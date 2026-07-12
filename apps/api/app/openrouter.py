@@ -99,18 +99,22 @@ class OpenRouterClient:
         if not self.embeddings_enabled:
             raise RuntimeError("OPENROUTER_API_KEY_NOT_CONFIGURED")
         schema = {
-            "document_type": None, "document_number": None, "language": None,
-            "parties": [], "effective_date": None, "execution_date": None,
-            "expiry_date": None, "governing_law": None, "jurisdiction": None,
-            "articles": [], "amendments": [], "obligations": [], "rights": [],
-            "prohibitions": [], "penalties": [], "definitions": [], "risk_flags": [], "confidence": 0.0,
+            "schema_version": 2,
+            "document_type": None, "document_number": None, "language": None, "articles": [],
+            "effective_date": None, "execution_date": None, "expiry_date": None,
+            "governing_law": None, "jurisdiction": None, "risk_flags": [],
+            "instrument": {"kind": None, "official_title": None, "official_number": None, "jurisdiction": None,
+                           "effective_date": None, "issuer": {"name": None, "evidence_quote": None}},
+            "provisions": [], "parties": [], "obligations": [], "rights": [], "prohibitions": [],
+            "penalties": [], "definitions": [], "amendments": [], "references": [], "confidence": 0.0,
         }
         prompt = (
-            "Extract structured legal metadata from the document text. Return JSON only, matching this schema. "
-            "Do not invent missing facts: use null, [] or 0. Every obligation, right, prohibition, penalty, and risk flag "
-            "must include an evidence_quote copied from the document and a confidence between 0 and 1. "
-            "Extract numbered legal provisions into articles (article_number, heading, text, evidence_quote), "
-            "and amendments/notices into amendments (title, announcement_number, announced_date, effective_date, changes, evidence_quote). "
+            "Extract a reviewable Legal Graph Schema v2 from the document. Return JSON only, matching this schema. "
+            "Do not invent missing facts: use null, [] or 0. Every list item MUST include an evidence_quote copied exactly "
+            "from the document. Extract provisions as {kind: article|section|clause|item, number, heading, text, evidence_quote}. "
+            "For instrument.issuer use {name, evidence_quote}. Extract cross-document references only when explicit in the text as "
+            "{relationship: ISSUED_UNDER|IMPLEMENTS|AMENDS|REPEALS|REFERS_TO|GOVERNED_BY, target_title, target_number, "
+            "target_provision, evidence_quote, confidence}. Do not infer a relationship from topic similarity. "
             "This is information extraction for human review, not legal advice.\n\n"
             f"Schema:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
             f"Document title: {title}\nDocument text (untrusted):\n{protect_document_text(text[:16000])}"
@@ -131,9 +135,49 @@ class OpenRouterClient:
             value = json.loads(content)
             if not isinstance(value, dict):
                 raise RuntimeError("OPENROUTER_LLM_INVALID_RESPONSE")
-            return {key: value.get(key, default) for key, default in schema.items()}
+            result = {key: value.get(key, default) for key, default in schema.items()}
+            # Tolerate a previously deployed extractor response while callers
+            # transition to the v2 contract.
+            if not result["provisions"] and isinstance(result["articles"], list):
+                result["provisions"] = [{
+                    "kind": "article", "number": item.get("article_number") or item.get("number"),
+                    "heading": item.get("heading"), "text": item.get("text"),
+                    "evidence_quote": item.get("evidence_quote"),
+                } for item in result["articles"] if isinstance(item, dict)]
+            return result
         except (httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise RuntimeError("OPENROUTER_LLM_INVALID_RESPONSE" if isinstance(exc, (json.JSONDecodeError, TypeError, ValueError)) else "OPENROUTER_UNAVAILABLE") from exc
+        finally:
+            if self._client is None:
+                client.close()
+
+    def suggest_legal_relationships(self, title: str, text: str, candidates: list[dict[str, str]]) -> list[dict[str, Any]]:
+        """Find only explicit cross-instrument references; callers keep results as suggestions."""
+        if not self.embeddings_enabled or not candidates:
+            return []
+        schema = {"references": []}
+        prompt = (
+            "Find explicit references from this legal document to one of the candidate instruments. Return JSON only. "
+            "Each reference must have relationship (ISSUED_UNDER, IMPLEMENTS, AMENDS, REPEALS, REFERS_TO, or GOVERNED_BY), "
+            "target_title copied from a candidate, target_number if present, evidence_quote copied exactly from the source text, "
+            "and confidence from 0 to 1. Do not infer from subject similarity.\n\n"
+            f"Source title: {title}\nCandidates: {json.dumps(candidates, ensure_ascii=False)}\n"
+            f"Source text (untrusted):\n{protect_document_text(text[:16000])}"
+        )
+        client = self._client or httpx.Client(timeout=remaining_timeout(90))
+        try:
+            response = client.post(
+                f"{self.settings.openrouter_base_url.rstrip('/')}/chat/completions", headers=self._headers(),
+                json={"model": self.settings.openrouter_llm_model, "temperature": 0,
+                      "messages": [{"role": "system", "content": "Return valid JSON only."}, {"role": "user", "content": prompt}]},
+            )
+            response.raise_for_status()
+            content = str(response.json().get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+            value = json.loads(content.removeprefix("```json").removesuffix("```").strip())
+            references = value.get("references", []) if isinstance(value, dict) else []
+            return [reference for reference in references if isinstance(reference, dict)]
+        except (httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError):
+            return []
         finally:
             if self._client is None:
                 client.close()

@@ -113,10 +113,14 @@ class EntityOut(ORMModel):
     knowledge_base_id: str
     name: str
     canonical_name: str
+    identity_key: str
     entity_type: str
     description: str | None
     aliases: list[str]
     confidence: float | None
+    origin: str
+    review_status: str
+    is_legal: bool
     source_count: int
 
 
@@ -146,6 +150,9 @@ class RelationshipOut(ORMModel):
     relationship_type: str
     description: str | None
     confidence: float | None
+    origin: str
+    review_status: str
+    is_legal: bool
     source_count: int
 
 
@@ -153,6 +160,11 @@ class RelationshipUpdate(BaseModel):
     relationship_type: str | None = Field(default=None, min_length=1, max_length=100)
     description: str | None = Field(default=None, max_length=5000)
     confidence: float | None = Field(default=None, ge=0, le=1)
+
+
+class LegalRelationshipReview(BaseModel):
+    status: str = Field(pattern="^(verified|rejected)$")
+    note: str | None = Field(default=None, max_length=2000)
 
 
 class GraphLayoutItem(BaseModel):

@@ -293,7 +293,13 @@ def store_upload(upload, knowledge_base_id: str) -> tuple[str, str, int, str, st
     return str(destination), stored_name, size, digest.hexdigest(), mime_type
 
 
-def create_document_job(db: Session, knowledge_base_id: str, upload, title: str | None = None) -> tuple[Document, ProcessingJob]:
+DOCUMENT_TYPES = {"general", "legal", "regulation", "contract"}
+LEGAL_DOCUMENT_TYPES = {"legal", "regulation", "contract"}
+
+
+def create_document_job(db: Session, knowledge_base_id: str, upload, title: str | None = None, document_type: str = "general") -> tuple[Document, ProcessingJob]:
+    if document_type not in DOCUMENT_TYPES:
+        raise ValueError("DOCUMENT_TYPE_INVALID")
     path, stored, size, checksum, mime = store_upload(upload, knowledge_base_id)
     duplicate = db.query(Document).filter_by(knowledge_base_id=knowledge_base_id, checksum_sha256=checksum).filter(Document.deleted_at.is_(None)).first()
     if duplicate:
@@ -301,7 +307,8 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
         raise ValueError("FILE_DUPLICATE")
     doc = Document(knowledge_base_id=knowledge_base_id, original_filename=upload.filename or stored,
                    stored_filename=stored, storage_path=path, file_size=size, checksum_sha256=checksum,
-                   mime_type=mime, title=title or Path(upload.filename or stored).stem, status="queued")
+                   mime_type=mime, title=title or Path(upload.filename or stored).stem,
+                   document_type=document_type, status="queued")
     db.add(doc); db.flush()
     job = ProcessingJob(document_id=doc.id, knowledge_base_id=knowledge_base_id)
     db.add(job); db.commit(); db.refresh(doc); db.refresh(job)
@@ -464,11 +471,13 @@ def process_next_job(db: Session) -> bool:
     reindex_only = job.job_type == "REINDEX_EMBEDDINGS"
     legal_only = job.job_type == "EXTRACT_LEGAL_METADATA"
     job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "extracting", 10, job.attempt_count + 1
-    if not reindex_only:
+    # Legal metadata runs as a follow-up job.  It must never move an already
+    # searchable document back to "extracting" or re-read the source file.
+    if not reindex_only and not legal_only:
         doc.status = "extracting"
     db.commit()
     try:
-        if reindex_only and doc.extracted_text:
+        if (reindex_only or legal_only) and doc.extracted_text:
             text = doc.extracted_text
         else:
             try:
@@ -516,8 +525,15 @@ def process_next_job(db: Session) -> bool:
                 else:
                     raise RuntimeError("RETRIEVAL_ENGINE_TIMEOUT")
             sync_lightrag_document_graph(db, doc)
-        if not reindex_only:
+        if not reindex_only and not legal_only:
             doc.status = "completed"; doc.indexed_at = datetime.utcnow()
+            if doc.document_type in LEGAL_DOCUMENT_TYPES:
+                db.add(ProcessingJob(
+                    document_id=doc.id,
+                    knowledge_base_id=doc.knowledge_base_id,
+                    job_type="EXTRACT_LEGAL_METADATA",
+                    current_stage="queued",
+                ))
         job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
     except Exception as exc:
         code = str(exc) if str(exc) in {"OCR_REQUIRED", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"} else "TEXT_EXTRACTION_FAILED"

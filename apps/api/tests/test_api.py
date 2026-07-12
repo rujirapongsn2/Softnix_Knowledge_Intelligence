@@ -44,6 +44,39 @@ def test_vertical_slice():
     assert reply.json()["result"]["structuredContent"]["request_id"] == 1
 
 
+def test_legal_document_type_queues_automatic_metadata_extraction():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Automatic legal", "code": "automatic-legal-kb"}).json()
+    uploaded = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/documents",
+        files={"file": ("contract.txt", b"Party A shall provide support.", "text/plain")},
+        data={"document_type": "contract"},
+    )
+    assert uploaded.status_code == 200
+    assert uploaded.json()["document_type"] == "contract"
+    assert uploaded.json()["legal_extraction_automatic"] is True
+    assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True
+    document = test_client.get(f"/api/v1/documents/{uploaded.json()['document_id']}/text").json()
+    assert document["status"] == "completed"
+    assert document["document_type"] == "contract"
+    jobs = test_client.get(f"/api/v1/documents/{uploaded.json()['document_id']}/jobs").json()
+    assert any(job["type"] == "EXTRACT_LEGAL_METADATA" and job["status"] == "queued" for job in jobs)
+    # Drain the follow-up job so independent tests do not consume it.
+    assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True
+
+
+def test_upload_rejects_unknown_document_type():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Typed", "code": "invalid-type-kb"}).json()
+    response = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/documents",
+        files={"file": ("notes.txt", b"notes", "text/plain")},
+        data={"document_type": "unknown"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "DOCUMENT_TYPE_INVALID"
+
+
 def test_token_is_not_returned_after_creation():
     test_client = next(client())
     token = test_client.post("/api/v1/tokens", json={"name": "agent"}).json()

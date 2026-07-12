@@ -156,14 +156,14 @@ def activate_kb(kb_id: str, user: User = Depends(current_admin), db: Session = D
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/documents")
-def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None), user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None), document_type: str = Form("general"), user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id): raise HTTPException(404, "Knowledge base not found")
-    try: doc, job = create_document_job(db, kb_id, file, title)
+    try: doc, job = create_document_job(db, kb_id, file, title, document_type)
     except ValueError as exc:
         status_code = 413 if str(exc) == "FILE_TOO_LARGE" else 400
         raise HTTPException(status_code, {"code": str(exc), "message": "Upload rejected", "retryable": False})
-    record_audit(db, "document.upload", user.id, "document", doc.id, {"knowledge_base_id": kb_id, "filename": doc.original_filename}); db.commit()
-    return {"status": "queued", "document_id": doc.id, "job_id": job.id}
+    record_audit(db, "document.upload", user.id, "document", doc.id, {"knowledge_base_id": kb_id, "filename": doc.original_filename, "document_type": doc.document_type}); db.commit()
+    return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type, "legal_extraction_automatic": doc.document_type in {"legal", "regulation", "contract"}}
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/documents", response_model=list[DocumentOut])
@@ -187,7 +187,7 @@ def reindex_embeddings(kb_id: str, force: bool = False, user: User = Depends(cur
 def document_text(document_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
     if not doc: raise HTTPException(404, "Document not found")
-    return {"document_id": doc.id, "status": doc.status, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata}
+    return {"document_id": doc.id, "status": doc.status, "document_type": doc.document_type, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata}
 
 
 @app.get("/api/v1/documents/{document_id}/jobs")

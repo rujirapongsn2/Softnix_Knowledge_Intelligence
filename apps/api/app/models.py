@@ -53,6 +53,9 @@ class Document(Timestamped, Base):
     file_size: Mapped[int] = mapped_column(Integer)
     checksum_sha256: Mapped[str] = mapped_column(String(64), index=True)
     title: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # This is an authoring choice, not a MIME-type inference.  It controls
+    # post-processing such as the legal metadata extraction workflow.
+    document_type: Mapped[str] = mapped_column(String(40), default="general", index=True)
     tags: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(30), default="queued")
     extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)

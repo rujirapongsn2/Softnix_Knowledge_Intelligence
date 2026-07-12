@@ -37,6 +37,7 @@ class DocumentOut(ORMModel):
     knowledge_base_id: str
     original_filename: str
     title: str | None
+    document_type: str
     mime_type: str
     file_size: int
     status: str

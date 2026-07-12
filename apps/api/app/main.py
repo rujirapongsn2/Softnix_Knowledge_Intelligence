@@ -14,14 +14,14 @@ from .audit import record_audit
 from .db import Base, engine, get_db
 from .external_ocr import ExternalOcrClient
 from .graph_store import Neo4jGraphStore
-from .models import AuditLog, Document, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, KnowledgeBase, ProcessingJob, QueryFeedback, QueryResult, Relationship, TokenKey, User
+from .models import AuditLog, Document, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, KnowledgeBase, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, TokenKey, User
 from .observability import metrics, now
 from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
-from .schemas import DocumentOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalMetadataUpdate, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, TokenCreate, TokenCreated, TokenOut
+from .schemas import DocumentOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, TokenCreate, TokenCreated, TokenOut
 from .security import authorize, bearer_token, create_session_token, create_token_secret, current_admin, password_hash, refresh_admin, token_digest, verify_password
-from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_query_result, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_lightrag_document_graph
+from .services import DEFAULT_RETRIEVAL_CONFIG, LEGAL_DOCUMENT_TYPES, analyze_impact, build_query_result, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, rebuild_legal_graph, resolve_entity, sync_legal_document_graph, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8080", "http://localhost:8081"], allow_credentials=True,
@@ -151,13 +151,40 @@ def list_kbs(_: User = Depends(current_admin), db: Session = Depends(get_db)):
 @app.post("/api/v1/knowledge-bases/{kb_id}/activate")
 def activate_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
-    if not kb: raise HTTPException(404, "Knowledge base not found")
+    if not kb or kb.deleted_at: raise HTTPException(404, "Knowledge base not found")
     kb.status = "active"; record_audit(db, "knowledge_base.activate", user.id, "knowledge_base", kb.id); db.commit(); return {"status": "success"}
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/disable")
+def disable_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    kb.status = "disabled"
+    record_audit(db, "knowledge_base.disable", user.id, "knowledge_base", kb.id)
+    db.commit()
+    return {"status": "success"}
+
+
+@app.delete("/api/v1/knowledge-bases/{kb_id}")
+def delete_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    if db.query(Document.id).filter_by(knowledge_base_id=kb.id).filter(Document.deleted_at.is_(None)).first():
+        raise HTTPException(409, {"code": "KNOWLEDGE_BASE_NOT_EMPTY", "message": "Delete or move all documents before deleting this Knowledge Base.", "retryable": False})
+    kb.deleted_at, kb.status = datetime.utcnow(), "deleted"
+    record_audit(db, "knowledge_base.delete", user.id, "knowledge_base", kb.id)
+    db.commit()
+    return {"status": "deleted", "knowledge_base_id": kb.id}
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/documents")
 def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None), document_type: str = Form("general"), user: User = Depends(current_admin), db: Session = Depends(get_db)):
-    if not db.get(KnowledgeBase, kb_id): raise HTTPException(404, "Knowledge base not found")
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at: raise HTTPException(404, "Knowledge base not found")
+    if kb.status == "disabled":
+        raise HTTPException(409, {"code": "KNOWLEDGE_BASE_DISABLED", "message": "Activate this Knowledge Base before uploading documents.", "retryable": False})
     try: doc, job = create_document_job(db, kb_id, file, title, document_type)
     except ValueError as exc:
         status_code = 413 if str(exc) == "FILE_TOO_LARGE" else 400
@@ -256,6 +283,17 @@ def reprocess_document(document_id: str, user: User = Depends(current_admin), db
     doc = db.get(Document, document_id)
     if not doc:
         raise HTTPException(404, "Document not found")
+    active = db.query(ProcessingJob).filter(
+        ProcessingJob.document_id == doc.id,
+        ProcessingJob.status.in_(["queued", "running"]),
+    ).order_by(ProcessingJob.created_at.desc()).first()
+    if active:
+        raise HTTPException(409, {
+            "code": "DOCUMENT_PROCESSING_IN_PROGRESS",
+            "message": "This document already has a processing job in progress.",
+            "retryable": True,
+            "job_id": active.id,
+        })
     doc.status, doc.error_code, doc.error_message = "queued", None, None
     job = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type="REPROCESS_DOCUMENT")
     db.add(job); record_audit(db, "document.reprocess", user.id, "document", doc.id)
@@ -361,6 +399,90 @@ def list_relationships(kb_id: str, _: User = Depends(current_admin), db: Session
     return db.query(Relationship).filter_by(knowledge_base_id=kb_id).filter(Relationship.deleted_at.is_(None)).limit(200).all()
 
 
+@app.get("/api/v1/knowledge-bases/{kb_id}/legal-graph")
+def get_legal_graph(kb_id: str, view: str = "verified", _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    if view not in {"verified", "suggested", "manual", "all"}:
+        raise HTTPException(400, {"code": "LEGAL_GRAPH_VIEW_INVALID", "message": "view must be verified, suggested, manual, or all", "retryable": False})
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+    status_filter = {"verified": ["verified"], "suggested": ["suggested"], "all": ["verified", "suggested", "rejected"]}
+    relationship_query = db.query(Relationship).filter(Relationship.knowledge_base_id == kb_id, Relationship.deleted_at.is_(None))
+    if view == "manual":
+        relationship_query = relationship_query.filter(Relationship.origin == "manual")
+    elif view == "all":
+        relationship_query = relationship_query.filter((Relationship.is_legal.is_(True)) | (Relationship.origin == "manual"))
+    else:
+        relationship_query = relationship_query.filter(Relationship.is_legal.is_(True), Relationship.review_status.in_(status_filter[view]))
+    relationships = relationship_query.limit(500).all()
+    node_ids = {edge.source_entity_id for edge in relationships} | {edge.target_entity_id for edge in relationships}
+    entity_query = db.query(Entity).filter(Entity.knowledge_base_id == kb_id, Entity.deleted_at.is_(None))
+    if view == "manual":
+        entity_query = entity_query.filter(Entity.origin == "manual")
+    elif view == "all":
+        entity_query = entity_query.filter((Entity.is_legal.is_(True)) | (Entity.origin == "manual"))
+    else:
+        entity_query = entity_query.filter(Entity.is_legal.is_(True))
+    if view == "verified":
+        entity_query = entity_query.filter(Entity.review_status == "verified")
+    elif node_ids:
+        entity_query = entity_query.filter((Entity.review_status == "verified") | Entity.id.in_(node_ids))
+    else:
+        entity_query = entity_query.filter(Entity.review_status == "suggested")
+    entities = entity_query.limit(500).all()
+    source_rows = db.query(RelationshipSource, Document).join(Document, Document.id == RelationshipSource.document_id).filter(
+        RelationshipSource.relationship_id.in_([edge.id for edge in relationships]) if relationships else False
+    ).all()
+    sources: dict[str, list[dict]] = {}
+    for source, document in source_rows:
+        sources.setdefault(source.relationship_id, []).append({"document_id": document.id, "title": document.title or document.original_filename, "excerpt": source.excerpt})
+    return {
+        "knowledge_base_id": kb_id, "view": view,
+        "nodes": [EntityOut.model_validate(entity).model_dump() for entity in entities],
+        "edges": [{**RelationshipOut.model_validate(edge).model_dump(), "sources": sources.get(edge.id, [])} for edge in relationships],
+    }
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/legal-graph/rebuild")
+def queue_legal_graph_rebuild(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+    active = db.query(ProcessingJob).filter(
+        ProcessingJob.knowledge_base_id == kb_id, ProcessingJob.job_type == "REBUILD_LEGAL_GRAPH",
+        ProcessingJob.status.in_(["queued", "running"]),
+    ).first()
+    if active:
+        return {"status": active.status, "job_id": active.id, "knowledge_base_id": kb_id}
+    job = ProcessingJob(knowledge_base_id=kb_id, job_type="REBUILD_LEGAL_GRAPH", current_stage="queued")
+    db.add(job); db.flush()
+    record_audit(db, "legal_graph.rebuild.queue", user.id, "knowledge_base", kb_id, {"job_id": job.id})
+    db.commit()
+    return {"status": "queued", "job_id": job.id, "knowledge_base_id": kb_id}
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/legal-graph/rebuild")
+def legal_graph_rebuild_status(kb_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    job = db.query(ProcessingJob).filter_by(knowledge_base_id=kb_id, job_type="REBUILD_LEGAL_GRAPH").order_by(ProcessingJob.created_at.desc()).first()
+    if not job:
+        return {"status": "not_started", "job_id": None}
+    return {"status": job.status, "job_id": job.id, "stage": job.current_stage, "progress_percent": job.progress_percent,
+            "error_code": job.error_code, "error_message": job.error_message}
+
+
+@app.patch("/api/v1/relationships/{relationship_id}/legal-review", response_model=RelationshipOut)
+def review_legal_relationship(relationship_id: str, payload: LegalRelationshipReview, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    relationship = db.get(Relationship, relationship_id)
+    if not relationship or relationship.deleted_at or not relationship.is_legal or relationship.origin != "ai_suggestion":
+        raise HTTPException(404, "Suggested legal relationship not found")
+    if relationship.review_status != "suggested":
+        raise HTTPException(409, {"code": "LEGAL_RELATIONSHIP_ALREADY_REVIEWED", "message": "This legal suggestion has already been reviewed.", "retryable": False})
+    relationship.review_status = payload.status
+    relationship.attributes = {**(relationship.attributes or {}), "review_note": payload.note, "reviewed_by": user.username, "reviewed_at": datetime.utcnow().isoformat()}
+    db.add(GraphProjectionEvent(event_type="relationship", relationship_id=relationship.id))
+    record_audit(db, f"legal_graph.relationship.{payload.status}", user.id, "relationship", relationship.id, {"note": payload.note})
+    db.commit(); db.refresh(relationship)
+    return relationship
+
+
 @app.post("/api/v1/knowledge-bases/{kb_id}/graph/sync")
 def sync_knowledge_base_graph(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
@@ -369,6 +491,9 @@ def sync_knowledge_base_graph(kb_id: str, user: User = Depends(current_admin), d
     documents = db.query(Document).filter_by(knowledge_base_id=kb_id, status="completed").filter(Document.deleted_at.is_(None)).all()
     for document in documents:
         result = sync_lightrag_document_graph(db, document)
+        totals["entities"] += result["entities"]
+        totals["relationships"] += result["relationships"]
+        result = sync_legal_document_graph(db, document)
         totals["entities"] += result["entities"]
         totals["relationships"] += result["relationships"]
     record_audit(db, "graph.sync", user.id, "knowledge_base", kb_id, {**totals, "documents": len(documents)})
@@ -436,6 +561,25 @@ def query_impact(payload: ImpactRequest, _: User = Depends(current_admin), db: S
 
 @app.post("/api/v1/tokens", response_model=TokenCreated)
 def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    # A token may only be granted a scope that is usable at the time it is issued.
+    # Runtime authorization repeats this check so disabling a Knowledge Base also
+    # takes effect for tokens that were created earlier.
+    requested_kb_ids = set(payload.allowed_knowledge_base_ids)
+    if requested_kb_ids:
+        active_kb_ids = {
+            row.id
+            for row in db.query(KnowledgeBase.id).filter(
+                KnowledgeBase.id.in_(requested_kb_ids),
+                KnowledgeBase.status == "active",
+                KnowledgeBase.deleted_at.is_(None),
+            ).all()
+        }
+        if active_kb_ids != requested_kb_ids:
+            raise HTTPException(status_code=400, detail={
+                "code": "KNOWLEDGE_BASE_INACTIVE",
+                "message": "MCP tokens can only be scoped to active Knowledge Bases.",
+                "retryable": False,
+            })
     secret = create_token_secret()
     token = TokenKey(name=payload.name, description=payload.description, token_prefix=secret[:16], token_hash=token_digest(secret),
                      allowed_knowledge_base_ids=payload.allowed_knowledge_base_ids, allowed_tools=payload.allowed_tools,
@@ -489,6 +633,28 @@ def authorized_query(payload: QueryRequest, token: TokenKey | None, db: Session)
     kb_ids = payload.knowledge_base_ids or (token.allowed_knowledge_base_ids if token else [])
     if token: authorize(token, "search_knowledge", kb_ids)
     return build_query_result(db, payload.query, kb_ids, payload.max_sources, token.id if token else None)
+
+
+def active_mcp_knowledge_base_ids(db: Session, kb_ids: list[str]) -> list[str]:
+    """Return only active Knowledge Bases, rejecting any requested inactive scope.
+
+    An unscoped MCP token retains its existing "all" behavior, but its all is
+    deliberately restricted to currently active, non-deleted Knowledge Bases.
+    """
+    rows = db.query(KnowledgeBase.id).filter(
+        KnowledgeBase.deleted_at.is_(None), KnowledgeBase.status == "active",
+    )
+    if kb_ids:
+        active_ids = {row[0] for row in rows.filter(KnowledgeBase.id.in_(kb_ids)).all()}
+        missing_ids = sorted(set(kb_ids) - active_ids)
+        if missing_ids:
+            raise HTTPException(403, {
+                "code": "KNOWLEDGE_BASE_INACTIVE",
+                "message": "The requested Knowledge Base is disabled, draft, deleted, or unavailable to MCP.",
+                "retryable": False,
+            })
+        return list(kb_ids)
+    return [row[0] for row in rows.all()]
 
 
 @app.post("/api/v1/query")
@@ -562,22 +728,28 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
         elif method == "tools/list": result = {"tools": [tool for tool in MCP_TOOLS if not token.allowed_tools or tool["name"] in token.allowed_tools]}
         elif method == "tools/call":
             name = params.get("name"); arguments = params.get("arguments", {}); authorize(token, name, arguments.get("knowledge_base_ids", token.allowed_knowledge_base_ids))
-            if name == "search_knowledge": result = authorized_query(QueryRequest.model_validate(arguments), token, db)
+            if name == "search_knowledge":
+                payload = QueryRequest.model_validate(arguments)
+                payload.knowledge_base_ids = active_mcp_knowledge_base_ids(db, payload.knowledge_base_ids or token.allowed_knowledge_base_ids)
+                result = authorized_query(payload, token, db)
             elif name == "find_entities":
-                kb_ids = arguments.get("knowledge_base_ids") or token.allowed_knowledge_base_ids
+                kb_ids = active_mcp_knowledge_base_ids(db, arguments.get("knowledge_base_ids") or token.allowed_knowledge_base_ids)
                 rows = db.query(Entity).filter(Entity.knowledge_base_id.in_(kb_ids), Entity.deleted_at.is_(None), Entity.name.ilike(f"%{arguments.get('search_text', '')}%")).limit(min(arguments.get("limit", 10), 50)).all()
                 result = {"status": "success", "entities": [EntityOut.model_validate(row).model_dump() for row in rows]}
             elif name == "analyze_relationships":
-                kb_ids = arguments.get("knowledge_base_ids") or token.allowed_knowledge_base_ids
+                kb_ids = active_mcp_knowledge_base_ids(db, arguments.get("knowledge_base_ids") or token.allowed_knowledge_base_ids)
                 entity = resolve_entity(db, kb_ids, arguments.get("subjects", [""])[0])
                 result = {"status": "success", "graph": entity_graph(db, entity, min(arguments.get("max_depth", 1), 3)) if entity else {"nodes": [], "edges": []}}
             elif name == "analyze_impact":
                 impact = ImpactRequest.model_validate(arguments)
-                kb_ids = impact.knowledge_base_ids or token.allowed_knowledge_base_ids
+                kb_ids = active_mcp_knowledge_base_ids(db, impact.knowledge_base_ids or token.allowed_knowledge_base_ids)
                 result = analyze_impact(db, impact.subject, kb_ids, impact.max_depth, impact.include_indirect)
             elif name == "get_sources":
                 saved = db.get(QueryResult, arguments.get("result_id"))
-                if saved: authorize(token, "get_sources", saved.result_json.get("metadata", {}).get("knowledge_base_ids", []))
+                if saved:
+                    source_kb_ids = saved.result_json.get("metadata", {}).get("knowledge_base_ids", [])
+                    authorize(token, "get_sources", source_kb_ids)
+                    active_mcp_knowledge_base_ids(db, source_kb_ids)
                 result = {"sources": saved.result_json.get("sources", [])} if saved else {"sources": []}
             else: return mcp_error(request_id, "MCP_TOOL_NOT_FOUND", "Tool not found")
             result.setdefault("request_id", request_id)

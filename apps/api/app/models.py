@@ -99,16 +99,22 @@ class ProcessingJob(Timestamped, Base):
 
 class Entity(Timestamped, Base):
     __tablename__ = "entities"
-    __table_args__ = (UniqueConstraint("knowledge_base_id", "canonical_name", "entity_type", name="uq_entity_canonical"),)
+    __table_args__ = (UniqueConstraint("knowledge_base_id", "identity_key", "entity_type", name="uq_entity_identity"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
     name: Mapped[str] = mapped_column(String(500), index=True)
     canonical_name: Mapped[str] = mapped_column(String(500), index=True)
+    # Legal provisions are document-scoped.  A separate identity key prevents
+    # "มาตรา 1" from different instruments being merged into one entity.
+    identity_key: Mapped[str] = mapped_column(String(700), index=True)
     entity_type: Mapped[str] = mapped_column(String(100), index=True, default="Concept")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     aliases: Mapped[list] = mapped_column(JSON, default=list)
     attributes: Mapped[dict] = mapped_column(JSON, default=dict)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    origin: Mapped[str] = mapped_column(String(30), default="manual", index=True)
+    review_status: Mapped[str] = mapped_column(String(20), default="verified", index=True)
+    is_legal: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     source_count: Mapped[int] = mapped_column(Integer, default=0)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -124,6 +130,9 @@ class Relationship(Timestamped, Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     attributes: Mapped[dict] = mapped_column(JSON, default=dict)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    origin: Mapped[str] = mapped_column(String(30), default="manual", index=True)
+    review_status: Mapped[str] = mapped_column(String(20), default="verified", index=True)
+    is_legal: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     source_count: Mapped[int] = mapped_column(Integer, default=0)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

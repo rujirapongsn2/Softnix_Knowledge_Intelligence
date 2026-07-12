@@ -19,8 +19,10 @@ from openpyxl import Workbook
 from pptx import Presentation
 from app import services
 from app.config import Settings
+from app.db import SessionLocal
 from app.external_ocr import ExternalOcrClient
 from app.main import app
+from app.models import Document
 
 
 def client():
@@ -42,6 +44,25 @@ def test_vertical_slice():
     assert reply.status_code == 200
     assert reply.json()["result"]["structuredContent"]["sources"]
     assert reply.json()["result"]["structuredContent"]["request_id"] == 1
+
+
+def test_knowledge_base_can_be_disabled_activated_and_safely_deleted():
+    test_client = next(client())
+    empty = test_client.post("/api/v1/knowledge-bases", json={"name": "Disposable", "code": "disposable-kb"}).json()
+    assert test_client.post(f"/api/v1/knowledge-bases/{empty['id']}/disable").status_code == 200
+    assert test_client.delete(f"/api/v1/knowledge-bases/{empty['id']}").json()["status"] == "deleted"
+    assert empty["id"] not in {kb["id"] for kb in test_client.get("/api/v1/knowledge-bases").json()}
+
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Managed", "code": "managed-kb"}).json()
+    assert test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/disable").status_code == 200
+    rejected = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("notes.txt", b"blocked", "text/plain")})
+    assert rejected.status_code == 409 and rejected.json()["error"]["code"] == "KNOWLEDGE_BASE_DISABLED"
+    assert test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/activate").status_code == 200
+    uploaded = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("notes.txt", b"allowed", "text/plain")}).json()
+    nonempty = test_client.delete(f"/api/v1/knowledge-bases/{kb['id']}")
+    assert nonempty.status_code == 409 and nonempty.json()["error"]["code"] == "KNOWLEDGE_BASE_NOT_EMPTY"
+    assert uploaded["status"] == "queued"
+    assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True
 
 
 def test_legal_document_type_queues_automatic_metadata_extraction():
@@ -104,6 +125,35 @@ def test_revoked_token_cannot_call_mcp():
     assert response.json()["error"]["code"] == "AUTH_TOKEN_REVOKED"
 
 
+def test_mcp_only_reads_active_knowledge_bases():
+    test_client = next(client())
+    active = test_client.post("/api/v1/knowledge-bases", json={"name": "MCP active", "code": "mcp-active-kb"}).json()
+    disabled = test_client.post("/api/v1/knowledge-bases", json={"name": "MCP disabled", "code": "mcp-disabled-kb"}).json()
+    test_client.post(f"/api/v1/knowledge-bases/{active['id']}/activate")
+    test_client.post(f"/api/v1/knowledge-bases/{disabled['id']}/activate")
+    active_doc = test_client.post(f"/api/v1/knowledge-bases/{active['id']}/documents", files={"file": ("active.txt", b"Active MCP evidence.", "text/plain")}).json()
+    assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True
+    token = test_client.post("/api/v1/tokens", json={"name": "active-only-agent", "allowed_knowledge_base_ids": [active["id"], disabled["id"]], "allowed_tools": ["search_knowledge"]}).json()
+    assert test_client.post(f"/api/v1/knowledge-bases/{disabled['id']}/disable").status_code == 200
+
+    active_response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_knowledge", "arguments": {"query": "Active MCP evidence", "knowledge_base_ids": [active["id"]]}}})
+    assert active_response.json()["result"]["structuredContent"]["sources"][0]["document_id"] == active_doc["document_id"]
+    disabled_response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "search_knowledge", "arguments": {"query": "anything", "knowledge_base_ids": [disabled["id"]]}}})
+    assert disabled_response.json()["error"]["code"] == "KNOWLEDGE_BASE_INACTIVE"
+
+
+def test_mcp_token_scope_must_reference_active_knowledge_bases():
+    test_client = next(client())
+    draft = test_client.post("/api/v1/knowledge-bases", json={"name": "Draft MCP scope", "code": "draft-mcp-scope"}).json()
+    response = test_client.post("/api/v1/tokens", json={
+        "name": "draft-scoped-agent",
+        "allowed_knowledge_base_ids": [draft["id"]],
+        "allowed_tools": ["search_knowledge"],
+    })
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "KNOWLEDGE_BASE_INACTIVE"
+
+
 def test_graph_impact_returns_direct_indirect_impacts_and_sources():
     test_client = next(client())
     kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Graph KB", "code": "graph-kb"}).json()
@@ -131,6 +181,9 @@ def test_document_list_preview_and_reprocess():
     assert "previewable" in test_client.get(f"/api/v1/documents/{uploaded['document_id']}/text").json()["text"]
     reprocess = test_client.post(f"/api/v1/documents/{uploaded['document_id']}/reprocess").json()
     assert reprocess["status"] == "queued"
+    duplicate = test_client.post(f"/api/v1/documents/{uploaded['document_id']}/reprocess")
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "DOCUMENT_PROCESSING_IN_PROGRESS"
     assert len(test_client.get(f"/api/v1/documents/{uploaded['document_id']}/jobs").json()) == 2
 
 
@@ -235,16 +288,60 @@ def test_upload_rejects_mime_type_that_does_not_match_extension():
 def test_legal_metadata_articles_amendments_crud():
     test_client = next(client())
     kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Legal", "code": "legal-kb"}).json()
-    uploaded = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("law.txt", "มาตรา 1 applies.".encode(), "text/plain")}).json()
+    uploaded = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("law.txt", "มาตรา 1 applies.".encode(), "text/plain")}, data={"document_type": "legal"}).json()
     test_client.post("/api/v1/internal/process-next")
     metadata = {"document_type": "ประกาศ", "articles": [{"article_number": "1", "text": "applies", "evidence_quote": "มาตรา 1 applies"}], "amendments": [{"title": "ประกาศแก้ไข", "announcement_number": "ฉบับที่ 2", "changes": "แก้ไขมาตรา 1", "evidence_quote": "ฉบับที่ 2"}]}
     saved = test_client.put(f"/api/v1/documents/{uploaded['document_id']}/legal-metadata", json={"metadata": metadata})
     assert saved.status_code == 200 and saved.json()["legal_metadata"]["articles"][0]["article_number"] == "1"
     patched = test_client.patch(f"/api/v1/documents/{uploaded['document_id']}/legal-metadata", json={"metadata": {"confidence": 0.9}})
     assert patched.json()["legal_metadata"]["confidence"] == 0.9
+    graph_sync = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/graph/sync").json()
+    assert graph_sync["entities"] >= 3 and graph_sync["relationships"] >= 2
     assert test_client.get(f"/api/v1/documents/{uploaded['document_id']}/text").json()["legal_metadata"]["amendments"][0]["title"] == "ประกาศแก้ไข"
     assert test_client.delete(f"/api/v1/documents/{uploaded['document_id']}/legal-metadata").json()["status"] == "deleted"
     assert test_client.get(f"/api/v1/documents/{uploaded['document_id']}/text").json()["legal_metadata"] is None
+
+
+def test_legal_graph_v2_keeps_provisions_document_scoped_and_reviews_suggestions():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Legal graph v2", "code": "legal-graph-v2"}).json()
+    first_metadata = {
+        "schema_version": 2,
+        "instrument": {"kind": "Act", "official_title": "PDPA Act", "official_number": "2562"},
+        "provisions": [{"kind": "article", "number": "1", "evidence_quote": "มาตรา 1 แห่งพระราชบัญญัตินี้"}],
+        "parties": [], "obligations": [], "rights": [], "prohibitions": [], "penalties": [], "definitions": [], "amendments": [], "references": [],
+    }
+    second_metadata = {
+        "schema_version": 2,
+        "instrument": {"kind": "Notification", "official_title": "PDPC Security Notification", "official_number": "1/2565"},
+        "provisions": [{"kind": "article", "number": "1", "evidence_quote": "ข้อ 1 ของประกาศนี้"}],
+        "parties": [], "obligations": [], "rights": [], "prohibitions": [], "penalties": [], "definitions": [], "amendments": [],
+        "references": [{"relationship": "ISSUED_UNDER", "target_title": "PDPA Act", "target_number": "2562", "evidence_quote": "อาศัยอำนาจตาม PDPA Act", "confidence": 0.9}],
+    }
+    with SessionLocal() as db:
+        db.add_all([
+            Document(knowledge_base_id=kb["id"], original_filename="act.txt", stored_filename="act.txt", storage_path="/tmp/act.txt", mime_type="text/plain", file_size=1,
+                     checksum_sha256="a" * 64, title="PDPA Act", document_type="legal", status="completed", extracted_text="มาตรา 1 แห่งพระราชบัญญัตินี้", legal_metadata=first_metadata),
+            Document(knowledge_base_id=kb["id"], original_filename="notice.txt", stored_filename="notice.txt", storage_path="/tmp/notice.txt", mime_type="text/plain", file_size=1,
+                     checksum_sha256="b" * 64, title="PDPC Security Notification", document_type="regulation", status="completed", extracted_text="อาศัยอำนาจตาม PDPA Act", legal_metadata=second_metadata),
+        ])
+        db.commit()
+        first_build = services.rebuild_legal_graph(db, kb["id"])
+        assert first_build["documents"] == 2
+
+    verified = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/legal-graph?view=verified").json()
+    provisions = [node for node in verified["nodes"] if node["entity_type"] == "Provision"]
+    assert len(provisions) == 2
+    assert len({node["identity_key"] for node in provisions}) == 2
+    suggested = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/legal-graph?view=suggested").json()
+    edge = next(edge for edge in suggested["edges"] if edge["relationship_type"] == "ISSUED_UNDER")
+    assert edge["review_status"] == "suggested" and edge["sources"][0]["excerpt"] == "อาศัยอำนาจตาม PDPA Act"
+    approved = test_client.patch(f"/api/v1/relationships/{edge['id']}/legal-review", json={"status": "verified", "note": "validated"})
+    assert approved.status_code == 200 and approved.json()["review_status"] == "verified"
+    with SessionLocal() as db:
+        services.rebuild_legal_graph(db, kb["id"])
+    verified_after = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/legal-graph?view=verified").json()
+    assert any(item["id"] == edge["id"] and item["review_status"] == "verified" for item in verified_after["edges"])
 
 
 def test_database_chunk_retrieval_is_scoped_to_knowledge_base():

@@ -56,13 +56,19 @@ def canonical_entity_name(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
+def generic_identity_key(name: str) -> str:
+    return f"generic:{canonical_entity_name(name)}"
+
+
 def create_entity(db: Session, knowledge_base_id: str, payload) -> Entity:
     canonical = canonical_entity_name(payload.name)
-    entity = db.query(Entity).filter_by(knowledge_base_id=knowledge_base_id, canonical_name=canonical, entity_type=payload.entity_type).first()
+    identity_key = generic_identity_key(payload.name)
+    entity = db.query(Entity).filter_by(knowledge_base_id=knowledge_base_id, identity_key=identity_key, entity_type=payload.entity_type).first()
     if not entity:
         entity = Entity(knowledge_base_id=knowledge_base_id, name=payload.name, canonical_name=canonical,
                         entity_type=payload.entity_type, description=payload.description, aliases=payload.aliases,
-                        attributes=payload.attributes, confidence=payload.confidence)
+                        attributes=payload.attributes, confidence=payload.confidence, identity_key=identity_key,
+                        origin="manual", review_status="verified", is_legal=False)
         db.add(entity)
         db.flush()
     elif entity.deleted_at:
@@ -87,7 +93,8 @@ def create_relationship(db: Session, knowledge_base_id: str, payload) -> Relatio
                                                      target_entity_id=target.id, relationship_type=payload.relationship_type).first()
     if not relationship:
         relationship = Relationship(knowledge_base_id=knowledge_base_id, source_entity_id=source.id, target_entity_id=target.id,
-                                    relationship_type=payload.relationship_type, description=payload.description, confidence=payload.confidence)
+                                    relationship_type=payload.relationship_type, description=payload.description, confidence=payload.confidence,
+                                    origin="manual", review_status="verified", is_legal=False)
         db.add(relationship)
         db.flush()
     elif relationship.deleted_at:
@@ -109,6 +116,11 @@ def sync_lightrag_document_graph(db: Session, document: Document, max_labels: in
     LightRAG keeps one shared graph service, so file-source provenance is the
     boundary that prevents nodes from a different Knowledge Base leaking in.
     """
+    # LightRAG's opaque relationship labels are useful retrieval signals but
+    # are not legal facts.  Legal documents get their graph only from the
+    # evidence-backed legal projection below.
+    if document.document_type in LEGAL_DOCUMENT_TYPES:
+        return {"entities": 0, "relationships": 0}
     engine = LightRAGRetrievalEngine()
     if not engine.enabled:
         return {"entities": 0, "relationships": 0}
@@ -146,10 +158,12 @@ def sync_lightrag_document_graph(db: Session, document: Document, max_labels: in
             continue
         entity_type = str(props.get("entity_type") or "Concept").strip()[:100] or "Concept"
         canonical = canonical_entity_name(name)
-        entity = db.query(Entity).filter_by(knowledge_base_id=document.knowledge_base_id, canonical_name=canonical, entity_type=entity_type).first()
+        identity_key = generic_identity_key(name)
+        entity = db.query(Entity).filter_by(knowledge_base_id=document.knowledge_base_id, identity_key=identity_key, entity_type=entity_type).first()
         if not entity:
             entity = Entity(knowledge_base_id=document.knowledge_base_id, name=name, canonical_name=canonical, entity_type=entity_type,
-                            description=str(props.get("description") or "")[:5000] or None, confidence=1.0)
+                            description=str(props.get("description") or "")[:5000] or None, confidence=1.0,
+                            identity_key=identity_key, origin="ai_suggestion", review_status="suggested", is_legal=False)
             db.add(entity); db.flush(); entity_count += 1
             db.add(GraphProjectionEvent(event_type="entity", entity_id=entity.id))
         elif entity.deleted_at:
@@ -170,7 +184,8 @@ def sync_lightrag_document_graph(db: Session, document: Document, max_labels: in
         description = str(props.get("description") or "")[:5000] or None
         if not relationship:
             relationship = Relationship(knowledge_base_id=document.knowledge_base_id, source_entity_id=source.id, target_entity_id=target.id,
-                                        relationship_type=relationship_type, description=description, confidence=1.0)
+                                        relationship_type=relationship_type, description=description, confidence=1.0,
+                                        origin="ai_suggestion", review_status="suggested", is_legal=False)
             db.add(relationship); db.flush(); relationship_count += 1
             db.add(GraphProjectionEvent(event_type="relationship", relationship_id=relationship.id))
         elif relationship.deleted_at:
@@ -180,6 +195,314 @@ def sync_lightrag_document_graph(db: Session, document: Document, max_labels: in
             db.add(RelationshipSource(relationship_id=relationship.id, document_id=document.id, excerpt=excerpt)); relationship.source_count += 1
     db.commit()
     return {"entities": entity_count, "relationships": relationship_count}
+
+
+LEGAL_GRAPH_RELATIONSHIPS = {
+    "CONTAINS_PROVISION", "ISSUED_BY", "PARTY_TO", "REQUIRES", "GRANTS_RIGHT", "PROHIBITS", "DEFINES",
+    "ISSUED_UNDER", "IMPLEMENTS", "AMENDS", "REPEALS", "REFERS_TO", "GOVERNED_BY",
+}
+
+
+def _legal_value(item, *keys: str) -> str:
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return ""
+    return str(next((item.get(key) for key in keys if item.get(key)), "")).strip()
+
+
+def _legal_evidence(item, fallback: str) -> str:
+    return (_legal_value(item, "evidence_quote", "excerpt", "text", "description") or fallback)[:5000]
+
+
+def legal_metadata_v2(document: Document) -> dict:
+    """Normalize legacy legal metadata without discarding a human-edited value."""
+    metadata = document.legal_metadata or {}
+    if metadata.get("schema_version") == 2:
+        return metadata
+    kind_by_document_type = {"legal": "Act", "regulation": "Regulation", "contract": "Contract"}
+    provisions = []
+    for article in metadata.get("articles", []) if isinstance(metadata.get("articles"), list) else []:
+        number = _legal_value(article, "number", "article_number", "label", "name", "title")
+        if number:
+            provisions.append({
+                "kind": _legal_value(article, "kind") or "article", "number": number,
+                "heading": _legal_value(article, "heading", "title"), "text": _legal_value(article, "text"),
+                "evidence_quote": _legal_evidence(article, f"มาตรา {number}"),
+            })
+    return {
+        "schema_version": 2,
+        # Compatibility aliases remain readable by existing clients while the
+        # graph projection uses the normalized v2 fields below.
+        "document_type": metadata.get("document_type"),
+        "articles": metadata.get("articles") if isinstance(metadata.get("articles"), list) else [],
+        "instrument": {
+            "kind": kind_by_document_type.get(document.document_type, "Other"),
+            "official_title": document.title or document.original_filename,
+            "official_number": metadata.get("document_number"),
+            "jurisdiction": metadata.get("jurisdiction"),
+            "effective_date": metadata.get("effective_date"),
+            "issuer": metadata.get("issuer"),
+        },
+        "provisions": provisions,
+        "parties": metadata.get("parties") if isinstance(metadata.get("parties"), list) else [],
+        "obligations": metadata.get("obligations") if isinstance(metadata.get("obligations"), list) else [],
+        "rights": metadata.get("rights") if isinstance(metadata.get("rights"), list) else [],
+        "prohibitions": metadata.get("prohibitions") if isinstance(metadata.get("prohibitions"), list) else [],
+        "penalties": metadata.get("penalties") if isinstance(metadata.get("penalties"), list) else [],
+        "definitions": metadata.get("definitions") if isinstance(metadata.get("definitions"), list) else [],
+        "amendments": metadata.get("amendments") if isinstance(metadata.get("amendments"), list) else [],
+        "references": metadata.get("references") if isinstance(metadata.get("references"), list) else [],
+        "confidence": metadata.get("confidence", 0.0),
+    }
+
+
+def _document_legal_identity(document: Document, suffix: str) -> str:
+    return f"legal:{suffix}:{document.id}"
+
+
+def _legal_fingerprint(value: str) -> str:
+    return hashlib.sha256(canonical_entity_name(value).encode()).hexdigest()[:24]
+
+
+def _remove_document_legal_projection(db: Session, document: Document) -> None:
+    """Remove only generated evidence from one document; never touch manual rows."""
+    relationship_ids = [row[0] for row in db.query(Relationship.id).join(RelationshipSource).filter(
+        RelationshipSource.document_id == document.id, Relationship.origin == "legal_schema"
+    ).all()]
+    for relationship_id in relationship_ids:
+        db.query(RelationshipSource).filter_by(relationship_id=relationship_id, document_id=document.id).delete(synchronize_session=False)
+        relationship = db.get(Relationship, relationship_id)
+        if relationship:
+            relationship.source_count = db.query(func.count(RelationshipSource.id)).filter_by(relationship_id=relationship_id).scalar() or 0
+            if relationship.source_count == 0:
+                relationship.deleted_at = datetime.utcnow()
+    entity_ids = [row[0] for row in db.query(Entity.id).join(EntitySource).filter(
+        EntitySource.document_id == document.id, Entity.origin == "legal_schema"
+    ).all()]
+    for entity_id in entity_ids:
+        db.query(EntitySource).filter_by(entity_id=entity_id, document_id=document.id).delete(synchronize_session=False)
+        entity = db.get(Entity, entity_id)
+        if entity:
+            entity.source_count = db.query(func.count(EntitySource.id)).filter_by(entity_id=entity_id).scalar() or 0
+            if entity.source_count == 0:
+                entity.deleted_at = datetime.utcnow()
+    db.flush()
+
+
+def _upsert_legal_entity(db: Session, document: Document, *, name: str, entity_type: str, identity_key: str,
+                         excerpt: str, attributes: dict | None = None, origin: str = "legal_schema",
+                         review_status: str = "verified") -> tuple[Entity | None, bool]:
+    name = str(name or "").strip()[:500]
+    if not name:
+        return None, False
+    entity = db.query(Entity).filter_by(
+        knowledge_base_id=document.knowledge_base_id, identity_key=identity_key, entity_type=entity_type,
+    ).first()
+    created = False
+    if not entity:
+        entity = Entity(
+            knowledge_base_id=document.knowledge_base_id, name=name, canonical_name=canonical_entity_name(name),
+            identity_key=identity_key, entity_type=entity_type, attributes=attributes or {}, confidence=1.0,
+            origin=origin, review_status=review_status, is_legal=True,
+        )
+        db.add(entity); db.flush(); created = True
+        db.add(GraphProjectionEvent(event_type="entity", entity_id=entity.id))
+    else:
+        entity.deleted_at, entity.name, entity.attributes = None, name, {**(entity.attributes or {}), **(attributes or {})}
+        entity.origin, entity.review_status, entity.is_legal = origin, review_status, True
+    excerpt = str(excerpt or name)[:5000]
+    if not db.query(EntitySource).filter_by(entity_id=entity.id, document_id=document.id, excerpt=excerpt).first():
+        db.add(EntitySource(entity_id=entity.id, document_id=document.id, excerpt=excerpt)); entity.source_count += 1
+    return entity, created
+
+
+def _upsert_legal_relationship(db: Session, document: Document, *, source: Entity | None, target: Entity | None,
+                               relationship_type: str, excerpt: str, origin: str = "legal_schema",
+                               review_status: str = "verified", confidence: float = 1.0, attributes: dict | None = None) -> tuple[Relationship | None, bool]:
+    if not source or not target or source.id == target.id:
+        return None, False
+    relationship = db.query(Relationship).filter_by(
+        knowledge_base_id=document.knowledge_base_id, source_entity_id=source.id,
+        target_entity_id=target.id, relationship_type=relationship_type,
+    ).first()
+    created = False
+    if not relationship:
+        relationship = Relationship(
+            knowledge_base_id=document.knowledge_base_id, source_entity_id=source.id, target_entity_id=target.id,
+            relationship_type=relationship_type, confidence=confidence, attributes=attributes or {},
+            origin=origin, review_status=review_status, is_legal=True,
+        )
+        db.add(relationship); db.flush(); created = True
+        db.add(GraphProjectionEvent(event_type="relationship", relationship_id=relationship.id))
+    else:
+        # A reviewer decision is durable.  Rebuilding source metadata must not
+        # silently turn an approved/rejected suggestion back into a pending one.
+        if origin == "ai_suggestion" and relationship.origin == "ai_suggestion" and relationship.review_status in {"verified", "rejected"}:
+            return relationship, False
+        relationship.deleted_at, relationship.confidence = None, confidence
+        relationship.attributes = {**(relationship.attributes or {}), **(attributes or {})}
+        relationship.origin, relationship.review_status, relationship.is_legal = origin, review_status, True
+    excerpt = str(excerpt or relationship_type)[:5000]
+    if not db.query(RelationshipSource).filter_by(relationship_id=relationship.id, document_id=document.id, excerpt=excerpt).first():
+        db.add(RelationshipSource(relationship_id=relationship.id, document_id=document.id, excerpt=excerpt)); relationship.source_count += 1
+    return relationship, created
+
+
+def legal_instrument_entity(db: Session, document: Document) -> Entity | None:
+    return db.query(Entity).filter_by(
+        knowledge_base_id=document.knowledge_base_id,
+        identity_key=_document_legal_identity(document, "instrument"), entity_type="LegalInstrument",
+    ).filter(Entity.deleted_at.is_(None)).first()
+
+
+def sync_legal_document_graph(db: Session, document: Document, *, replace: bool = True) -> dict[str, int]:
+    """Project evidence-backed Legal Graph v2 nodes and edges for one document."""
+    if document.document_type not in LEGAL_DOCUMENT_TYPES:
+        return {"entities": 0, "relationships": 0}
+    if replace:
+        _remove_document_legal_projection(db, document)
+    if not document.legal_metadata:
+        db.flush()
+        return {"entities": 0, "relationships": 0}
+    metadata = legal_metadata_v2(document)
+    document.legal_metadata = metadata
+    text = document.extracted_text or ""
+    instrument = metadata.get("instrument") if isinstance(metadata.get("instrument"), dict) else {}
+    title = _legal_value(instrument, "official_title", "title") or document.title or document.original_filename
+    instrument_kind = _legal_value(instrument, "kind") or "Other"
+    anchor, entity_created = _upsert_legal_entity(
+        db, document, name=title, entity_type="LegalInstrument", identity_key=_document_legal_identity(document, "instrument"),
+        excerpt=text[:500] or title, attributes={"instrument_kind": instrument_kind, "document_id": document.id,
+        "official_number": instrument.get("official_number"), "effective_date": instrument.get("effective_date")},
+    )
+    entity_count, relationship_count = int(entity_created), 0
+
+    issuer = instrument.get("issuer")
+    issuer_name = _legal_value(issuer, "name", "organization")
+    if issuer_name:
+        issuer_entity, created = _upsert_legal_entity(
+            db, document, name=issuer_name, entity_type="LegalAuthority",
+            identity_key=f"legal:authority:{canonical_entity_name(issuer_name)}", excerpt=_legal_evidence(issuer, issuer_name),
+        ); entity_count += int(created)
+        _, created = _upsert_legal_relationship(db, document, source=anchor, target=issuer_entity, relationship_type="ISSUED_BY", excerpt=_legal_evidence(issuer, issuer_name)); relationship_count += int(created)
+
+    for provision in metadata.get("provisions", []) if isinstance(metadata.get("provisions"), list) else []:
+        number = _legal_value(provision, "number", "label")
+        if not number:
+            continue
+        kind = _legal_value(provision, "kind") or "article"
+        label = f"{kind.title()} {number}" if not str(number).startswith(("มาตรา", "ข้อ", "Article", "Clause")) else str(number)
+        provision_entity, created = _upsert_legal_entity(
+            db, document, name=label, entity_type="Provision",
+            identity_key=f"legal:provision:{document.id}:{canonical_entity_name(kind)}:{canonical_entity_name(number)}",
+            excerpt=_legal_evidence(provision, label), attributes={"provision_kind": kind, "provision_number": str(number), "heading": _legal_value(provision, "heading")},
+        ); entity_count += int(created)
+        _, created = _upsert_legal_relationship(db, document, source=anchor, target=provision_entity, relationship_type="CONTAINS_PROVISION", excerpt=_legal_evidence(provision, label)); relationship_count += int(created)
+
+    for values_key, entity_type, relationship_type in [
+        ("parties", "LegalParty", "PARTY_TO"), ("obligations", "Obligation", "REQUIRES"),
+        ("rights", "Right", "GRANTS_RIGHT"), ("prohibitions", "Prohibition", "PROHIBITS"),
+        ("definitions", "Definition", "DEFINES"), ("penalties", "Penalty", "REQUIRES"),
+        ("amendments", "Amendment", "AMENDS"),
+    ]:
+        values = metadata.get(values_key) if isinstance(metadata.get(values_key), list) else []
+        for item in values:
+            name = _legal_value(item, "name", "party", "organization", "description", "obligation", "title", "term", "definition", "penalty")
+            if not name:
+                continue
+            key = f"legal:{entity_type.casefold()}:{document.id}:{_legal_fingerprint(name)}"
+            item_entity, created = _upsert_legal_entity(db, document, name=name, entity_type=entity_type, identity_key=key,
+                excerpt=_legal_evidence(item, name), attributes={"role": _legal_value(item, "role")})
+            entity_count += int(created)
+            _, created = _upsert_legal_relationship(db, document, source=anchor, target=item_entity,
+                relationship_type=relationship_type, excerpt=_legal_evidence(item, name))
+            relationship_count += int(created)
+    db.flush()
+    return {"entities": entity_count, "relationships": relationship_count}
+
+
+def _clear_legal_suggestions(db: Session, knowledge_base_id: str) -> None:
+    rows = db.query(Relationship).filter_by(knowledge_base_id=knowledge_base_id, origin="ai_suggestion", is_legal=True, review_status="suggested").all()
+    for relationship in rows:
+        relationship.deleted_at = datetime.utcnow()
+
+
+def _target_instrument(db: Session, document: Document, reference: dict) -> Document | None:
+    title = _legal_value(reference, "target_title", "title", "instrument_title")
+    number = _legal_value(reference, "target_number", "official_number", "instrument_number")
+    candidates = db.query(Document).filter(
+        Document.knowledge_base_id == document.knowledge_base_id, Document.id != document.id,
+        Document.document_type.in_(LEGAL_DOCUMENT_TYPES), Document.status == "completed", Document.deleted_at.is_(None),
+    ).all()
+    for candidate in candidates:
+        metadata = legal_metadata_v2(candidate)
+        instrument = metadata.get("instrument") or {}
+        candidate_title = _legal_value(instrument, "official_title") or candidate.title or candidate.original_filename
+        if title and (canonical_entity_name(title) in canonical_entity_name(candidate_title) or canonical_entity_name(candidate_title) in canonical_entity_name(title)):
+            return candidate
+        if number and number == str(instrument.get("official_number") or ""):
+            return candidate
+    return None
+
+
+def build_legal_cross_document_suggestions(db: Session, knowledge_base_id: str) -> int:
+    """Create reviewable, evidenced cross-instrument links from extracted references."""
+    count = 0
+    documents = db.query(Document).filter(
+        Document.knowledge_base_id == knowledge_base_id, Document.document_type.in_(LEGAL_DOCUMENT_TYPES),
+        Document.status == "completed", Document.deleted_at.is_(None),
+    ).all()
+    for document in documents:
+        source = legal_instrument_entity(db, document)
+        metadata = legal_metadata_v2(document)
+        references = metadata.get("references", []) if isinstance(metadata.get("references"), list) else []
+        if not references and document.extracted_text:
+            candidates = []
+            for candidate in documents:
+                if candidate.id == document.id:
+                    continue
+                candidate_metadata = legal_metadata_v2(candidate)
+                candidate_instrument = candidate_metadata.get("instrument") or {}
+                candidates.append({
+                    "title": _legal_value(candidate_instrument, "official_title") or candidate.title or candidate.original_filename,
+                    "official_number": str(candidate_instrument.get("official_number") or ""),
+                })
+            references = OpenRouterClient().suggest_legal_relationships(document.title or document.original_filename, document.extracted_text, candidates)
+            if references:
+                metadata["references"] = references
+                document.legal_metadata = metadata
+        for reference in references:
+            if not isinstance(reference, dict):
+                continue
+            relationship_type = _legal_value(reference, "relationship", "relationship_type").upper() or "REFERS_TO"
+            if relationship_type not in LEGAL_GRAPH_RELATIONSHIPS:
+                relationship_type = "REFERS_TO"
+            target_document = _target_instrument(db, document, reference)
+            target = legal_instrument_entity(db, target_document) if target_document else None
+            _, created = _upsert_legal_relationship(
+                db, document, source=source, target=target, relationship_type=relationship_type,
+                excerpt=_legal_evidence(reference, relationship_type), origin="ai_suggestion", review_status="suggested",
+                confidence=float(reference.get("confidence") or 0.5), attributes={"reference": reference},
+            )
+            count += int(created)
+    db.flush()
+    return count
+
+
+def rebuild_legal_graph(db: Session, knowledge_base_id: str) -> dict[str, int]:
+    documents = db.query(Document).filter(
+        Document.knowledge_base_id == knowledge_base_id, Document.document_type.in_(LEGAL_DOCUMENT_TYPES),
+        Document.status == "completed", Document.deleted_at.is_(None),
+    ).all()
+    totals = {"documents": len(documents), "entities": 0, "relationships": 0, "suggestions": 0}
+    _clear_legal_suggestions(db, knowledge_base_id)
+    for document in documents:
+        result = sync_legal_document_graph(db, document, replace=True)
+        totals["entities"] += result["entities"]; totals["relationships"] += result["relationships"]
+    totals["suggestions"] = build_legal_cross_document_suggestions(db, knowledge_base_id)
+    db.commit()
+    return totals
 
 
 def resolve_entity(db: Session, knowledge_base_ids: list[str], text: str) -> Entity | None:
@@ -208,6 +531,8 @@ def entity_graph(db: Session, entity: Entity, depth: int = 1) -> dict:
     edges: list[Relationship] = []
     for _ in range(depth):
         found = db.query(Relationship).filter(Relationship.deleted_at.is_(None)).filter(
+            (Relationship.is_legal.is_(False)) | (Relationship.review_status == "verified")
+        ).filter(
             (Relationship.source_entity_id.in_(frontier)) | (Relationship.target_entity_id.in_(frontier))).all()
         edges.extend(edge for edge in found if edge.id not in {item.id for item in edges})
         next_frontier = {edge.source_entity_id for edge in found} | {edge.target_entity_id for edge in found}
@@ -463,6 +788,19 @@ def process_next_job(db: Session) -> bool:
     ).order_by(ProcessingJob.created_at).first()
     if not job:
         return False
+    if job.job_type == "REBUILD_LEGAL_GRAPH":
+        job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "rebuilding_legal_graph", 10, job.attempt_count + 1
+        db.commit()
+        try:
+            if not job.knowledge_base_id:
+                raise RuntimeError("KNOWLEDGE_BASE_NOT_FOUND")
+            rebuild_legal_graph(db, job.knowledge_base_id)
+            job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
+        except Exception as exc:
+            logger.exception("legal graph rebuild failed", extra={"job_id": job.id, "knowledge_base_id": job.knowledge_base_id})
+            job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "LEGAL_GRAPH_REBUILD_FAILED", str(exc)[:2000]
+        db.commit()
+        return True
     doc = db.get(Document, job.document_id)
     if not doc or doc.deleted_at:
         job.status, job.current_stage, job.error_code = "cancelled", "cancelled", "DOCUMENT_DELETED"
@@ -494,6 +832,7 @@ def process_next_job(db: Session) -> bool:
             job.current_stage, job.progress_percent = "legal_extraction", 60
             db.commit()
             doc.legal_metadata = OpenRouterClient().extract_legal_metadata(doc.title or doc.original_filename, text)
+            sync_legal_document_graph(db, doc)
             job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
             db.commit()
             return True

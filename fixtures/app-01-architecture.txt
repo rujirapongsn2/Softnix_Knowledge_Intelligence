@@ -1,0 +1,6 @@
+Enterprise IT Architecture — Sanitized Acceptance Fixture
+
+Customer Portal is hosted on APP-01 Production. APP-01 depends on PostgreSQL DB-01.
+Customer Service Process uses Customer Portal. If APP-01 stops, Customer Portal is unavailable
+and the Customer Service Process is indirectly affected.
+

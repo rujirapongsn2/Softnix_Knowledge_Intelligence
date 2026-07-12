@@ -1,0 +1,107 @@
+services:
+  api:
+    build: ./apps/api
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://skip:skip@postgres:5432/skip
+      REDIS_URL: redis://redis:6379/0
+      FILE_STORAGE_PATH: /data/files
+      NEO4J_HTTP_URL: http://neo4j:7474
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-now}
+    volumes: [files:/data/files]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_started}
+      neo4j: {condition: service_started}
+      lightrag: {condition: service_started}
+    ports: ["${API_PORT:-8001}:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  worker:
+    build: ./apps/api
+    command: python -m app.worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://skip:skip@postgres:5432/skip
+      REDIS_URL: redis://redis:6379/0
+      FILE_STORAGE_PATH: /data/files
+      NEO4J_HTTP_URL: http://neo4j:7474
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-now}
+    volumes: [files:/data/files]
+    depends_on: [api]
+  migrate:
+    build: ./apps/api
+    command: alembic upgrade head
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://skip:skip@postgres:5432/skip
+    depends_on: [postgres]
+  web:
+    build: ./apps/web
+    environment:
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
+    depends_on: [api]
+    ports: ["${WEB_PORT:-8081}:80"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  postgres:
+    image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+    environment: {POSTGRES_DB: skip, POSTGRES_USER: skip, POSTGRES_PASSWORD: skip}
+    volumes: [postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skip -d skip"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis:
+    image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    volumes: [redis:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  neo4j:
+    image: neo4j@sha256:4bae36aff76271e27fd6a6ed0835413f86a284cd179cfb1cb7d188f5f7533aca
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-change-me-now}"
+    volumes: [neo4j:/data]
+  lightrag:
+    image: ${LIGHTRAG_IMAGE:-ghcr.io/hkuds/lightrag:latest}
+    environment:
+      HOST: 0.0.0.0
+      PORT: 9621
+      WORKING_DIR: /app/data/rag_storage
+      INPUT_DIR: /app/data/inputs
+      PROMPT_DIR: /app/data/prompts
+      LIGHTRAG_API_KEY: ${LIGHTRAG_API_KEY}
+      LLM_BINDING: openai
+      LLM_BINDING_HOST: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      LLM_BINDING_API_KEY: ${OPENROUTER_API_KEY}
+      LLM_MODEL: ${OPENROUTER_LLM_MODEL:-openai/gpt-4o-mini}
+      KEYWORD_LLM_MODEL: ${OPENROUTER_LLM_MODEL:-openai/gpt-4o-mini}
+      QUERY_LLM_MODEL: ${OPENROUTER_LLM_MODEL:-openai/gpt-4o-mini}
+      EMBEDDING_BINDING: openai
+      EMBEDDING_BINDING_HOST: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      EMBEDDING_BINDING_API_KEY: ${OPENROUTER_API_KEY}
+      EMBEDDING_MODEL: ${OPENROUTER_EMBEDDING_MODEL:-openai/text-embedding-3-small}
+      EMBEDDING_DIM: ${OPENROUTER_EMBEDDING_DIMENSION:-1536}
+      ENTITY_EXTRACTION_USE_JSON: "true"
+      LIGHTRAG_PARSER: "*:native-teP,*:legacy-R"
+      VLM_PROCESS_ENABLE: "false"
+    volumes: [lightrag:/app/data]
+    depends_on: [postgres, neo4j]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9621/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+volumes: {postgres: {}, redis: {}, neo4j: {}, files: {}, lightrag: {}}

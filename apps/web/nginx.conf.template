@@ -1,0 +1,19 @@
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+  client_max_body_size ${MAX_FILE_SIZE_MB}m;
+
+  location / {
+    try_files $uri /index.html;
+  }
+
+  location /api/ {
+    proxy_pass http://api:8000/api/;
+  }
+
+  location /mcp {
+    proxy_pass http://api:8000/mcp;
+    proxy_http_version 1.1;
+    proxy_read_timeout 300s;
+  }
+}

@@ -1,0 +1,67 @@
+/*
+ * The React Flow node boundary must match the visible circle exactly.
+ * Labels are absolutely positioned so they never affect edge geometry.
+ */
+.graph-visual-node {
+  position: relative !important;
+  display: block !important;
+  width: 68px !important;
+  min-width: 68px !important;
+  height: 68px !important;
+  min-height: 68px !important;
+  overflow: visible !important;
+}
+
+.graph-visual-node .graph-node-circle {
+  width: 68px !important;
+  height: 68px !important;
+  box-sizing: border-box;
+}
+
+.graph-visual-node .graph-node-label,
+.graph-visual-node .graph-node-type {
+  position: absolute;
+  left: 50%;
+  width: 180px;
+  max-width: 180px;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.graph-visual-node .graph-node-label {
+  top: 75px;
+  min-height: 31px;
+}
+
+.graph-visual-node .graph-node-type {
+  top: 108px;
+  text-align: center;
+}
+
+.graph-visual-node .graph-handle {
+  width: 14px !important;
+  height: 14px !important;
+  opacity: 0;
+  border: 0 !important;
+  background: transparent !important;
+}
+
+.graph-visual-node .graph-handle-top {
+  top: 0 !important;
+  left: 50% !important;
+}
+
+.graph-visual-node .graph-handle-right {
+  top: 50% !important;
+  right: 0 !important;
+}
+
+.graph-visual-node .graph-handle-bottom {
+  bottom: 0 !important;
+  left: 50% !important;
+}
+
+.graph-visual-node .graph-handle-left {
+  top: 50% !important;
+  left: 0 !important;
+}

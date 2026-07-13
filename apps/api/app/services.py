@@ -1350,7 +1350,19 @@ def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: 
               "relationships": evidence.relationships, "paths": evidence.paths, "sources": evidence.sources,
               "warnings": [], "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": intent,
                                                 "retrieval_plan": decision.plan.model_dump(mode="json"),
-                                                "retrieval_trace": retrieval_trace}}
+                                                "planner_policy_version": decision.policy_version,
+                                                "retrieval_trace": retrieval_trace,
+                                                # Safe observability summaries. Full prompts, provider
+                                                # payloads, and document bodies are never persisted.
+                                                "query_preview": query[:500],
+                                                "query_length": len(query),
+                                                "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                                                "answer_preview": answer[:800],
+                                                "citation_ids": [source.get("citation_id") for source in evidence.sources],
+                                                "filter_summary": query_filters.model_dump(mode="json") if query_filters else {},
+                                                "response_summary": {"status": "success", "insufficient_evidence": not bool(evidence.sources),
+                                                                     "source_count": len(evidence.sources), "entity_count": len(evidence.entities),
+                                                                     "relationship_count": len(evidence.relationships)}}}
     saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
     db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
     return result

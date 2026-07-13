@@ -14,7 +14,7 @@ Base path: `/api/v1`. Admin APIs use secure HTTP-only login cookies.
 - `POST|GET /knowledge-bases/{id}/legal-graph/rebuild`, `PATCH /relationships/{id}/legal-review`
 - `GET|POST /tokens`, `POST /tokens/{id}/enable|disable|revoke`
 - `GET /mcp/activity` returns redacted MCP tool calls with the planner decision and actual retrieval route.
-- `GET /traces`, `GET /traces/{trace_id}` return safe RetrievalExecutor root/span traces for the Trace Explorer. Each span contains its channel, status, result count, duration, and relative timing offset; raw prompts, request bodies, tokens, and documents are excluded.
+- `GET /traces`, `GET /traces/{trace_id}` return safe RetrievalExecutor root/span traces for the Trace Explorer. The trace includes a bounded request preview, query length/hash, filter summary, answer preview, citation IDs, planner rationale/policy version, and per-span input/output summaries. Each span contains its channel, status, result count, reason code, duration, and relative timing offset. Tokens, headers, full prompts, provider payloads, and document bodies are excluded.
 
 Query responses include `metadata.retrieval_plan` and `metadata.retrieval_trace`. The plan is rule-first; it records graph scope, extracted entity/document identifiers, publication-date bounds, and whether reranking is permitted. OpenRouter is called only for ambiguous queries and its JSON output is constrained by the Knowledge Base policy. A trace marks each channel as `used`, `skipped`, or `unavailable` and includes result count and duration.
 

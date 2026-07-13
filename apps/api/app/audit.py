@@ -40,13 +40,26 @@ def record_retrieval_execution(db, request_id: str | None, result: dict, *, acto
         detail = _safe_trace_detail(step.get("detail"))
         if detail:
             item["detail"] = detail
+        item["input_summary"] = {
+            "query_sha256": metadata.get("query_sha256"),
+            "knowledge_base_count": len(metadata.get("knowledge_base_ids") or []),
+            "max_sources": (plan or {}).get("max_sources") if isinstance(plan, dict) else None,
+        }
+        item["output_summary"] = {
+            "result_count": item.get("result_count", 0),
+            "status": item.get("status"),
+        }
+        if item.get("status") == "skipped":
+            item["reason_code"] = "not_selected_by_plan" if "not selected" in (item.get("detail") or "") else "channel_unavailable"
         safe_trace.append(item)
     correlation_id = str(request_id or "").strip()[:36] or None
-    safe_plan = {key: plan[key] for key in ("intent", "planner_source", "channels", "graph_depth", "graph_scope", "entity_subjects", "document_identifiers", "published_from", "published_to", "rerank_enabled", "max_sources", "fallback_reason") if key in plan} if isinstance(plan, dict) else None
+    safe_plan = {key: plan[key] for key in ("version", "intent", "planner_source", "rationale", "channels", "graph_depth", "graph_scope", "entity_subjects", "document_identifiers", "published_from", "published_to", "rerank_enabled", "max_sources", "fallback_reason") if key in plan} if isinstance(plan, dict) else None
+    if safe_plan is not None and metadata.get("planner_policy_version") is not None:
+        safe_plan["policy_version"] = metadata.get("planner_policy_version")
     if safe_plan and safe_plan.get("fallback_reason"):
         safe_plan["fallback_reason"] = _safe_trace_detail(safe_plan["fallback_reason"])
     trace_status = "error" if any(item.get("status") == "unavailable" for item in safe_trace) else (
-        "warning" if any(item.get("status") == "skipped" for item in safe_trace) else "success"
+        "warning" if (safe_plan and safe_plan.get("fallback_reason")) or result.get("insufficient_evidence") else "success"
     )
     record_audit(db, "retrieval.execution", actor_id, "http_request", correlation_id, {
         "trace_id": correlation_id,
@@ -58,6 +71,17 @@ def record_retrieval_execution(db, request_id: str | None, result: dict, *, acto
         "result_id": result.get("result_id"),
         "source_count": len(result.get("sources") or []),
         "knowledge_base_ids": metadata.get("knowledge_base_ids") or [],
+        "request_summary": {
+            "query_preview": _safe_trace_detail(metadata.get("query_preview")),
+            "query_length": metadata.get("query_length", 0),
+            "query_sha256": metadata.get("query_sha256"),
+            "filter_summary": metadata.get("filter_summary") or {},
+        },
+        "response_summary": {
+            "answer_preview": _safe_trace_detail(metadata.get("answer_preview")),
+            "citation_ids": metadata.get("citation_ids") or [],
+            **(metadata.get("response_summary") or {}),
+        },
         "retrieval_plan": safe_plan,
         "retrieval_trace": safe_trace,
     })

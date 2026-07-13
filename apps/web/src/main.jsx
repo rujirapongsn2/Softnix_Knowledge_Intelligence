@@ -414,13 +414,55 @@ function TraceExplorer({traces}) {
   </aside><main className="trace-detail-pane">{loading ? <p className="section-copy">Loading trace…</p> : trace ? <TraceWaterfall trace={trace}/> : <EmptyState isCompact title="Choose a retrieval trace" description="Select a completed Search or MCP request to inspect its execution."/>}</main></section>;
 }
 
-function TraceWaterfall({trace}) {
+function TraceStatusLabel({status, reasonCode}) {
+  if (status === "skipped") return reasonCode === "not_selected_by_plan" ? "Skipped by plan" : "Skipped / unavailable";
+  if (status === "unavailable") return "Failed / unavailable";
+  if (status === "used") return "Completed";
+  return status || "Unknown";
+}
+
+function TraceOverview({trace}) {
+  const request = trace.request_summary || {};
+  const response = trace.response_summary || {};
+  return <div className="trace-overview-grid">
+    <section className="trace-payload-card"><p className="eyebrow">REQUEST</p><div className="trace-query-preview">{request.query_preview || "Query preview unavailable"}</div><dl className="trace-meta-list"><div><dt>Length</dt><dd>{request.query_length || 0} characters</dd></div><div><dt>SHA-256</dt><dd><code>{request.query_sha256 || "—"}</code></dd></div><div><dt>Filters</dt><dd>{Object.keys(request.filter_summary || {}).length ? JSON.stringify(request.filter_summary) : "None"}</dd></div></dl><p className="trace-safe-note">Bounded preview for administrators; full prompts and headers are never stored.</p></section>
+    <section className="trace-payload-card"><p className="eyebrow">RESPONSE</p><div className="trace-answer-preview">{response.answer_preview || "No answer preview"}</div><dl className="trace-meta-list"><div><dt>Status</dt><dd>{response.status || trace.status}</dd></div><div><dt>Sources</dt><dd>{response.source_count ?? trace.source_count ?? 0} cited source(s)</dd></div><div><dt>Entities / relationships</dt><dd>{response.entity_count ?? 0} / {response.relationship_count ?? 0}</dd></div></dl><p className="trace-safe-note">Answer text is truncated and redacted for audit use.</p></section>
+  </div>;
+}
+
+function TraceDecision({trace}) {
   const plan = trace.retrieval_plan || {};
+  return <section className="trace-decision"><div className="trace-decision-row"><span>Intent</span><strong>{plan.intent || trace.intent || "retrieval"}</strong></div><div className="trace-decision-row"><span>Decision source</span><strong>{plan.planner_source || "rules"}{plan.policy_version ? ` · policy v${plan.policy_version}` : ""}</strong></div><div className="trace-decision-row"><span>Why this route</span><strong>{plan.rationale || "No planner rationale was recorded."}</strong></div><div className="trace-decision-row"><span>Selected channels</span><strong>{plan.channels?.length ? plan.channels.join(" → ") : "None"}</strong></div><div className="trace-decision-row"><span>Limits</span><strong>top {plan.max_sources || "—"} · graph depth {plan.graph_depth || "—"} · {plan.graph_scope || "none"} scope</strong></div>{plan.fallback_reason && <div className="trace-decision-warning">Deterministic fallback: {plan.fallback_reason}</div>}<p className="trace-safe-note">A channel marked “Skipped by plan” is an intentional decision, not a runtime failure.</p></section>;
+}
+
+function TraceTimeline({trace}) {
   const total = Math.max(trace.duration_ms || 0, 1);
-  return <div className="trace-waterfall"><div className="trace-detail-heading"><div><p className="eyebrow">{trace.transport === "mcp" ? "MCP TRACE" : "SEARCH TRACE"}</p><h2>{trace.root_span?.name || "Knowledge query"}</h2><p>{trace.intent || "retrieval"} · {trace.source_count} cited source(s) · {trace.duration_ms} ms</p></div><span className={`trace-status ${trace.status}`}>{trace.status}</span></div>
+  const spans = (trace.spans || []).map(span => {
+    const left = Math.min(100, (Number(span.offset_ms || 0) / total) * 100);
+    const width = Math.max(1.5, Math.min(100 - left, (Number(span.duration_ms || 0) / total) * 100));
+    return <details className="waterfall-row" key={span.span_id}>
+      <summary><div><b>{span.channel}</b><small>{span.system}</small></div><div className="waterfall-track"><span className={`waterfall-bar ${span.status}`} style={{left: `${left}%`, width: `${width}%`}} title={`${span.offset_ms}–${Number(span.offset_ms || 0) + Number(span.duration_ms || 0)} ms`}/></div><div><em>{span.duration_ms} ms</em><small>{TraceStatusLabel({status: span.status, reasonCode: span.reason_code})} · {span.result_count || 0} results</small></div></summary>
+      {span.detail && <p>{span.detail}</p>}
+      <div className="trace-span-details"><dl><div><dt>Input</dt><dd>query {span.input_summary?.query_sha256 ? `sha ${span.input_summary.query_sha256.slice(0, 12)}…` : "summary unavailable"}; {span.input_summary?.knowledge_base_count ?? 0} KB(s); max {span.input_summary?.max_sources ?? "—"} sources</dd></div><div><dt>Output</dt><dd>{span.output_summary?.result_count ?? span.result_count ?? 0} result(s); {span.output_summary?.status || span.status}</dd></div>{span.reason_code && <div><dt>Reason</dt><dd>{TraceStatusLabel({status: span.status, reasonCode: span.reason_code})}</dd></div>}</dl></div>
+    </details>;
+  });
+  return <section className="waterfall-panel"><div className="waterfall-heading"><div>Execution spans</div><span>0 ms</span><span>{trace.duration_ms} ms</span></div><div className="waterfall-root"><b>{trace.root_span?.name || "Request"}</b><span className={`waterfall-root-bar ${trace.status}`}/><em>{trace.duration_ms} ms</em></div><div className="waterfall-spans">{spans}</div></section>;
+}
+
+function TraceEvidence({trace}) {
+  const ids = trace.response_summary?.citation_ids || [];
+  return <section className="trace-evidence"><p className="eyebrow">CITATIONS</p><h3>{ids.length ? `${ids.length} cited source(s)` : "No citations returned"}</h3>{ids.length ? <div className="trace-chip-list">{ids.map(id => <span className="trace-chip" key={id}>{id}</span>)}</div> : <p className="trace-empty-note">The executor did not return evidence for this request. Check the response summary and channel spans for the reason.</p>}<p className="trace-safe-note">Citation identifiers are retained so an operator can reconcile this trace with the cited Search/MCP response without storing document bodies.</p></section>;
+}
+
+function TraceWaterfall({trace}) {
+  const [tab, setTab] = useState("overview");
+  const plan = trace.retrieval_plan || {};
+  const tabs = [["overview", "Overview"], ["decision", "Decision"], ["timeline", "Timeline"], ["evidence", "Evidence"]];
+  return <div className="trace-waterfall">
+    <div className="trace-detail-heading"><div><p className="eyebrow">{trace.transport === "mcp" ? "MCP TRACE" : "SEARCH TRACE"}</p><h2>{trace.root_span?.name || "Knowledge query"}</h2><p>{trace.intent || "retrieval"} · {trace.source_count} cited source(s) · {trace.duration_ms} ms</p></div><span className={`trace-status ${trace.status}`}>{trace.status}</span></div>
     <section className="trace-context"><div><span>Trace ID</span><code>{trace.trace_id}</code></div><div><span>Scope</span><code>{trace.knowledge_base_ids?.length || 0} Knowledge Base(s)</code></div><div><span>Planner</span><code>{plan.planner_source || "rules"}</code></div></section>
-    <section className="trace-plan"><b>Retrieval plan</b><span>{plan.channels?.join(" → ") || "No channel plan recorded"}</span>{plan.fallback_reason && <small>Fallback: {plan.fallback_reason}</small>}</section>
-    <section className="waterfall-panel"><div className="waterfall-heading"><div>Execution spans</div><span>0 ms</span><span>{trace.duration_ms} ms</span></div><div className="waterfall-root"><b>{trace.root_span?.name || "Request"}</b><span className={`waterfall-root-bar ${trace.status}`}/><em>{trace.duration_ms} ms</em></div><div className="waterfall-spans">{trace.spans.map(span => { const left = Math.min(100, (Number(span.offset_ms || 0) / total) * 100); const width = Math.max(1.5, Math.min(100 - left, (Number(span.duration_ms || 0) / total) * 100)); return <div className="waterfall-row" key={span.span_id}><div><b>{span.channel}</b><small>{span.system}</small></div><div className="waterfall-track"><span className={`waterfall-bar ${span.status}`} style={{left: `${left}%`, width: `${width}%`}} title={`${span.offset_ms}–${Number(span.offset_ms || 0) + Number(span.duration_ms || 0)} ms`}/></div><div><em>{span.duration_ms} ms</em><small>{span.status} · {span.result_count || 0} results</small></div>{span.detail && <p>{span.detail}</p>}</div>; })}</div></section>
+    <nav className="trace-tabs" aria-label="Trace detail views">{tabs.map(([value, label]) => <button type="button" role="tab" aria-selected={tab === value} className={tab === value ? "selected" : ""} key={value} onClick={() => setTab(value)}>{label}</button>)}</nav>
+    {tab === "overview" && <TraceOverview trace={trace}/>} {tab === "decision" && <TraceDecision trace={trace}/>} {tab === "timeline" && <TraceTimeline trace={trace}/>} {tab === "evidence" && <TraceEvidence trace={trace}/>}
   </div>;
 }
 

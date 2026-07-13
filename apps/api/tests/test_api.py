@@ -514,7 +514,9 @@ def test_admin_query_transaction_includes_retrieval_executor_trace():
     assert detail["root_span"]["span_id"] == "root"
     assert detail["spans"]
     assert all("offset_ms" in span and "duration_ms" in span for span in detail["spans"])
-    assert "query" not in detail
+    assert detail["request_summary"]["query_preview"] == "platform"
+    assert detail["request_summary"]["query_sha256"]
+    assert "Bearer " not in str(detail)
 
 
 def test_document_restore_graph_layout_and_feedback_lifecycle():

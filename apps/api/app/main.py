@@ -843,6 +843,8 @@ def trace_summary(row: AuditLog) -> dict:
         "knowledge_base_ids": metadata.get("knowledge_base_ids") or [],
         "source_count": metadata.get("source_count", 0),
         "duration_ms": total_duration,
+        "request_summary": metadata.get("request_summary") or {},
+        "response_summary": metadata.get("response_summary") or {},
         "created_at": row.created_at,
     }
 

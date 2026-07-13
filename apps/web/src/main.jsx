@@ -24,6 +24,8 @@ import "./access.css";
 import "./branding.css";
 import "./graph-visual.css";
 import "./graph-topology.css";
+import "./retrieval-policy.css";
+import "./logging.css";
 import {connectionHandles} from "./graph-geometry.mjs";
 
 const ACCEPTED_FILES = ".pdf,.docx,.pptx,.xlsx,.xls,.txt,.md,.html,.htm,.csv,.json";
@@ -101,6 +103,9 @@ function App() {
   const [showDeletedDocuments, setShowDeletedDocuments] = useState(false);
   const [tokens, setTokens] = useState([]);
   const [auditLogs, setAuditLogs] = useState([]);
+  const [mcpActivity, setMcpActivity] = useState([]);
+  const [transactionLogs, setTransactionLogs] = useState([]);
+  const [traceLogs, setTraceLogs] = useState([]);
   const [legalGraphView, setLegalGraphView] = useState("verified");
   const [isLegalGraph, setIsLegalGraph] = useState(false);
   const [legalRebuildStatus, setLegalRebuildStatus] = useState(null);
@@ -172,6 +177,13 @@ function App() {
       await api(`/v1/knowledge-bases/${knowledgeBase.id}${action === "delete" ? "" : `/${action}`}`, {method: action === "delete" ? "DELETE" : "POST"});
       await loadKbs();
       notify(`Knowledge Base ${action === "delete" ? "deleted" : action === "disable" ? "disabled" : "activated"}.`);
+    } catch (error) { showError(error); }
+  };
+  const updateRetrievalConfig = async (knowledgeBase, config) => {
+    try {
+      const updated = await api(`/v1/knowledge-bases/${knowledgeBase.id}/retrieval-config`, {method: "PATCH", body: JSON.stringify(config)});
+      setKbs(items => items.map(item => item.id === updated.id ? updated : item));
+      notify("Retrieval policy updated for this Knowledge Base.");
     } catch (error) { showError(error); }
   };
   const addEntity = async ({name, entityType}) => {
@@ -272,9 +284,20 @@ function App() {
     catch (error) { showError(error); }
   };
   const loadAccess = async () => {
-    const [nextTokens, nextAudit] = await Promise.all([api("/v1/tokens"), api("/v1/audit-logs?limit=20")]);
-    setTokens(nextTokens); setAuditLogs(nextAudit);
+    const [nextTokens, nextAudit, nextMcpActivity] = await Promise.all([
+      api("/v1/tokens"), api("/v1/audit-logs?limit=20"), api("/v1/mcp/activity?limit=50"),
+    ]);
+    setTokens(nextTokens); setAuditLogs(nextAudit); setMcpActivity(nextMcpActivity);
   };
+  const loadTransactionLogs = async () => {
+    setTransactionLogs(await api("/v1/logs/transactions?limit=250"));
+  };
+  const loadTraceLogs = async () => {
+    setTraceLogs(await api("/v1/traces?limit=250"));
+  };
+  useEffect(() => {
+    if (user && activeView === "logs") Promise.all([loadTransactionLogs(), loadTraceLogs()]).catch(showError);
+  }, [user, activeView]);
   const createMcpToken = async payload => {
     const result = await api("/v1/tokens", {method: "POST", body: JSON.stringify(payload)});
     await loadAccess(); notify("MCP token created. Copy it now; it will not be shown again."); return result;
@@ -299,7 +322,7 @@ function App() {
       <SideNavItem label="Search" isSelected={activeView === "search"} onClick={() => switchView("search")}/>
       <SideNavItem label="Explore graph" isSelected={activeView === "explore"} onClick={() => switchView("explore")}/>
     </SideNavSection>
-    <SideNavSection title="SYSTEM"><SideNavItem label="Access & MCP" isSelected={activeView === "access"} onClick={() => switchView("access")}/></SideNavSection>
+    <SideNavSection title="SYSTEM"><SideNavItem label="Access & MCP" isSelected={activeView === "access"} onClick={() => switchView("access")}/><SideNavItem label="Logging" isSelected={activeView === "logs"} onClick={() => switchView("logs")}/></SideNavSection>
   </SideNav>;
   const topNav = <TopNav label="Workspace navigation" heading={<TopNavHeading heading={selectedKb?.name || "Knowledge workspace"}/>} endContent={<div className="topnav-user"><span className="status-indicator"/> {user.username}</div>}/>;
 
@@ -307,7 +330,7 @@ function App() {
     <div className="workspace" aria-live="polite">
       {message && <Toast body={message.body} type={message.type} isAutoHide={message.type !== "error"} autoHideDuration={5000} onDismiss={() => setMessage(null)}/>} 
       {activeView === "overview" && <Overview selectedKb={selectedKb} kbs={kbs} documents={documents} completedDocuments={completedDocuments} processingDocuments={processingDocuments} onViewDocuments={() => switchView("documents")} onSearch={() => switchView("search")} onCreate={() => switchView("knowledge-bases")}/>}
-      {activeView === "knowledge-bases" && <KnowledgeBases kbs={kbs} selectedKbId={selectedKbId} setSelectedKbId={setSelectedKbId} newKbName={newKbName} setNewKbName={setNewKbName} createKb={createKb} manageKnowledgeBase={manageKnowledgeBase} onContinue={() => switchView("documents")}/>}
+      {activeView === "knowledge-bases" && <KnowledgeBases kbs={kbs} selectedKbId={selectedKbId} setSelectedKbId={setSelectedKbId} newKbName={newKbName} setNewKbName={setNewKbName} createKb={createKb} manageKnowledgeBase={manageKnowledgeBase} updateRetrievalConfig={updateRetrievalConfig} onContinue={() => switchView("documents")}/>}
       {activeView === "documents" && (
         <Documents selectedKb={selectedKb} documents={documents} showDeletedDocuments={showDeletedDocuments} setShowDeletedDocuments={setShowDeletedDocuments} uploadFile={uploadFile} setUploadFile={setUploadFile} uploadTitle={uploadTitle} setUploadTitle={setUploadTitle} uploadDocumentType={uploadDocumentType} setUploadDocumentType={setUploadDocumentType} uploadDocument={uploadDocument} isUploading={isUploading} openDocument={openDocument} extractLegalMetadata={extractLegalMetadata} saveLegalMetadata={saveLegalMetadata} deleteLegalMetadata={deleteLegalMetadata} reprocessDocument={reprocessDocument} deleteDocument={deleteDocument} restoreDocument={restoreDocument} reindexEmbeddings={reindexEmbeddings} refreshDocuments={() => loadKbData(selectedKbId).catch(showError)} documentPreview={documentPreview} documentJobs={documentJobs} onCreateKb={() => switchView("knowledge-bases")} onSearch={() => switchView("search")} onExplore={() => switchView("explore")}/>
       )}
@@ -317,9 +340,88 @@ function App() {
       {activeView === "explore" && (
         <ExploreView selectedKb={selectedKb} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={() => loadKbData(selectedKbId).catch(showError)} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship}/>
       )}
-      {activeView === "access" && <AccessView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} changeTokenState={changeTokenState}/>} 
+      {activeView === "access" && <><AccessView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} mcpActivity={mcpActivity} loadAccess={loadAccess} createMcpToken={createMcpToken} changeTokenState={changeTokenState}/><McpActivity activity={mcpActivity}/></>}
+      {activeView === "logs" && <LoggingView transactions={transactionLogs} traces={traceLogs} loadTransactions={loadTransactionLogs} loadTraces={loadTraceLogs}/>}
     </div>
   </AppShell></Theme>;
+}
+
+function LoggingView({transactions, traces, loadTransactions, loadTraces}) {
+  const [search, setSearch] = useState("");
+  const [method, setMethod] = useState("all");
+  const [status, setStatus] = useState("all");
+  const [expandedId, setExpandedId] = useState(null);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [view, setView] = useState("traces");
+  useEffect(() => {
+    if (!autoRefresh) return undefined;
+    const timer = window.setInterval(() => Promise.all([loadTransactions(), loadTraces()]).catch(() => undefined), 10000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, loadTransactions, loadTraces]);
+  const visible = transactions.filter(item => {
+    const needle = search.trim().toLocaleLowerCase();
+    const matchSearch = !needle || `${item.request_id} ${item.path} ${item.authentication}`.toLocaleLowerCase().includes(needle);
+    const matchMethod = method === "all" || item.method === method;
+    const matchStatus = status === "all" || (status === "error" ? Number(item.status_code) >= 400 : String(item.status_code).startsWith(status));
+    return matchSearch && matchMethod && matchStatus;
+  });
+  const errors = transactions.filter(item => Number(item.status_code) >= 400).length;
+  const mcpRequests = transactions.filter(item => item.path === "/mcp").length;
+  const retrievalRequests = transactions.filter(item => item.retrieval?.retrieval_trace?.length).length;
+  const averageDuration = transactions.length ? Math.round(transactions.reduce((total, item) => total + Number(item.duration_ms || 0), 0) / transactions.length) : 0;
+  const methods = [...new Set(transactions.map(item => item.method).filter(Boolean))].sort();
+  return <><PageHeading eyebrow="OPERATIONS" title="Request logging" description="Inspect requests or trace how retrieval decisions, parallel channels, and answer generation were executed. Sensitive request content is never stored." actions={<><label className="log-auto-refresh"><input type="checkbox" checked={autoRefresh} onChange={event => setAutoRefresh(event.target.checked)}/> Auto-refresh</label><Button label="Refresh logs" variant="secondary" onClick={() => Promise.all([loadTransactions(), loadTraces()])}/></>}/>
+    <section className="metric-grid"><Metric value={transactions.length} label="Recent transactions" detail="Most recent 250 requests"/><Metric value={errors} label="Errors" detail="HTTP status 4xx and 5xx"/><Metric value={retrievalRequests} label="Retrieval executions" detail={`${mcpRequests} MCP request(s) in this view`}/><Metric value={`${averageDuration} ms`} label="Average duration" detail="Across displayed transactions"/></section>
+    <div className="log-tabs" role="tablist"><button role="tab" aria-selected={view === "traces"} className={view === "traces" ? "selected" : ""} onClick={() => setView("traces")}>Trace Explorer</button><button role="tab" aria-selected={view === "transactions"} className={view === "transactions" ? "selected" : ""} onClick={() => setView("transactions")}>All transactions</button></div>
+    {view === "traces" ? <TraceExplorer traces={traces}/> : <Card padding={4}><div className="log-filter-bar"><TextInput label="Find a request" value={search} onChange={setSearch} placeholder="Request ID, route, or authentication"/><label className="native-field">Method<select value={method} onChange={event => setMethod(event.target.value)}><option value="all">All methods</option>{methods.map(value => <option key={value} value={value}>{value}</option>)}</select></label><label className="native-field">Status<select value={status} onChange={event => setStatus(event.target.value)}><option value="all">All statuses</option><option value="2">2xx success</option><option value="4">4xx client error</option><option value="5">5xx server error</option><option value="error">All errors</option></select></label></div>
+      <p className="section-copy log-privacy-note">Protected data: request bodies, prompt content, cookies, authorization headers, and token values are excluded from this log.</p>
+      {visible.length ? <div className="transaction-list">{visible.map(item => {
+        const isOpen = expandedId === item.id;
+        const isError = Number(item.status_code) >= 400;
+        const execution = item.retrieval;
+        return <article className={`transaction-row ${isError ? "has-error" : ""}`} key={item.id}><button type="button" className="transaction-summary" onClick={() => setExpandedId(isOpen ? null : item.id)} aria-expanded={isOpen}><span className="transaction-route"><b className={`http-method ${item.method?.toLowerCase()}`}>{item.method}</b><code>{item.path}</code><small>{new Date(item.created_at).toLocaleString()} · {item.authentication}{execution ? " · retrieval trace" : ""}</small></span><span className={`transaction-status ${isError ? "error" : ""}`}>{item.status_code}</span><span className="transaction-duration">{item.duration_ms} ms</span></button>{isOpen && <div className="transaction-detail"><div><span>Request ID</span><code>{item.request_id}</code></div><div><span>Transaction</span><code>{item.method} {item.path} → {item.status_code} in {item.duration_ms} ms</code></div>{execution && <RetrievalExecutionTrace execution={execution}/>}<p>Use the request ID to correlate this entry with structured service logs and MCP activity. No request content is retained.</p></div>}</article>;
+      })}</div> : <EmptyState isCompact title="No matching transactions" description="Try removing a filter or refresh the logs."/>}
+    </Card>}</>;
+}
+
+function RetrievalExecutionTrace({execution}) {
+  const plan = execution.retrieval_plan || {};
+  const trace = execution.retrieval_trace || [];
+  return <section className="retrieval-execution"><div className="retrieval-execution-heading"><span>Retrieval execution</span><b>{plan.intent || execution.tool || "retrieval"}</b></div>{plan.channels?.length > 0 && <p className="retrieval-plan-summary">{plan.planner_source || "rules"} · {plan.channels.join(", ")}{plan.fallback_reason ? " · deterministic fallback" : ""}</p>}<ul className="retrieval-execution-list">{trace.map((step, index) => <li key={`${step.channel}-${step.system}-${index}`}><i className={`mcp-step-dot ${step.status}`}/><div><b>{step.channel}</b><small>{step.system} · {step.status} · {step.result_count || 0} result(s) · {step.duration_ms || 0} ms</small>{step.detail && <span>{step.detail}</span>}</div></li>)}</ul></section>;
+}
+
+function TraceExplorer({traces}) {
+  const [selectedTraceId, setSelectedTraceId] = useState("");
+  const [trace, setTrace] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [filter, setFilter] = useState("");
+  useEffect(() => {
+    if (!selectedTraceId && traces[0]?.trace_id) setSelectedTraceId(traces[0].trace_id);
+    if (selectedTraceId && !traces.some(item => item.trace_id === selectedTraceId)) setSelectedTraceId(traces[0]?.trace_id || "");
+  }, [traces, selectedTraceId]);
+  useEffect(() => {
+    if (!selectedTraceId) { setTrace(null); return undefined; }
+    let active = true; setLoading(true);
+    api(`/v1/traces/${selectedTraceId}`).then(value => { if (active) setTrace(value); }).catch(() => { if (active) setTrace(null); }).finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [selectedTraceId]);
+  const visible = traces.filter(item => {
+    const needle = filter.trim().toLocaleLowerCase();
+    return !needle || `${item.trace_id} ${item.tool || ""} ${item.intent || ""} ${item.transport}`.toLocaleLowerCase().includes(needle);
+  });
+  return <section className="trace-explorer"><aside className="trace-list-pane"><div className="trace-list-heading"><div><p className="eyebrow">TRACE EXPLORER</p><h2>Retrieval runs</h2></div><span>{visible.length}</span></div><TextInput label="Find a trace" value={filter} onChange={setFilter} placeholder="Tool, intent, or trace ID"/>
+    <div className="trace-list">{visible.map(item => <button type="button" key={item.trace_id} className={`trace-summary ${item.trace_id === selectedTraceId ? "selected" : ""}`} onClick={() => setSelectedTraceId(item.trace_id)}><span className={`trace-status-dot ${item.status}`}/><span><b>{item.tool || "Search knowledge"}</b><small>{item.intent || "retrieval"} · {item.transport}</small><small>{new Date(item.created_at).toLocaleString()}</small></span><em>{item.duration_ms} ms</em></button>)}</div>
+  </aside><main className="trace-detail-pane">{loading ? <p className="section-copy">Loading trace…</p> : trace ? <TraceWaterfall trace={trace}/> : <EmptyState isCompact title="Choose a retrieval trace" description="Select a completed Search or MCP request to inspect its execution."/>}</main></section>;
+}
+
+function TraceWaterfall({trace}) {
+  const plan = trace.retrieval_plan || {};
+  const total = Math.max(trace.duration_ms || 0, 1);
+  return <div className="trace-waterfall"><div className="trace-detail-heading"><div><p className="eyebrow">{trace.transport === "mcp" ? "MCP TRACE" : "SEARCH TRACE"}</p><h2>{trace.root_span?.name || "Knowledge query"}</h2><p>{trace.intent || "retrieval"} · {trace.source_count} cited source(s) · {trace.duration_ms} ms</p></div><span className={`trace-status ${trace.status}`}>{trace.status}</span></div>
+    <section className="trace-context"><div><span>Trace ID</span><code>{trace.trace_id}</code></div><div><span>Scope</span><code>{trace.knowledge_base_ids?.length || 0} Knowledge Base(s)</code></div><div><span>Planner</span><code>{plan.planner_source || "rules"}</code></div></section>
+    <section className="trace-plan"><b>Retrieval plan</b><span>{plan.channels?.join(" → ") || "No channel plan recorded"}</span>{plan.fallback_reason && <small>Fallback: {plan.fallback_reason}</small>}</section>
+    <section className="waterfall-panel"><div className="waterfall-heading"><div>Execution spans</div><span>0 ms</span><span>{trace.duration_ms} ms</span></div><div className="waterfall-root"><b>{trace.root_span?.name || "Request"}</b><span className={`waterfall-root-bar ${trace.status}`}/><em>{trace.duration_ms} ms</em></div><div className="waterfall-spans">{trace.spans.map(span => { const left = Math.min(100, (Number(span.offset_ms || 0) / total) * 100); const width = Math.max(1.5, Math.min(100 - left, (Number(span.duration_ms || 0) / total) * 100)); return <div className="waterfall-row" key={span.span_id}><div><b>{span.channel}</b><small>{span.system}</small></div><div className="waterfall-track"><span className={`waterfall-bar ${span.status}`} style={{left: `${left}%`, width: `${width}%`}} title={`${span.offset_ms}–${Number(span.offset_ms || 0) + Number(span.duration_ms || 0)} ms`}/></div><div><em>{span.duration_ms} ms</em><small>{span.status} · {span.result_count || 0} results</small></div>{span.detail && <p>{span.detail}</p>}</div>; })}</div></section>
+  </div>;
 }
 
 const PageHeading = ({eyebrow, title, description, actions}) => <div className="page-heading"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
@@ -337,7 +439,7 @@ function Overview({selectedKb, kbs, documents, completedDocuments, processingDoc
   </>;
 }
 
-function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKbName, createKb, manageKnowledgeBase, onContinue}) {
+function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKbName, createKb, manageKnowledgeBase, updateRetrievalConfig, onContinue}) {
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const normalizedSearch = searchTerm.trim().toLocaleLowerCase();
@@ -348,9 +450,19 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
   return <><PageHeading eyebrow="KNOWLEDGE BASES" title="Organize knowledge by context" description="Keep documents, concepts, and relationships together so every answer stays relevant."/>
     <section className="two-column"><Card padding={4}><h2>Create a Knowledge Base</h2><p className="section-copy">Examples: IT Architecture, Security Policies, Product Documentation.</p><form className="form-stack" onSubmit={createKb}><TextInput label="Knowledge Base name" value={newKbName} onChange={setNewKbName} placeholder="e.g. IT Architecture" isRequired/><Button label="Create Knowledge Base" type="submit" variant="primary"/></form></Card><Card padding={4}><h2>How this stays organized</h2><ul className="guidance-list"><li>Each document belongs to one Knowledge Base.</li><li>Queries search the selected Knowledge Base only.</li><li>Entities and graph relationships remain scoped to that context.</li></ul></Card></section>
     {kbs.length > 0 && <section className="kb-filter-bar" aria-label="Filter Knowledge Bases"><TextInput label="Search Knowledge Bases" value={searchTerm} onChange={setSearchTerm} placeholder="Search by name or code"/><label className="native-field">Status<select value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><option value="all">All statuses</option><option value="active">Active</option><option value="draft">Draft</option><option value="disabled">Disabled</option></select></label><p className="section-copy">{visibleKnowledgeBases.length} of {kbs.length} Knowledge Bases</p></section>}
-    <section className="kb-grid">{kbs.length ? visibleKnowledgeBases.map(kb => <article className={`kb-card ${kb.id === selectedKbId ? "selected" : ""}`} key={kb.id}><button className="kb-card-select" onClick={() => setSelectedKbId(kb.id)}><span className="kb-card-title">{kb.name}</span><span className="kb-card-code">{kb.code}</span><StatusBadge status={kb.status}/></button>{kb.id === selectedKbId && <button className="kb-selected" onClick={onContinue}>Selected · continue to Documents →</button>}<div className="kb-card-actions">{kb.status === "active" ? <Button label="Disable" size="sm" variant="secondary" onClick={() => manageKnowledgeBase(kb, "disable")}/> : <Button label="Activate" size="sm" variant="secondary" onClick={() => manageKnowledgeBase(kb, "activate")}/>}<Button label="Delete" size="sm" variant="destructive" onClick={() => manageKnowledgeBase(kb, "delete")}/></div></article>) : <EmptyState title="Create your first Knowledge Base" description="Start with one focused domain. You can add more as your organization grows."/>}{kbs.length > 0 && !visibleKnowledgeBases.length && <EmptyState isCompact title="No Knowledge Bases match" description="Try another name, code, or status filter."/>}</section>
+    <section className="kb-grid">{kbs.length ? visibleKnowledgeBases.map(kb => <article className={`kb-card ${kb.id === selectedKbId ? "selected" : ""}`} key={kb.id}><button className="kb-card-select" onClick={() => setSelectedKbId(kb.id)}><span className="kb-card-title">{kb.name}</span><span className="kb-card-code">{kb.code}</span><StatusBadge status={kb.status}/></button>{kb.id === selectedKbId && <button className="kb-selected" onClick={onContinue}>Selected · continue to Documents →</button>}<div className="kb-card-actions">{kb.status === "active" ? <Button label="Disable" size="sm" variant="secondary" onClick={() => manageKnowledgeBase(kb, "disable")}/> : <Button label="Activate" size="sm" variant="secondary" onClick={() => manageKnowledgeBase(kb, "activate")}/>}<Button label="Delete" size="sm" variant="destructive" onClick={() => manageKnowledgeBase(kb, "delete")}/></div>{kb.id === selectedKbId && <RetrievalPolicyEditor knowledgeBase={kb} onSave={config => updateRetrievalConfig(kb, config)}/>}</article>) : <EmptyState title="Create your first Knowledge Base" description="Start with one focused domain. You can add more as your organization grows."/>}{kbs.length > 0 && !visibleKnowledgeBases.length && <EmptyState isCompact title="No Knowledge Bases match" description="Try another name, code, or status filter."/>}</section>
     {selectedKbId && <div className="page-footer-action"><Button label="Continue to documents" variant="primary" onClick={onContinue}/></div>}
   </>;
+}
+
+function RetrievalPolicyEditor({knowledgeBase, onSave}) {
+  const current = knowledgeBase.retrieval_config || {};
+  const [draft, setDraft] = useState(current);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => setDraft(current), [knowledgeBase.id, knowledgeBase.retrieval_config]);
+  const toggle = key => setDraft(value => ({...value, [key]: !value[key]}));
+  const save = async event => { event.preventDefault(); setSaving(true); try { await onSave(draft); } finally { setSaving(false); } };
+  return <details className="retrieval-policy"><summary>Retrieval policy</summary><form className="retrieval-policy-form" onSubmit={save}><p className="section-copy">Controls which stores the planner may use for this Knowledge Base.</p><label className="native-field">Mode<select value={draft.retrieval_mode || "auto"} onChange={event => setDraft({...draft, retrieval_mode: event.target.value})}><option value="auto">Auto</option><option value="balanced">Balanced</option><option value="precision">Precision</option><option value="recall">Recall</option></select></label><div className="policy-checks">{[["enable_vector","Semantic vector"],["enable_fulltext","Full-text"],["enable_graph","Graph"],["enable_lightrag","LightRAG"],["enable_reranker","Reranker"],["planner_llm_fallback","LLM fallback for ambiguous queries"]].map(([key,label]) => <label key={key}><input type="checkbox" checked={draft[key] !== false} onChange={() => toggle(key)}/>{label}</label>)}</div><div className="policy-numbers"><label>Default top-k<input type="number" min="1" max="30" value={draft.default_top_k || 12} onChange={event => setDraft({...draft, default_top_k: Number(event.target.value)})}/></label><label>Graph depth<input type="number" min="1" max="3" value={draft.maximum_graph_depth || 3} onChange={event => setDraft({...draft, maximum_graph_depth: Number(event.target.value)})}/></label></div><Button label="Save retrieval policy" type="submit" size="sm" variant="secondary" isLoading={saving}/></form></details>;
 }
 
 function Documents({selectedKb, documents, showDeletedDocuments, setShowDeletedDocuments, uploadFile, setUploadFile, uploadTitle, setUploadTitle, uploadDocumentType, setUploadDocumentType, uploadDocument, isUploading, openDocument, extractLegalMetadata, saveLegalMetadata, deleteLegalMetadata, reprocessDocument, deleteDocument, restoreDocument, reindexEmbeddings, refreshDocuments, documentPreview, documentJobs, onCreateKb, onSearch, onExplore}) {
@@ -521,7 +633,7 @@ function GraphCanvas({knowledgeBaseId, entities, relationships, addEntity, addRe
   </section>;
 }
 
-function AccessView({selectedKb, knowledgeBases, tokens, auditLogs, loadAccess, createMcpToken, changeTokenState}) {
+function AccessView({selectedKb, knowledgeBases, tokens, auditLogs, mcpActivity, loadAccess, createMcpToken, changeTokenState}) {
   const allTools = ["search_knowledge", "find_entities", "analyze_relationships", "analyze_impact", "get_sources"];
   const activeKnowledgeBases = knowledgeBases.filter(kb => kb.status === "active");
   const [name, setName] = useState(""); const [secret, setSecret] = useState(""); const [isLoading, setIsLoading] = useState(false); const [formError, setFormError] = useState(""); const [copied, setCopied] = useState("");
@@ -545,9 +657,32 @@ function AccessView({selectedKb, knowledgeBases, tokens, auditLogs, loadAccess, 
   return <><PageHeading eyebrow="ACCESS & MCP" title="Connect knowledge safely" description="Create a scoped token, copy a ready-to-run configuration, then verify the connection." actions={<Button label="Refresh status" variant="ghost" onClick={() => { loadAccess(); loadOperations(); }}/>}/><section className="mcp-overview"><div className="mcp-status"><span className="status-dot"/><div><b>{operations?.ready?.status || "Checking system"}</b><span>{operations ? `${Object.keys(operations.ready.dependencies || {}).length} dependencies online` : "Loading dependencies"}</span></div></div><div className="mcp-endpoint"><span>Server endpoint</span><code>{mcpUrl}</code><button type="button" onClick={() => copy(mcpUrl, "endpoint")}>Copy</button></div></section><section className="mcp-grid"><Card padding={4}><div className="card-heading"><div><p className="eyebrow">STEP 1</p><h2>Create a scoped token</h2></div><Badge label="Secret shown once" variant="warning"/></div><form className="form-stack" onSubmit={create}><TextInput label="Token name" value={name} onChange={setName} placeholder="e.g. claude-code-architecture" isRequired/><div className="scope-section"><div className="scope-heading"><b>Knowledge Base access</b>{activeKnowledgeBases.length > 0 && <button type="button" onClick={() => setSelectedKbs(activeKnowledgeBases.map(kb => kb.id))}>Select all</button>}</div><p className="section-copy">Only active Knowledge Bases can be granted to an MCP token.</p><div className="scope-options">{activeKnowledgeBases.length ? activeKnowledgeBases.map(kb => <label key={kb.id} className={`scope-option ${selectedKbs.includes(kb.id) ? "selected" : ""}`}><input type="checkbox" checked={selectedKbs.includes(kb.id)} onChange={() => toggle(kb.id, selectedKbs, setSelectedKbs)}/><span>{kb.name}</span></label>) : <p className="section-copy">No active Knowledge Bases. Activate one from Knowledge Bases before creating a token.</p>}</div></div><div className="scope-section"><div className="scope-heading"><b>Allowed tools</b><button type="button" onClick={() => setTools(allTools)}>Enable all</button></div><div className="tool-options">{allTools.map(tool => <label key={tool} className={`tool-option ${tools.includes(tool) ? "selected" : ""}`}><input type="checkbox" checked={tools.includes(tool)} onChange={() => toggle(tool, tools, setTools)}/><span>{tool.replace(/_/g, " ")}</span></label>)}</div></div><details className="advanced-options"><summary>Advanced limits</summary><div className="limit-grid"><label>Expiry (optional)<input type="datetime-local" value={expiresAt} onChange={event => setExpiresAt(event.target.value)}/></label><label>Requests/min<input type="number" min="1" max="10000" value={rpm} onChange={event => setRpm(event.target.value)}/></label><label>Concurrent requests<input type="number" min="1" max="100" value={concurrency} onChange={event => setConcurrency(event.target.value)}/></label><label>Timeout (seconds)<input type="number" min="1" max="300" value={timeout} onChange={event => setTimeoutValue(event.target.value)}/></label></div></details>{formError && <p className="inline-error">{formError}</p>}<Button label="Create MCP token" type="submit" variant="primary" isLoading={isLoading} isDisabled={!name.trim() || !tools.length || !selectedKbs.length}/></form></Card><Card padding={4}><p className="eyebrow">STEP 2</p><h2>Connect with Claude Code</h2><p className="section-copy">Run this command on the machine where Claude Code is installed. Use a HTTPS URL for access outside this computer.</p><div className="code-panel"><div className="code-panel-top"><b>Terminal</b><button type="button" onClick={() => copy(cliCommand, "claude command")}>{copied === "claude command" ? "Copied" : "Copy command"}</button></div><pre>{cliCommand}</pre></div><ol className="mcp-steps"><li>Create the token in Step 1 and copy it immediately.</li><li>Paste the command into Terminal.</li><li>Restart Claude Code, then run <code>/mcp</code> to confirm <code>softnix-knowledge</code> is connected.</li></ol><details className="json-config"><summary>Prefer a project <code>.mcp.json</code> file?</summary><p>Store the token in <code>SOFTNIX_MCP_TOKEN</code>, not in source control.</p><div className="code-panel"><div className="code-panel-top"><b>.mcp.json</b><button type="button" onClick={() => copy(jsonConfig, "json config")}>{copied === "json config" ? "Copied" : "Copy JSON"}</button></div><pre>{jsonConfig}</pre></div></details>{secret && <div className="token-reveal"><b>New token — copy it now</b><code>{secret}</code><button type="button" onClick={() => copy(secret, "token")}>{copied === "token" ? "Copied" : "Copy token"}</button></div>}</Card></section><section className="content-section"><div className="section-title"><div><p className="eyebrow">ACTIVE ACCESS</p><h2>Tokens</h2></div><span className="section-copy">Revoke a token immediately if a machine or credential is no longer trusted.</span></div>{tokens.length ? <div className="token-list">{tokens.map(token => <article className="token-row" key={token.id}><div><b>{token.name}</b><p>{token.token_prefix}… · {token.allowed_tools.length} tools · {token.allowed_knowledge_base_ids.length} knowledge bases</p><small>{token.requests_per_minute}/min · {token.max_concurrent_requests} concurrent · {token.query_timeout_seconds}s timeout{token.expires_at ? ` · expires ${new Date(token.expires_at).toLocaleString()}` : ""}</small></div><StatusBadge status={token.status}/><div className="document-actions">{token.status === "active" && <Button label="Disable" size="sm" variant="secondary" onClick={() => changeTokenState(token.id, "disable")}/>} {token.status === "inactive" && <Button label="Enable" size="sm" variant="secondary" onClick={() => changeTokenState(token.id, "enable")}/>} {token.status !== "revoked" && <Button label="Revoke" size="sm" variant="destructive" onClick={() => changeTokenState(token.id, "revoke")}/>}</div></article>)}</div> : <EmptyState title="No MCP tokens yet" description="Create a token above to connect Claude Code or another MCP client."/>}</section><section className="content-section"><h2>Recent audit activity</h2>{auditLogs.length ? <div className="audit-list">{auditLogs.map(row => <div key={row.id}><span>{row.action}</span><small>{row.target_type || "system"} · {new Date(row.created_at).toLocaleString()}</small></div>)}</div> : <EmptyState isCompact title="No activity yet" description="Administrative actions will appear here."/>}</section></>;
 }
 
+function McpActivity({activity}) {
+  const [expandedId, setExpandedId] = useState(null);
+  return <section className="content-section mcp-activity">
+    <div className="section-title"><div><p className="eyebrow">MCP OBSERVABILITY</p><h2>Agent queries and retrieval path</h2></div><span className="section-copy">Shows the systems actually called for each MCP tool request. Token secrets and headers are never stored.</span></div>
+    <div className="mcp-route-note"><b>Neo4j note:</b> it receives graph projections for exploration; current MCP retrieval uses PostgreSQL graph tables, so Neo4j appears only when a runtime path calls it.</div>
+    {activity.length ? <div className="mcp-activity-list">{activity.map(row => {
+      const metadata = row.metadata || {}; const isOpen = expandedId === row.id; const route = metadata.route || [];
+      return <article className={`mcp-activity-row ${row.action === "mcp.tool.error" ? "has-error" : ""}`} key={row.id}>
+        <button type="button" className="mcp-activity-summary" onClick={() => setExpandedId(isOpen ? null : row.id)} aria-expanded={isOpen}>
+          <span><b>{metadata.tool || "MCP request"}</b><small>{metadata.token_name || "Scoped token"} · {new Date(row.created_at).toLocaleString()} · {metadata.duration_ms ?? 0} ms</small></span>
+          <span className={`mcp-route-status ${row.action === "mcp.tool.error" ? "error" : ""}`}>{row.action === "mcp.tool.error" ? metadata.error_code || "failed" : `${route.filter(step => step.status === "used").length} route(s) used`}</span>
+        </button>
+        {isOpen && <div className="mcp-activity-detail">
+          {metadata.retrieval_plan && <div><b>Planner decision</b><p>{metadata.retrieval_plan.intent} · {metadata.retrieval_plan.planner_source} · channels: {(metadata.retrieval_plan.channels || []).join(", ") || "none"}{metadata.retrieval_plan.fallback_reason ? ` · fallback: ${metadata.retrieval_plan.fallback_reason}` : ""}</p></div>}
+          {metadata.query && <div><b>Agent query</b><p>{metadata.query}{metadata.query_truncated ? "…" : ""}</p></div>}
+          {metadata.subjects?.length ? <div><b>Subjects</b><p>{metadata.subjects.join(", ")}</p></div> : null}
+          <div><b>Retrieval path</b>{route.length ? <ol className="mcp-route-list">{route.map((step, index) => <li key={`${row.id}-${step.channel}-${index}`}><span className={`mcp-step-dot ${step.status}`}/><div><strong>{step.system}</strong><small>{step.channel.replace(/_/g, " ")} · {step.status} · {step.result_count ?? 0} result(s) · {step.duration_ms ?? 0} ms{step.detail ? ` · ${step.detail}` : ""}</small></div></li>)}</ol> : <p>No retrieval store was reached before this request was rejected.</p>}</div>
+        </div>}
+      </article>;
+    })}</div> : <EmptyState isCompact title="No MCP tool calls yet" description="When an agent calls a knowledge tool, its query and the actual retrieval path will appear here."/>}
+  </section>;
+}
+
 const Impact = ({data}) => <div className="result-panel"><h3>{data.insufficient_evidence ? "Insufficient evidence" : `Impact for ${data.subject.name}`}</h3>{data.insufficient_evidence ? <p>Upload more source material or add verified relationships before making a decision.</p> : <><h4>Direct impact</h4><ul>{data.direct_impacts.map(item => <li key={item.entity_id}>{item.name} <Badge label={item.relationship} variant="warning"/> {item.citation_ids.join(" ")}</li>)}</ul><h4>Indirect impact</h4><ul>{data.indirect_impacts.map(item => <li key={item.entity_id}>{item.path.join(" → ")} {item.citation_ids.join(" ")}</li>)}</ul></>}</div>;
 const Graph = ({data}) => <div className="result-panel"><div className="graph-summary"><Badge label={`${data.nodes.length} nodes`} variant="info"/><Badge label={`${data.edges.length} connections`} variant="neutral"/></div><ul className="graph-list">{data.edges.map(edge => <li key={edge.id}><b>{data.nodes.find(node => node.id === edge.source)?.name}</b><span>{edge.type.replace(/_/g, " ")}</span><b>{data.nodes.find(node => node.id === edge.target)?.name}</b></li>)}</ul></div>;
-const QueryResult = ({data, submitFeedback, onOpenSource}) => <section className="query-result"><Card padding={4}><p className="eyebrow">ANSWER</p><div className="answer-copy">{data.answer}</div><div className="feedback-actions"><span>Was this result useful?</span><Button label="Yes" size="sm" variant="secondary" onClick={() => submitFeedback(data.result_id, 1)}/><Button label="No" size="sm" variant="ghost" onClick={() => submitFeedback(data.result_id, -1)}/></div></Card><div className="sources-heading"><h2>Sources</h2><p>Every claim should be checked against its supporting excerpt.</p></div><div className="source-grid">{data.sources.map(source => <Card key={source.citation_id} padding={3}><Badge label={source.citation_id} variant="info"/><h3>{source.title}</h3><p>{source.excerpt}</p><Button label="Open source" size="sm" variant="ghost" onClick={() => onOpenSource({id: source.document_id, title: source.title})}/></Card>)}</div></section>;
+const QueryResult = ({data, submitFeedback, onOpenSource}) => <section className="query-result"><Card padding={4}><p className="eyebrow">ANSWER</p><div className="answer-copy">{data.answer}</div><div className="feedback-actions"><span>Was this result useful?</span><Button label="Yes" size="sm" variant="secondary" onClick={() => submitFeedback(data.result_id, 1)}/><Button label="No" size="sm" variant="ghost" onClick={() => submitFeedback(data.result_id, -1)}/></div>{data.metadata?.retrieval_plan && <details className="retrieval-trace"><summary>How this answer was retrieved</summary><p>{data.metadata.retrieval_plan.intent} · {data.metadata.retrieval_plan.planner_source} · {(data.metadata.retrieval_plan.channels || []).join(", ") || "no channels selected"}</p><ul>{(data.metadata.retrieval_trace || []).map((step, index) => <li key={`${step.channel}-${index}`}><b>{step.system}</b><span>{step.status} · {step.result_count ?? 0} result(s) · {step.duration_ms ?? 0} ms</span></li>)}</ul></details>}</Card><div className="sources-heading"><h2>Sources</h2><p>Every claim should be checked against its supporting excerpt.</p></div><div className="source-grid">{data.sources.map(source => <Card key={source.citation_id} padding={3}><Badge label={source.citation_id} variant="info"/><h3>{source.title}</h3><p>{source.excerpt}</p><Button label="Open source" size="sm" variant="ghost" onClick={() => onOpenSource({id: source.document_id, title: source.title})}/></Card>)}</div></section>;
 function DocumentPreview({preview, jobs, onExtractLegal, onSaveLegal, onDeleteLegal}) {
   const [editingLegal, setEditingLegal] = useState(false);
   const [legalDraft, setLegalDraft] = useState("");

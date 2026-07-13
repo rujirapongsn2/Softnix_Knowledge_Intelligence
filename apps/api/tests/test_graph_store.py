@@ -29,5 +29,13 @@ def test_neo4j_projection_uses_parameterized_cypher():
     assert payload["statements"][0]["parameters"]["name"] == "APP-01"
 
 
+def test_neo4j_traverse_returns_ids_only_for_bounded_acceleration():
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json={"results": [{"data": [{"row": [["entity-1", "entity-2"], ["rel-1"]]}]}], "errors": []})
+
+    store = Neo4jGraphStore(base_url="http://neo4j.test", username="neo4j", password="secret", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert store.traverse("entity-1", "kb-1", depth=2, max_nodes=20) == {"node_ids": ["entity-1", "entity-2"], "relationship_ids": ["rel-1"]}
+
+
 def request_path(request: httpx.Request) -> str:
     return request.url.path

@@ -74,6 +74,8 @@ flowchart LR
 6. **Retrieval and answer** — the planner runs permitted vector, full-text, graph, and LightRAG retrieval in parallel. Results are fused and mapped to citations; OpenRouter receives only scope-filtered evidence and generates the final answer.
 7. **Response** — MCP returns a text summary, structured result, citations, and a request ID for tracing and audit.
 
+Each Knowledge Base exposes a versioned retrieval policy at `PATCH /api/v1/knowledge-bases/{id}/retrieval-config`. Rule-first planning selects an intent and only an ambiguous query uses the constrained OpenRouter planner fallback. The response metadata and MCP activity view expose the selected plan and actual channel trace; planner logs never contain bearer tokens or request headers.
+
 ### MarkItDown extraction
 
 The ingestion pipeline accepts PDF, DOCX, PPTX, XLSX/XLS, TXT, Markdown, HTML, CSV, and JSON (up to the configured upload limit). MarkItDown runs only against the stored local file with built-in converters and plugins, OCR, LLM, URLs, ZIPs, and cloud integrations disabled. Its Markdown output is the canonical extracted content used by search, citations, graph extraction, and legal metadata; the original file remains unchanged as the source record. Existing local parsers are used only as a compatibility fallback for previously supported file types.

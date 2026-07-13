@@ -4,6 +4,7 @@ import mimetypes
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -16,10 +17,13 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from .config import get_settings
+from .db import SessionLocal
 from .external_ocr import ExternalOcrClient
 from .graph_store import Neo4jGraphStore
-from .models import Document, DocumentChunk, Entity, EntitySource, GraphProjectionEvent, ProcessingJob, QueryResult, Relationship, RelationshipSource
+from .models import Document, DocumentChunk, Entity, EntitySource, GraphProjectionEvent, KnowledgeBase, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .openrouter import OpenRouterClient
+from .observability import metrics
+from .planner import RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
 from .retrieval import LightRAGRetrievalEngine, RetrievalEvidence
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".html", ".htm", ".csv", ".json"}
@@ -36,9 +40,10 @@ ALLOWED_MIME_TYPES = {
     ".json": {"application/json", "text/json", "text/plain"},
 }
 DEFAULT_RETRIEVAL_CONFIG = {
-    "retrieval_mode": "auto", "enable_vector": True, "enable_graph": True,
-    "enable_fulltext": True, "enable_reranker": True, "default_top_k": 12,
-    "maximum_top_k": 30, "maximum_graph_depth": 3, "citation_required": True,
+    "version": 1, "retrieval_mode": "auto", "enable_vector": True, "enable_graph": True,
+    "enable_fulltext": True, "enable_lightrag": True, "enable_reranker": True,
+    "planner_llm_fallback": True, "default_top_k": 12, "maximum_top_k": 30,
+    "maximum_graph_depth": 3, "citation_required": True,
 }
 TRANSIENT_PROCESSING_ERRORS = {
     "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY",
@@ -532,7 +537,7 @@ def entity_graph(db: Session, entity: Entity, depth: int = 1) -> dict:
     for _ in range(depth):
         found = db.query(Relationship).filter(Relationship.deleted_at.is_(None)).filter(
             (Relationship.is_legal.is_(False)) | (Relationship.review_status == "verified")
-        ).filter(
+        ).filter(Relationship.knowledge_base_id == entity.knowledge_base_id).filter(
             (Relationship.source_entity_id.in_(frontier)) | (Relationship.target_entity_id.in_(frontier))).all()
         edges.extend(edge for edge in found if edge.id not in {item.id for item in edges})
         next_frontier = {edge.source_entity_id for edge in found} | {edge.target_entity_id for edge in found}
@@ -937,32 +942,135 @@ def plan_intent(query: str) -> str:
     return "hybrid_fallback"
 
 
-def query_documents(db: Session, query: str, kb_ids: list[str], limit: int) -> RetrievalEvidence:
-    channels = [query_database_vectors(db, query, kb_ids, limit), query_database_chunks(db, query, kb_ids, limit)]
-    engine = LightRAGRetrievalEngine()
-    if engine.enabled and len(kb_ids) == 1:
+def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources: int) -> PlannerDecision:
+    """Build a policy-constrained plan; invoke the LLM only when rules are ambiguous."""
+    rows = db.query(KnowledgeBase).filter(KnowledgeBase.id.in_(kb_ids)).all() if kb_ids else []
+    policy = intersect_policies([policy_from_config(row.retrieval_config) for row in rows])
+    decision = rule_plan(query, policy, max_sources)
+    if decision.ambiguous and policy.planner_llm_fallback:
         try:
-            channels.append(engine.query(query, kb_ids, limit))
-        except RuntimeError:
-            pass
-    evidence = rerank_evidence(query, fuse_evidence(*channels, limit=limit), limit)
+            available = [channel.value for channel, enabled in (
+                (RetrievalChannel.VECTOR, policy.enable_vector),
+                (RetrievalChannel.FULLTEXT, policy.enable_fulltext),
+                (RetrievalChannel.GRAPH, policy.enable_graph),
+                (RetrievalChannel.LIGHTRAG, policy.enable_lightrag),
+            ) if enabled]
+            value = OpenRouterClient().plan_retrieval(query, available, decision.plan.max_sources, policy.maximum_graph_depth)
+            decision = apply_llm_plan(decision, value, policy, max_sources)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            decision.plan = decision.plan.model_copy(update={"planner_source": "rules_fallback", "fallback_reason": str(exc)})
+    metrics.observe_planner(decision.plan.intent, decision.plan.planner_source, decision.plan.fallback_reason is not None)
+    return decision
+
+
+def _append_retrieval_trace(trace: list[dict] | None, *, channel: str, system: str, status: str,
+                            started_at: float, result_count: int = 0, detail: str | None = None) -> None:
+    """Record an operator-safe description of an actual retrieval attempt."""
+    if trace is None:
+        return
+    item = {"channel": channel, "system": system, "status": status, "result_count": result_count,
+            "duration_ms": round((time.monotonic() - started_at) * 1000),
+            # Monotonic time is converted into a safe relative offset before
+            # persistence. It lets the trace UI accurately show parallel work.
+            "started_at_ms": round(started_at * 1000)}
+    if detail:
+        item["detail"] = detail
+    trace.append(item)
+    metrics.observe_retrieval(channel, status, item["duration_ms"])
+
+
+def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
+                    trace: list[dict] | None = None, plan: RetrievalPlan | None = None) -> RetrievalEvidence:
+    plan = plan or rule_plan(query, policy_from_config(None), limit).plan
+    channels: list[RetrievalEvidence] = []
+    db_channels = {
+        RetrievalChannel.VECTOR: lambda session: query_database_vectors(session, query, kb_ids, limit, trace),
+        RetrievalChannel.FULLTEXT: lambda session: query_database_chunks(session, query, kb_ids, limit, trace),
+        RetrievalChannel.GRAPH: lambda session: query_database_graph(session, query, kb_ids, limit, trace, plan.graph_depth),
+    }
+    for channel in (RetrievalChannel.VECTOR, RetrievalChannel.FULLTEXT, RetrievalChannel.GRAPH):
+        if channel not in plan.channels:
+            _append_retrieval_trace(trace, channel=channel.value, system="planner", status="skipped",
+                                    started_at=time.monotonic(), detail="not selected by retrieval plan")
+    engine = LightRAGRetrievalEngine()
+    if RetrievalChannel.LIGHTRAG not in plan.channels:
+        _append_retrieval_trace(trace, channel="lightrag", system="planner", status="skipped", started_at=time.monotonic(),
+                                detail="not selected by retrieval plan")
+    elif not engine.enabled or len(kb_ids) != 1:
+        _append_retrieval_trace(trace, channel="lightrag", system="LightRAG", status="skipped", started_at=time.monotonic(),
+                                detail="not configured" if not engine.enabled else "requires one Knowledge Base")
+    else:
+        db_channels[RetrievalChannel.LIGHTRAG] = lambda _: _query_lightrag(engine, query, kb_ids, limit, trace)
+    futures = {}
+    channel_results = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(db_channels))) as executor:
+        for channel, callback in db_channels.items():
+            if channel in plan.channels:
+                futures[executor.submit(_run_retrieval_channel, callback, channel != RetrievalChannel.LIGHTRAG)] = channel
+        for future in as_completed(futures):
+            try:
+                value = future.result()
+                if value is not None:
+                    channel_results[futures[future]] = value
+            except Exception as exc:
+                channel = futures[future]
+                _append_retrieval_trace(trace, channel=channel.value, system="executor", status="unavailable",
+                                        started_at=time.monotonic(), detail=str(exc))
+    channels = [channel_results[channel] for channel in (RetrievalChannel.VECTOR, RetrievalChannel.FULLTEXT, RetrievalChannel.GRAPH, RetrievalChannel.LIGHTRAG) if channel in channel_results]
+    evidence = rerank_evidence(query, fuse_evidence(*channels, limit=limit), limit, trace)
     if evidence.sources:
+        started_at = time.monotonic()
         try:
             evidence.answer = OpenRouterClient().answer_from_sources(query, evidence.sources)
-        except RuntimeError:
+            _append_retrieval_trace(trace, channel="answer_generation", system="OpenRouter LLM", status="used",
+                                    started_at=started_at, result_count=len(evidence.sources), detail="cited answer")
+        except RuntimeError as exc:
             evidence.answer = None
+            _append_retrieval_trace(trace, channel="answer_generation", system="OpenRouter LLM", status="unavailable",
+                                    started_at=started_at, detail=str(exc))
     return evidence
 
 
-def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: int) -> RetrievalEvidence:
+def _run_retrieval_channel(callback, needs_db: bool):
+    session = SessionLocal() if needs_db else None
+    try:
+        return callback(session)
+    finally:
+        if session is not None:
+            session.close()
+
+
+def _query_lightrag(engine: LightRAGRetrievalEngine, query: str, kb_ids: list[str], limit: int,
+                    trace: list[dict] | None = None) -> RetrievalEvidence:
+    started_at = time.monotonic()
+    try:
+        value = engine.query(query, kb_ids, limit)
+        _append_retrieval_trace(trace, channel="lightrag", system="LightRAG", status="used",
+                                started_at=started_at, result_count=len(value.sources), detail="mix retrieval")
+        return value
+    except RuntimeError as exc:
+        _append_retrieval_trace(trace, channel="lightrag", system="LightRAG", status="unavailable",
+                                started_at=started_at, detail=str(exc))
+        return RetrievalEvidence([], [], [], [])
+
+
+def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: int,
+                           trace: list[dict] | None = None) -> RetrievalEvidence:
+    started_at = time.monotonic()
     if db.get_bind().dialect.name != "postgresql":
+        _append_retrieval_trace(trace, channel="semantic_vector", system="PostgreSQL + pgvector", status="skipped",
+                                started_at=started_at, detail="PostgreSQL is not the active database")
         return RetrievalEvidence([], [], [], [])
     client = OpenRouterClient()
     if not client.embeddings_enabled:
+        _append_retrieval_trace(trace, channel="semantic_vector", system="PostgreSQL + pgvector", status="skipped",
+                                started_at=started_at, detail="embedding provider is not configured")
         return RetrievalEvidence([], [], [], [])
     try:
         query_vector = client.embed_texts([query])[0]
-    except RuntimeError:
+    except RuntimeError as exc:
+        _append_retrieval_trace(trace, channel="semantic_vector", system="OpenRouter embeddings → PostgreSQL + pgvector",
+                                status="unavailable", started_at=started_at, detail=str(exc))
         return RetrievalEvidence([], [], [], [])
     distance = DocumentChunk.embedding.cosine_distance(query_vector)
     rows = db.query(DocumentChunk, Document, distance.label("distance")).join(
@@ -974,10 +1082,14 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
                 "chunk_id": chunk.id, "excerpt": chunk.content[:500], "relevance": max(0.0, 1.0 - float(item_distance))}
                for i, (chunk, document, item_distance) in enumerate(records, 1)]
+    _append_retrieval_trace(trace, channel="semantic_vector", system="OpenRouter embeddings → PostgreSQL + pgvector",
+                            status="used", started_at=started_at, result_count=len(sources), detail="cosine similarity")
     return RetrievalEvidence(sources, [], [], [])
 
 
-def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int) -> RetrievalEvidence:
+def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int,
+                          trace: list[dict] | None = None) -> RetrievalEvidence:
+    started_at = time.monotonic()
     words = [word for word in re.findall(r"[\w-]+", query.lower()) if len(word) > 1]
     rows = db.query(DocumentChunk, Document).join(Document, Document.id == DocumentChunk.document_id).filter(
         Document.status == "completed", Document.deleted_at.is_(None)
@@ -995,7 +1107,53 @@ def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
                 "chunk_id": chunk.id, "excerpt": chunk.content[:500], "relevance": 1.0 / i}
                for i, (chunk, document) in enumerate(records, 1)]
+    system = "PostgreSQL full-text search" if db.get_bind().dialect.name == "postgresql" else "SQL text fallback"
+    _append_retrieval_trace(trace, channel="full_text", system=system, status="used",
+                            started_at=started_at, result_count=len(sources), detail="keyword retrieval")
     return RetrievalEvidence(sources, [], [], [])
+
+
+def query_database_graph(db: Session, query: str, kb_ids: list[str], limit: int,
+                         trace: list[dict] | None = None, depth: int = 1) -> RetrievalEvidence:
+    """Use Neo4j as a bounded ID accelerator and PostgreSQL for evidence."""
+    started_at = time.monotonic()
+    entity = resolve_entity(db, kb_ids, query)
+    if not entity:
+        _append_retrieval_trace(trace, channel="graph", system="PostgreSQL graph tables", status="used",
+                                started_at=started_at, detail="no scoped entity matched")
+        return RetrievalEvidence([], [], [], [])
+    store = Neo4jGraphStore()
+    accelerator = "postgresql fallback"
+    relationship_ids: list[str] = []
+    node_ids: list[str] = []
+    if store.enabled:
+        try:
+            result = store.traverse(entity.id, entity.knowledge_base_id, depth, max(limit * 10, 50))
+            relationship_ids = result.get("relationship_ids", [])
+            node_ids = result.get("node_ids", [])
+            if relationship_ids:
+                accelerator = "neo4j accelerator → PostgreSQL evidence"
+        except (httpx.HTTPError, RuntimeError, ValueError):
+            relationship_ids = []
+    if relationship_ids:
+        relationships = db.query(Relationship).filter(
+            Relationship.id.in_(relationship_ids), Relationship.knowledge_base_id == entity.knowledge_base_id,
+            Relationship.deleted_at.is_(None),
+            (Relationship.is_legal.is_(False)) | (Relationship.review_status == "verified"),
+        ).all()
+        node_rows = db.query(Entity).filter(Entity.id.in_(node_ids), Entity.knowledge_base_id == entity.knowledge_base_id,
+                                            Entity.deleted_at.is_(None)).all()
+        graph = {"nodes": [{"id": row.id, "name": row.name, "type": row.entity_type} for row in node_rows],
+                 "edges": [{"id": row.id, "source": row.source_entity_id, "target": row.target_entity_id, "type": row.relationship_type} for row in relationships]}
+    else:
+        graph = entity_graph(db, entity, min(depth, 3))
+        relationships = db.query(Relationship).filter(Relationship.id.in_([edge["id"] for edge in graph["edges"]])).all()
+    sources = relationship_sources(db, relationships)[:limit]
+    for source in sources:
+        source.pop("_relationship_id", None)
+    _append_retrieval_trace(trace, channel="graph", system=accelerator, status="used",
+                            started_at=started_at, result_count=len(sources), detail="verified/manual bounded traversal")
+    return RetrievalEvidence(sources, graph["nodes"], graph["edges"], graph["edges"])
 
 
 def fuse_evidence(*channels: RetrievalEvidence, limit: int) -> RetrievalEvidence:
@@ -1021,23 +1179,33 @@ def fuse_evidence(*channels: RetrievalEvidence, limit: int) -> RetrievalEvidence
     return RetrievalEvidence(sources, entities, relationships, paths, answer)
 
 
-def rerank_evidence(query: str, evidence: RetrievalEvidence, limit: int) -> RetrievalEvidence:
+def rerank_evidence(query: str, evidence: RetrievalEvidence, limit: int,
+                    trace: list[dict] | None = None) -> RetrievalEvidence:
     """Optionally apply a cross-encoder reranker after deterministic fusion."""
     client = OpenRouterClient()
     if not client.reranker_enabled or not evidence.sources:
+        _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="skipped", started_at=time.monotonic(),
+                                detail="not configured" if not client.reranker_enabled else "no candidates")
         return evidence
+    started_at = time.monotonic()
     candidates = evidence.sources[:get_settings().rerank_candidate_limit]
     try:
         ranked = client.rerank(query, [item["excerpt"] for item in candidates], limit)
-    except RuntimeError:
+    except RuntimeError as exc:
+        _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="unavailable",
+                                started_at=started_at, detail=str(exc))
         return evidence
     ordered = []
     for index, relevance in ranked:
         if 0 <= index < len(candidates):
             ordered.append({**candidates[index], "relevance": relevance})
     if not ordered:
+        _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="used",
+                                started_at=started_at, detail="no ranked candidates returned")
         return evidence
     sources = [{**source, "citation_id": f"S{index}"} for index, source in enumerate(ordered[:limit], 1)]
+    _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="used",
+                            started_at=started_at, result_count=len(sources), detail="cross-encoder rerank")
     return RetrievalEvidence(sources, evidence.entities, evidence.relationships, evidence.paths, evidence.answer)
 
 
@@ -1054,13 +1222,18 @@ def compose_cited_answer(evidence: RetrievalEvidence) -> str:
 
 
 def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: int, token_id: str | None = None) -> dict:
-    evidence = query_documents(db, query, kb_ids, max_sources)
-    intent = plan_intent(query)
+    retrieval_trace: list[dict] = []
+    decision = build_retrieval_plan(db, query, kb_ids, max_sources)
+    evidence = query_documents(db, query, kb_ids, decision.plan.max_sources, retrieval_trace, decision.plan)
+    intent = decision.plan.intent
     answer = compose_cited_answer(evidence)
+    metrics.observe_query_outcome("insufficient_evidence" if not evidence.sources else "evidence_found")
     result = {"status": "success", "result_id": "", "answer": answer,
               "insufficient_evidence": not bool(evidence.sources), "entities": evidence.entities,
               "relationships": evidence.relationships, "paths": evidence.paths, "sources": evidence.sources,
-              "warnings": [], "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": intent}}
+              "warnings": [], "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": intent,
+                                                "retrieval_plan": decision.plan.model_dump(mode="json"),
+                                                "retrieval_trace": retrieval_trace}}
     saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
     db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
     return result

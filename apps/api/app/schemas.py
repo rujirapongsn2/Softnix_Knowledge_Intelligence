@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .planner import RetrievalPolicy
+
 
 class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -30,6 +32,24 @@ class KnowledgeBaseOut(ORMModel):
     default_language: str
     status: str
     retrieval_config: dict[str, Any]
+
+
+class RetrievalConfigUpdate(BaseModel):
+    retrieval_mode: str | None = None
+    enable_vector: bool | None = None
+    enable_fulltext: bool | None = None
+    enable_graph: bool | None = None
+    enable_lightrag: bool | None = None
+    enable_reranker: bool | None = None
+    planner_llm_fallback: bool | None = None
+    default_top_k: int | None = Field(default=None, ge=1, le=30)
+    maximum_top_k: int | None = Field(default=None, ge=1, le=50)
+    maximum_graph_depth: int | None = Field(default=None, ge=1, le=3)
+    citation_required: bool | None = None
+
+    def merged(self, current: dict[str, Any]) -> dict[str, Any]:
+        values = {key: value for key, value in self.model_dump().items() if value is not None}
+        return RetrievalPolicy.model_validate({**current, **values}).model_dump()
 
 
 class DocumentOut(ORMModel):

@@ -13,7 +13,8 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("documents", sa.Column("legal_metadata", sa.JSON(), nullable=True))
+    if "legal_metadata" not in {column["name"] for column in sa.inspect(op.get_bind()).get_columns("documents")}:
+        op.add_column("documents", sa.Column("legal_metadata", sa.JSON(), nullable=True))
 
 
 def downgrade() -> None:

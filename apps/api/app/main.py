@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 import time
@@ -20,9 +20,9 @@ from .observability import metrics, now
 from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
-from .schemas import DocumentOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
+from .schemas import DocumentMetadataUpdate, DocumentOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
 from .security import authorize, bearer_token, create_session_token, create_token_secret, current_admin, password_hash, refresh_admin, token_digest, verify_password
-from .services import DEFAULT_RETRIEVAL_CONFIG, LEGAL_DOCUMENT_TYPES, analyze_impact, build_query_result, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, rebuild_legal_graph, resolve_entity, sync_legal_document_graph, sync_lightrag_document_graph
+from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_query_result, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_legal_document_graph, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8080", "http://localhost:8081"], allow_credentials=True,
@@ -235,12 +235,12 @@ def delete_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Dep
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/documents")
-def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None), document_type: str = Form("general"), user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None), document_type: str = Form("general"), published_at: date | None = Form(None), user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at: raise HTTPException(404, "Knowledge base not found")
     if kb.status == "disabled":
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_DISABLED", "message": "Activate this Knowledge Base before uploading documents.", "retryable": False})
-    try: doc, job = create_document_job(db, kb_id, file, title, document_type)
+    try: doc, job = create_document_job(db, kb_id, file, title, document_type, published_at)
     except ValueError as exc:
         status_code = 413 if str(exc) == "FILE_TOO_LARGE" else 400
         raise HTTPException(status_code, {"code": str(exc), "message": "Upload rejected", "retryable": False})
@@ -309,6 +309,17 @@ def update_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: 
     record_audit(db, "document.legal_metadata.update", user.id, "document", doc.id, {"fields": sorted(payload.metadata.keys())})
     db.commit()
     return {"status": "updated", "document_id": doc.id, "legal_metadata": doc.legal_metadata}
+
+
+@app.patch("/api/v1/documents/{document_id}/metadata")
+def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    doc = db.get(Document, document_id)
+    if not doc or doc.deleted_at:
+        raise HTTPException(404, "Document not found")
+    doc.published_at = payload.published_at
+    record_audit(db, "document.metadata.update", user.id, "document", doc.id, {"published_at": str(payload.published_at) if payload.published_at else None})
+    db.commit()
+    return {"status": "updated", "document_id": doc.id, "published_at": doc.published_at}
 
 
 @app.put("/api/v1/documents/{document_id}/legal-metadata")
@@ -687,7 +698,7 @@ def revoke_token(token_id: str, user: User = Depends(current_admin), db: Session
 def authorized_query(payload: QueryRequest, token: TokenKey | None, db: Session):
     kb_ids = payload.knowledge_base_ids or (token.allowed_knowledge_base_ids if token else [])
     if token: authorize(token, "search_knowledge", kb_ids)
-    return build_query_result(db, payload.query, kb_ids, payload.max_sources, token.id if token else None)
+    return build_query_result(db, payload.query, kb_ids, payload.max_sources, token.id if token else None, payload.filters)
 
 
 def effective_mcp_knowledge_base_ids(db: Session, token: TokenKey) -> list[str]:

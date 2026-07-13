@@ -22,7 +22,7 @@ from app.config import Settings
 from app.db import SessionLocal
 from app.external_ocr import ExternalOcrClient
 from app.main import app
-from app.models import Document
+from app.models import Document, DocumentChunk
 
 
 def client():
@@ -136,6 +136,70 @@ def test_refresh_cookie_restores_access_session():
     assert refreshed.status_code == 200
     assert test_client.cookies.get("skip_access")
     assert test_client.get("/api/v1/auth/me").status_code == 200
+
+
+def test_auto_retrieval_fixture_exercises_scopes_exact_dates_and_rerank_policy():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Auto retrieval fixture", "code": "auto-retrieval-fixture"}).json()
+    test_client.patch(f"/api/v1/knowledge-bases/{kb['id']}/retrieval-config", json={
+        "enable_lightrag": False, "planner_llm_fallback": False, "enable_reranker": False,
+    })
+    from datetime import date, datetime
+    import hashlib
+    with SessionLocal() as db:
+        documents = []
+        for index, (name, text, published_at) in enumerate([
+            ("vpn.txt", "ขั้นตอนขอสิทธิ์ VPN คือ submit request and manager approval.", None),
+            ("delay.txt", "ปัจจัยหลักที่ทำให้โครงการล่าช้า คือ vendor dependency.", None),
+            ("abc-june.txt", "ข่าวบริษัท ABC เดือนมิถุนายน 2026 เปิดศูนย์บริการ.", date(2026, 6, 15)),
+            ("abc-may.txt", "ข่าวบริษัท ABC เดือนพฤษภาคม 2026 ไม่ควรถูกคืน.", date(2026, 5, 15)),
+            ("SNX-2026-001.txt", "เอกสารเลขที่ SNX-2026-001: Information Security Standard.", None),
+        ]):
+            digest = hashlib.sha256(f"{name}:{text}".encode()).hexdigest()
+            doc = Document(knowledge_base_id=kb["id"], original_filename=name, stored_filename=name,
+                           storage_path=f"/tmp/{name}", mime_type="text/plain", file_size=len(text), checksum_sha256=digest,
+                           title=name.removesuffix(".txt"), document_type="general", published_at=published_at,
+                           tags=[], status="completed", extracted_text=text, indexed_at=datetime.utcnow())
+            db.add(doc); db.flush()
+            db.add(DocumentChunk(document_id=doc.id, knowledge_base_id=kb["id"], chunk_index=0, content=text,
+                                 content_sha256=hashlib.sha256(text.encode()).hexdigest(), char_start=0, char_end=len(text), token_count=len(text.split())))
+            documents.append(doc)
+        db.commit()
+    architecture = documents[0]
+    app_entity = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/entities", json={"name": "APP-01", "entity_type": "Application"}).json()
+    portal = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/entities", json={"name": "Customer Portal", "entity_type": "Application"}).json()
+    relationship = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/relationships", json={
+        "source_entity_id": app_entity["id"], "target_entity_id": portal["id"], "relationship_type": "CONNECTS_TO",
+        "document_id": architecture.id, "excerpt": "APP-01 connects to Customer Portal.",
+    })
+    assert relationship.status_code == 200
+    cases = {
+        "ขั้นตอนขอสิทธิ์ VPN คืออะไร": ["vector", "full_text"],
+        "APP-01 เชื่อมต่อกับระบบใด": ["graph"],
+        "ระบบใดได้รับผลกระทบหาก APP-01 ล่ม": ["graph", "vector"],
+        "ปัจจัยหลักที่ทำให้โครงการล่าช้า": ["graph", "vector"],
+        "ข่าวบริษัท ABC เดือนมิถุนายน 2026": ["full_text", "vector"],
+        "เอกสารเลขที่ SNX-2026-001": ["exact_document", "full_text"],
+        "ภาพรวมความสัมพันธ์ระหว่างหน่วยงาน": ["graph", "vector"],
+    }
+    results = {}
+    for query, channels in cases.items():
+        result = test_client.post("/api/v1/query", json={"query": query, "knowledge_base_ids": [kb["id"]]}).json()
+        assert [item for item in result["metadata"]["retrieval_plan"]["channels"]] == channels
+        results[query] = result
+    local_trace = results["APP-01 เชื่อมต่อกับระบบใด"]["metadata"]["retrieval_trace"]
+    assert next(item for item in local_trace if item["channel"] == "graph")["result_count"] == 1
+    impact_trace = results["ระบบใดได้รับผลกระทบหาก APP-01 ล่ม"]["metadata"]["retrieval_trace"]
+    assert next(item for item in impact_trace if item["channel"] == "graph")["result_count"] == 1
+    global_trace = results["ภาพรวมความสัมพันธ์ระหว่างหน่วยงาน"]["metadata"]["retrieval_trace"]
+    assert next(item for item in global_trace if item["channel"] == "graph")["result_count"] == 1
+    news_sources = results["ข่าวบริษัท ABC เดือนมิถุนายน 2026"]["sources"]
+    assert news_sources and {source["title"] for source in news_sources} == {"abc-june"}
+    exact_trace = results["เอกสารเลขที่ SNX-2026-001"]["metadata"]["retrieval_trace"]
+    assert next(item for item in exact_trace if item["channel"] == "exact_document")["result_count"] == 1
+    assert all(item["channel"] != "graph" or item["status"] == "skipped" for item in exact_trace)
+    rerank_trace = results["เอกสารเลขที่ SNX-2026-001"]["metadata"]["retrieval_trace"]
+    assert next(item for item in rerank_trace if item["channel"] == "rerank")["detail"] == "disabled by retrieval policy"
 
 
 def test_revoked_token_cannot_call_mcp():

@@ -194,7 +194,6 @@ class OpenRouterClient:
         """Find only explicit cross-instrument references; callers keep results as suggestions."""
         if not self.embeddings_enabled or not candidates:
             return []
-        schema = {"references": []}
         prompt = (
             "Find explicit references from this legal document to one of the candidate instruments. Return JSON only. "
             "Each reference must have relationship (ISSUED_UNDER, IMPLEMENTS, AMENDS, REPEALS, REFERS_TO, or GOVERNED_BY), "

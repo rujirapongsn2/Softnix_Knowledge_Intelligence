@@ -42,7 +42,7 @@ def record_retrieval_execution(db, request_id: str | None, result: dict, *, acto
             item["detail"] = detail
         safe_trace.append(item)
     correlation_id = str(request_id or "").strip()[:36] or None
-    safe_plan = {key: plan[key] for key in ("intent", "planner_source", "channels", "graph_depth", "max_sources", "fallback_reason") if key in plan} if isinstance(plan, dict) else None
+    safe_plan = {key: plan[key] for key in ("intent", "planner_source", "channels", "graph_depth", "graph_scope", "entity_subjects", "document_identifiers", "published_from", "published_to", "rerank_enabled", "max_sources", "fallback_reason") if key in plan} if isinstance(plan, dict) else None
     if safe_plan and safe_plan.get("fallback_reason"):
         safe_plan["fallback_reason"] = _safe_trace_detail(safe_plan["fallback_reason"])
     trace_status = "error" if any(item.get("status") == "unavailable" for item in safe_trace) else (

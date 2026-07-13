@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -58,6 +58,7 @@ class DocumentOut(ORMModel):
     original_filename: str
     title: str | None
     document_type: str
+    published_at: date | None
     mime_type: str
     file_size: int
     status: str
@@ -70,6 +71,15 @@ class DocumentOut(ORMModel):
 
 class LegalMetadataUpdate(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentMetadataUpdate(BaseModel):
+    published_at: date | None = None
+
+
+class QueryFilters(BaseModel):
+    published_from: date | None = None
+    published_to: date | None = None
 
 
 class TokenCreate(BaseModel):
@@ -103,7 +113,7 @@ class TokenCreated(TokenOut):
 class QueryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=10_000)
     knowledge_base_ids: list[str] = Field(default_factory=list, max_length=100)
-    filters: dict[str, Any] = Field(default_factory=dict)
+    filters: QueryFilters = Field(default_factory=QueryFilters)
     response_mode: Literal["evidence", "answer", "both"] = "both"
     max_sources: int = Field(default=10, ge=1, le=20)
     language: str = "auto"

@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 from pgvector.sqlalchemy import Vector
@@ -56,6 +56,7 @@ class Document(Timestamped, Base):
     # This is an authoring choice, not a MIME-type inference.  It controls
     # post-processing such as the legal metadata extraction workflow.
     document_type: Mapped[str] = mapped_column(String(40), default="general", index=True)
+    published_at: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     tags: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(30), default="queued")
     extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)

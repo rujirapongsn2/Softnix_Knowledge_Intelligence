@@ -516,14 +516,31 @@ def resolve_entity(db: Session, knowledge_base_ids: list[str], text: str) -> Ent
     if knowledge_base_ids:
         query = query.filter(Entity.knowledge_base_id.in_(knowledge_base_ids))
     exact = query.filter(Entity.canonical_name == canonical).first()
-    return exact or query.filter(Entity.name.ilike(f"%{text}%")).first()
+    if exact:
+        return exact
+    candidates = query.filter(Entity.name.ilike(f"%{text}%")).all()
+    if candidates:
+        return candidates[0]
+    # JSON aliases are portable between PostgreSQL and SQLite when matched in
+    # Python; the graph is bounded and this runs only after indexed lookups.
+    for candidate in query.limit(500).all():
+        if canonical in {canonical_entity_name(alias) for alias in (candidate.aliases or [])}:
+            return candidate
+    return None
 
 
-def relationship_sources(db: Session, relationships: list[Relationship]) -> list[dict]:
+def relationship_sources(db: Session, relationships: list[Relationship], plan: RetrievalPlan | None = None) -> list[dict]:
     ids = [relationship.id for relationship in relationships]
     if not ids:
         return []
-    rows = db.query(RelationshipSource, Document).join(Document, Document.id == RelationshipSource.document_id).filter(RelationshipSource.relationship_id.in_(ids)).all()
+    rows = db.query(RelationshipSource, Document).join(Document, Document.id == RelationshipSource.document_id).filter(
+        RelationshipSource.relationship_id.in_(ids), Document.status == "completed", Document.deleted_at.is_(None)
+    )
+    if plan and plan.published_from:
+        rows = rows.filter(Document.published_at >= plan.published_from)
+    if plan and plan.published_to:
+        rows = rows.filter(Document.published_at < plan.published_to)
+    rows = rows.all()
     return [{"citation_id": f"S{index}", "document_id": document.id, "title": document.title,
              "chunk_id": source.id, "excerpt": source.excerpt, "relevance": 1.0 / index,
              "_relationship_id": source.relationship_id}
@@ -627,7 +644,7 @@ DOCUMENT_TYPES = {"general", "legal", "regulation", "contract"}
 LEGAL_DOCUMENT_TYPES = {"legal", "regulation", "contract"}
 
 
-def create_document_job(db: Session, knowledge_base_id: str, upload, title: str | None = None, document_type: str = "general") -> tuple[Document, ProcessingJob]:
+def create_document_job(db: Session, knowledge_base_id: str, upload, title: str | None = None, document_type: str = "general", published_at=None) -> tuple[Document, ProcessingJob]:
     if document_type not in DOCUMENT_TYPES:
         raise ValueError("DOCUMENT_TYPE_INVALID")
     path, stored, size, checksum, mime = store_upload(upload, knowledge_base_id)
@@ -638,7 +655,7 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
     doc = Document(knowledge_base_id=knowledge_base_id, original_filename=upload.filename or stored,
                    stored_filename=stored, storage_path=path, file_size=size, checksum_sha256=checksum,
                    mime_type=mime, title=title or Path(upload.filename or stored).stem,
-                   document_type=document_type, status="queued")
+                   document_type=document_type, published_at=published_at, status="queued")
     db.add(doc); db.flush()
     job = ProcessingJob(document_id=doc.id, knowledge_base_id=knowledge_base_id)
     db.add(job); db.commit(); db.refresh(doc); db.refresh(job)
@@ -942,11 +959,18 @@ def plan_intent(query: str) -> str:
     return "hybrid_fallback"
 
 
-def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources: int) -> PlannerDecision:
+def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources: int, query_filters=None) -> PlannerDecision:
     """Build a policy-constrained plan; invoke the LLM only when rules are ambiguous."""
     rows = db.query(KnowledgeBase).filter(KnowledgeBase.id.in_(kb_ids)).all() if kb_ids else []
     policy = intersect_policies([policy_from_config(row.retrieval_config) for row in rows])
     decision = rule_plan(query, policy, max_sources)
+    requested_from = getattr(query_filters, "published_from", None) if query_filters else None
+    requested_to = getattr(query_filters, "published_to", None) if query_filters else None
+    if requested_from or requested_to:
+        decision.plan = decision.plan.model_copy(update={
+            "published_from": requested_from or decision.plan.published_from,
+            "published_to": requested_to or decision.plan.published_to,
+        })
     if decision.ambiguous and policy.planner_llm_fallback:
         try:
             available = [channel.value for channel, enabled in (
@@ -984,11 +1008,12 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
     plan = plan or rule_plan(query, policy_from_config(None), limit).plan
     channels: list[RetrievalEvidence] = []
     db_channels = {
-        RetrievalChannel.VECTOR: lambda session: query_database_vectors(session, query, kb_ids, limit, trace),
-        RetrievalChannel.FULLTEXT: lambda session: query_database_chunks(session, query, kb_ids, limit, trace),
-        RetrievalChannel.GRAPH: lambda session: query_database_graph(session, query, kb_ids, limit, trace, plan.graph_depth),
+        RetrievalChannel.EXACT: lambda session: query_exact_documents(session, plan, kb_ids, limit, trace),
+        RetrievalChannel.VECTOR: lambda session: query_database_vectors(session, query, kb_ids, limit, trace, plan),
+        RetrievalChannel.FULLTEXT: lambda session: query_database_chunks(session, query, kb_ids, limit, trace, plan),
+        RetrievalChannel.GRAPH: lambda session: query_database_graph(session, query, kb_ids, limit, trace, plan),
     }
-    for channel in (RetrievalChannel.VECTOR, RetrievalChannel.FULLTEXT, RetrievalChannel.GRAPH):
+    for channel in (RetrievalChannel.EXACT, RetrievalChannel.VECTOR, RetrievalChannel.FULLTEXT, RetrievalChannel.GRAPH):
         if channel not in plan.channels:
             _append_retrieval_trace(trace, channel=channel.value, system="planner", status="skipped",
                                     started_at=time.monotonic(), detail="not selected by retrieval plan")
@@ -1016,8 +1041,8 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
                 channel = futures[future]
                 _append_retrieval_trace(trace, channel=channel.value, system="executor", status="unavailable",
                                         started_at=time.monotonic(), detail=str(exc))
-    channels = [channel_results[channel] for channel in (RetrievalChannel.VECTOR, RetrievalChannel.FULLTEXT, RetrievalChannel.GRAPH, RetrievalChannel.LIGHTRAG) if channel in channel_results]
-    evidence = rerank_evidence(query, fuse_evidence(*channels, limit=limit), limit, trace)
+    channels = [channel_results[channel] for channel in (RetrievalChannel.EXACT, RetrievalChannel.VECTOR, RetrievalChannel.FULLTEXT, RetrievalChannel.GRAPH, RetrievalChannel.LIGHTRAG) if channel in channel_results]
+    evidence = rerank_evidence(query, fuse_evidence(*channels, limit=limit), limit, trace, plan.rerank_enabled)
     if evidence.sources:
         started_at = time.monotonic()
         try:
@@ -1054,8 +1079,18 @@ def _query_lightrag(engine: LightRAGRetrievalEngine, query: str, kb_ids: list[st
         return RetrievalEvidence([], [], [], [])
 
 
+def _apply_published_filter(rows, plan: RetrievalPlan | None):
+    if not plan:
+        return rows
+    if plan.published_from:
+        rows = rows.filter(Document.published_at >= plan.published_from)
+    if plan.published_to:
+        rows = rows.filter(Document.published_at < plan.published_to)
+    return rows
+
+
 def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: int,
-                           trace: list[dict] | None = None) -> RetrievalEvidence:
+                           trace: list[dict] | None = None, plan: RetrievalPlan | None = None) -> RetrievalEvidence:
     started_at = time.monotonic()
     if db.get_bind().dialect.name != "postgresql":
         _append_retrieval_trace(trace, channel="semantic_vector", system="PostgreSQL + pgvector", status="skipped",
@@ -1078,6 +1113,7 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
     ).filter(Document.status == "completed", Document.deleted_at.is_(None), DocumentChunk.embedding.is_not(None))
     if kb_ids:
         rows = rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
+    rows = _apply_published_filter(rows, plan)
     records = rows.order_by(distance).limit(limit).all()
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
                 "chunk_id": chunk.id, "excerpt": chunk.content[:500], "relevance": max(0.0, 1.0 - float(item_distance))}
@@ -1088,14 +1124,16 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
 
 
 def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int,
-                          trace: list[dict] | None = None) -> RetrievalEvidence:
+                          trace: list[dict] | None = None, plan: RetrievalPlan | None = None) -> RetrievalEvidence:
     started_at = time.monotonic()
     words = [word for word in re.findall(r"[\w-]+", query.lower()) if len(word) > 1]
-    rows = db.query(DocumentChunk, Document).join(Document, Document.id == DocumentChunk.document_id).filter(
+    base_rows = db.query(DocumentChunk, Document).join(Document, Document.id == DocumentChunk.document_id).filter(
         Document.status == "completed", Document.deleted_at.is_(None)
     )
     if kb_ids:
-        rows = rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
+        base_rows = base_rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
+    base_rows = _apply_published_filter(base_rows, plan)
+    rows = base_rows
     if words:
         if db.get_bind().dialect.name == "postgresql":
             vector = func.to_tsvector("simple", DocumentChunk.content)
@@ -1104,6 +1142,10 @@ def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int
         else:
             rows = rows.filter(or_(*[DocumentChunk.content.ilike(f"%{word}%") for word in words[:8]]))
     records = rows.limit(limit).all()
+    if not records and words and db.get_bind().dialect.name == "postgresql":
+        # PostgreSQL simple FTS does not segment Thai. Retain FTS as the first
+        # choice, then use an explicit phrase/token fallback in the same scope.
+        records = base_rows.filter(or_(*[DocumentChunk.content.ilike(f"%{word}%") for word in words[:8]])).limit(limit).all()
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
                 "chunk_id": chunk.id, "excerpt": chunk.content[:500], "relevance": 1.0 / i}
                for i, (chunk, document) in enumerate(records, 1)]
@@ -1113,11 +1155,92 @@ def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int
     return RetrievalEvidence(sources, [], [], [])
 
 
-def query_database_graph(db: Session, query: str, kb_ids: list[str], limit: int,
-                         trace: list[dict] | None = None, depth: int = 1) -> RetrievalEvidence:
-    """Use Neo4j as a bounded ID accelerator and PostgreSQL for evidence."""
+def query_exact_documents(db: Session, plan: RetrievalPlan, kb_ids: list[str], limit: int,
+                          trace: list[dict] | None = None) -> RetrievalEvidence:
     started_at = time.monotonic()
-    entity = resolve_entity(db, kb_ids, query)
+    identifiers = plan.document_identifiers
+    if not identifiers:
+        _append_retrieval_trace(trace, channel="exact_document", system="PostgreSQL document metadata", status="used",
+                                started_at=started_at, detail="no document identifier supplied")
+        return RetrievalEvidence([], [], [], [])
+    rows = db.query(DocumentChunk, Document).join(Document, Document.id == DocumentChunk.document_id).filter(
+        Document.status == "completed", Document.deleted_at.is_(None)
+    )
+    if kb_ids:
+        rows = rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
+    rows = _apply_published_filter(rows, plan)
+    predicates = []
+    for identifier in identifiers:
+        pattern = f"%{identifier}%"
+        predicates.extend((Document.title.ilike(pattern), Document.original_filename.ilike(pattern), DocumentChunk.content.ilike(pattern)))
+    records = rows.filter(or_(*predicates)).order_by(DocumentChunk.chunk_index).limit(limit).all()
+    sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
+                "chunk_id": chunk.id, "excerpt": chunk.content[:500], "relevance": 1.0 / i}
+               for i, (chunk, document) in enumerate(records, 1)]
+    _append_retrieval_trace(trace, channel="exact_document", system="PostgreSQL document metadata", status="used",
+                            started_at=started_at, result_count=len(sources), detail="title, filename, and document ID lookup")
+    return RetrievalEvidence(sources, [], [], [])
+
+
+def _verified_relationships(db: Session, kb_ids: list[str]):
+    rows = db.query(Relationship).filter(
+        Relationship.deleted_at.is_(None),
+        (Relationship.is_legal.is_(False)) | (Relationship.review_status == "verified"),
+    )
+    if kb_ids:
+        rows = rows.filter(Relationship.knowledge_base_id.in_(kb_ids))
+    return rows
+
+
+def _global_graph_evidence(db: Session, kb_ids: list[str], limit: int, plan: RetrievalPlan) -> RetrievalEvidence:
+    """Return representative cited edges from several connected components."""
+    relationships = _verified_relationships(db, kb_ids).order_by(Relationship.source_count.desc(), Relationship.created_at.desc()).limit(max(limit * 10, 50)).all()
+    if not relationships:
+        return RetrievalEvidence([], [], [], [])
+    parent: dict[str, str] = {}
+    def find(value: str) -> str:
+        parent.setdefault(value, value)
+        if parent[value] != value:
+            parent[value] = find(parent[value])
+        return parent[value]
+    def union(first: str, second: str) -> None:
+        first, second = find(first), find(second)
+        if first != second:
+            parent[second] = first
+    for relationship in relationships:
+        union(relationship.source_entity_id, relationship.target_entity_id)
+    selected: list[Relationship] = []
+    seen_components: set[str] = set()
+    for relationship in relationships:
+        component = find(relationship.source_entity_id)
+        if component not in seen_components:
+            selected.append(relationship); seen_components.add(component)
+        if len(selected) >= limit:
+            break
+    if len(selected) < limit:
+        selected.extend(item for item in relationships if item not in selected)
+    selected = selected[:limit]
+    node_ids = {item.source_entity_id for item in selected} | {item.target_entity_id for item in selected}
+    nodes = db.query(Entity).filter(Entity.id.in_(node_ids), Entity.deleted_at.is_(None)).all()
+    edges = [{"id": item.id, "source": item.source_entity_id, "target": item.target_entity_id, "type": item.relationship_type} for item in selected]
+    sources = relationship_sources(db, selected, plan)[:limit]
+    for source in sources:
+        source.pop("_relationship_id", None)
+    return RetrievalEvidence(sources, [{"id": item.id, "name": item.name, "type": item.entity_type} for item in nodes], edges, edges)
+
+
+def query_database_graph(db: Session, query: str, kb_ids: list[str], limit: int,
+                         trace: list[dict] | None = None, plan: RetrievalPlan | None = None) -> RetrievalEvidence:
+    """Use local entity traversal or bounded global graph evidence as planned."""
+    started_at = time.monotonic()
+    plan = plan or rule_plan(query, policy_from_config(None), limit).plan
+    if plan.graph_scope == "global":
+        evidence = _global_graph_evidence(db, kb_ids, limit, plan)
+        _append_retrieval_trace(trace, channel="graph", system="PostgreSQL graph tables", status="used",
+                                started_at=started_at, result_count=len(evidence.sources), detail="global representative relationship evidence")
+        return evidence
+    subject = next(iter(plan.entity_subjects), query)
+    entity = resolve_entity(db, kb_ids, subject)
     if not entity:
         _append_retrieval_trace(trace, channel="graph", system="PostgreSQL graph tables", status="used",
                                 started_at=started_at, detail="no scoped entity matched")
@@ -1128,27 +1251,21 @@ def query_database_graph(db: Session, query: str, kb_ids: list[str], limit: int,
     node_ids: list[str] = []
     if store.enabled:
         try:
-            result = store.traverse(entity.id, entity.knowledge_base_id, depth, max(limit * 10, 50))
-            relationship_ids = result.get("relationship_ids", [])
-            node_ids = result.get("node_ids", [])
+            result = store.traverse(entity.id, entity.knowledge_base_id, plan.graph_depth, max(limit * 10, 50))
+            relationship_ids, node_ids = result.get("relationship_ids", []), result.get("node_ids", [])
             if relationship_ids:
                 accelerator = "neo4j accelerator → PostgreSQL evidence"
         except (httpx.HTTPError, RuntimeError, ValueError):
             relationship_ids = []
     if relationship_ids:
-        relationships = db.query(Relationship).filter(
-            Relationship.id.in_(relationship_ids), Relationship.knowledge_base_id == entity.knowledge_base_id,
-            Relationship.deleted_at.is_(None),
-            (Relationship.is_legal.is_(False)) | (Relationship.review_status == "verified"),
-        ).all()
-        node_rows = db.query(Entity).filter(Entity.id.in_(node_ids), Entity.knowledge_base_id == entity.knowledge_base_id,
-                                            Entity.deleted_at.is_(None)).all()
+        relationships = _verified_relationships(db, [entity.knowledge_base_id]).filter(Relationship.id.in_(relationship_ids)).all()
+        node_rows = db.query(Entity).filter(Entity.id.in_(node_ids), Entity.deleted_at.is_(None)).all()
         graph = {"nodes": [{"id": row.id, "name": row.name, "type": row.entity_type} for row in node_rows],
                  "edges": [{"id": row.id, "source": row.source_entity_id, "target": row.target_entity_id, "type": row.relationship_type} for row in relationships]}
     else:
-        graph = entity_graph(db, entity, min(depth, 3))
-        relationships = db.query(Relationship).filter(Relationship.id.in_([edge["id"] for edge in graph["edges"]])).all()
-    sources = relationship_sources(db, relationships)[:limit]
+        graph = entity_graph(db, entity, plan.graph_depth)
+        relationships = _verified_relationships(db, [entity.knowledge_base_id]).filter(Relationship.id.in_([edge["id"] for edge in graph["edges"]])).all()
+    sources = relationship_sources(db, relationships, plan)[:limit]
     for source in sources:
         source.pop("_relationship_id", None)
     _append_retrieval_trace(trace, channel="graph", system=accelerator, status="used",
@@ -1180,12 +1297,12 @@ def fuse_evidence(*channels: RetrievalEvidence, limit: int) -> RetrievalEvidence
 
 
 def rerank_evidence(query: str, evidence: RetrievalEvidence, limit: int,
-                    trace: list[dict] | None = None) -> RetrievalEvidence:
+                    trace: list[dict] | None = None, enabled: bool = True) -> RetrievalEvidence:
     """Optionally apply a cross-encoder reranker after deterministic fusion."""
     client = OpenRouterClient()
-    if not client.reranker_enabled or not evidence.sources:
+    if not enabled or not client.reranker_enabled or not evidence.sources:
         _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="skipped", started_at=time.monotonic(),
-                                detail="not configured" if not client.reranker_enabled else "no candidates")
+                                detail="disabled by retrieval policy" if not enabled else ("not configured" if not client.reranker_enabled else "no candidates"))
         return evidence
     started_at = time.monotonic()
     candidates = evidence.sources[:get_settings().rerank_candidate_limit]
@@ -1221,9 +1338,9 @@ def compose_cited_answer(evidence: RetrievalEvidence) -> str:
     return answer
 
 
-def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: int, token_id: str | None = None) -> dict:
+def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: int, token_id: str | None = None, query_filters=None) -> dict:
     retrieval_trace: list[dict] = []
-    decision = build_retrieval_plan(db, query, kb_ids, max_sources)
+    decision = build_retrieval_plan(db, query, kb_ids, max_sources, query_filters)
     evidence = query_documents(db, query, kb_ids, decision.plan.max_sources, retrieval_trace, decision.plan)
     intent = decision.plan.intent
     answer = compose_cited_answer(evidence)

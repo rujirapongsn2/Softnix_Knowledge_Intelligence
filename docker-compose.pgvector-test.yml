@@ -1,0 +1,22 @@
+services:
+  postgres-test:
+    image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+    environment:
+      POSTGRES_DB: retrieval_test
+      POSTGRES_USER: retrieval_test
+      POSTGRES_PASSWORD: retrieval_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retrieval_test -d retrieval_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  api-pgvector-test:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile.test
+    environment:
+      TEST_POSTGRES_DATABASE_URL: postgresql+psycopg://retrieval_test:retrieval_test@postgres-test:5432/retrieval_test
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    command: pytest -q tests/test_pgvector_integration.py

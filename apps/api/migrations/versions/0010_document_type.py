@@ -15,8 +15,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("documents", sa.Column("document_type", sa.String(length=40), nullable=False, server_default="general"))
-    op.create_index("ix_documents_document_type", "documents", ["document_type"])
+    bind = op.get_bind(); inspector = sa.inspect(bind)
+    if "document_type" not in {column["name"] for column in inspector.get_columns("documents")}:
+        op.add_column("documents", sa.Column("document_type", sa.String(length=40), nullable=False, server_default="general"))
+    if "ix_documents_document_type" not in {index["name"] for index in sa.inspect(bind).get_indexes("documents")}:
+        op.create_index("ix_documents_document_type", "documents", ["document_type"])
 
 
 def downgrade() -> None:

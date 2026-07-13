@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+import time
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,8 +11,8 @@ import redis
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .audit import record_audit
-from .db import Base, engine, get_db
+from .audit import record_audit, record_retrieval_execution
+from .db import Base, engine, get_db, SessionLocal
 from .external_ocr import ExternalOcrClient
 from .graph_store import Neo4jGraphStore
 from .models import AuditLog, Document, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, KnowledgeBase, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, TokenKey, User
@@ -19,7 +20,7 @@ from .observability import metrics, now
 from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
-from .schemas import DocumentOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, TokenCreate, TokenCreated, TokenOut
+from .schemas import DocumentOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
 from .security import authorize, bearer_token, create_session_token, create_token_secret, current_admin, password_hash, refresh_admin, token_digest, verify_password
 from .services import DEFAULT_RETRIEVAL_CONFIG, LEGAL_DOCUMENT_TYPES, analyze_impact, build_query_result, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, rebuild_legal_graph, resolve_entity, sync_legal_document_graph, sync_lightrag_document_graph
 
@@ -28,16 +29,55 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8080", "http
                    allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type"])
 
 
+REQUEST_TRANSACTION_ACTION = "request.transaction"
+# Health probes and reads of the logging APIs intentionally do not create a new
+# transaction record. This keeps the operator view useful rather than filling it
+# with its own polling traffic.
+REQUEST_LOG_EXCLUDED_PATHS = {"/health", "/ready", "/metrics", "/api/v1/audit-logs", "/api/v1/logs/transactions", "/api/v1/traces"}
+
+
+def record_request_transaction(request: Request, request_id: str, status_code: int, duration_seconds: float) -> None:
+    """Persist operator-safe request metadata without ever retaining request secrets or bodies."""
+    path = request.url.path
+    if path in REQUEST_LOG_EXCLUDED_PATHS or (not path.startswith("/api/") and path != "/mcp"):
+        return
+    auth_type = "mcp_token" if request.headers.get("authorization", "").lower().startswith("bearer ") else (
+        "admin_session" if "skip_access" in request.cookies else "anonymous"
+    )
+    db = SessionLocal()
+    try:
+        record_audit(db, REQUEST_TRANSACTION_ACTION, target_type="http_request", target_id=request_id, metadata={
+            "request_id": request_id,
+            "method": request.method,
+            "path": path,
+            "status_code": status_code,
+            "duration_ms": round(duration_seconds * 1000, 1),
+            "authentication": auth_type,
+        })
+        db.commit()
+    except Exception:
+        # Observability must never change a successful request into an error.
+        db.rollback()
+    finally:
+        db.close()
+
+
 @app.middleware("http")
 async def request_observability(request: Request, call_next):
     started = now()
-    request_id = request.headers.get("X-Request-ID") or __import__("uuid").uuid4().hex
+    supplied_request_id = str(request.headers.get("X-Request-ID") or "").strip()
+    request_id = supplied_request_id[:36] or __import__("uuid").uuid4().hex
+    request.state.request_id = request_id
     try:
         response = await call_next(request)
     except Exception:
-        metrics.observe(request.method, request.url.path, 500, now() - started)
+        duration = now() - started
+        metrics.observe(request.method, request.url.path, 500, duration)
+        record_request_transaction(request, request_id, 500, duration)
         raise
-    metrics.observe(request.method, request.url.path, response.status_code, now() - started)
+    duration = now() - started
+    metrics.observe(request.method, request.url.path, response.status_code, duration)
+    record_request_transaction(request, request_id, response.status_code, duration)
     response.headers["X-Request-ID"] = request_id
     return response
 
@@ -146,6 +186,21 @@ def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(current_admin),
 @app.get("/api/v1/knowledge-bases", response_model=list[KnowledgeBaseOut])
 def list_kbs(_: User = Depends(current_admin), db: Session = Depends(get_db)):
     return db.query(KnowledgeBase).filter(KnowledgeBase.deleted_at.is_(None)).all()
+
+
+@app.patch("/api/v1/knowledge-bases/{kb_id}/retrieval-config", response_model=KnowledgeBaseOut)
+def update_retrieval_config(kb_id: str, payload: RetrievalConfigUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    try:
+        kb.retrieval_config = payload.merged(kb.retrieval_config or {})
+    except ValueError as exc:
+        raise HTTPException(422, {"code": "RETRIEVAL_CONFIG_INVALID", "message": str(exc), "retryable": False}) from exc
+    record_audit(db, "knowledge_base.retrieval_config.update", user.id, "knowledge_base", kb.id,
+                 {"config": kb.retrieval_config})
+    db.commit(); db.refresh(kb)
+    return kb
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/activate")
@@ -635,31 +690,50 @@ def authorized_query(payload: QueryRequest, token: TokenKey | None, db: Session)
     return build_query_result(db, payload.query, kb_ids, payload.max_sources, token.id if token else None)
 
 
-def active_mcp_knowledge_base_ids(db: Session, kb_ids: list[str]) -> list[str]:
-    """Return only active Knowledge Bases, rejecting any requested inactive scope.
+def effective_mcp_knowledge_base_ids(db: Session, token: TokenKey) -> list[str]:
+    """Derive MCP retrieval scope from the token, never from client arguments.
 
-    An unscoped MCP token retains its existing "all" behavior, but its all is
-    deliberately restricted to currently active, non-deleted Knowledge Bases.
+    A scoped token searches its currently active Knowledge Bases. Legacy
+    unscoped tokens retain an explicit all-active behaviour for compatibility.
     """
+    configured_ids = list(token.allowed_knowledge_base_ids or [])
     rows = db.query(KnowledgeBase.id).filter(
         KnowledgeBase.deleted_at.is_(None), KnowledgeBase.status == "active",
     )
-    if kb_ids:
-        active_ids = {row[0] for row in rows.filter(KnowledgeBase.id.in_(kb_ids)).all()}
-        missing_ids = sorted(set(kb_ids) - active_ids)
-        if missing_ids:
+    if configured_ids:
+        active_scope = [row[0] for row in rows.filter(KnowledgeBase.id.in_(configured_ids)).all()]
+        if not active_scope:
             raise HTTPException(403, {
                 "code": "KNOWLEDGE_BASE_INACTIVE",
-                "message": "The requested Knowledge Base is disabled, draft, deleted, or unavailable to MCP.",
+                "message": "None of this MCP key's Knowledge Bases are active.",
                 "retryable": False,
             })
-        return list(kb_ids)
+        return active_scope
     return [row[0] for row in rows.all()]
 
 
+def active_mcp_knowledge_base_ids(db: Session, kb_ids: list[str]) -> list[str]:
+    """Validate historical result sources before MCP returns them."""
+    rows = db.query(KnowledgeBase.id).filter(
+        KnowledgeBase.deleted_at.is_(None), KnowledgeBase.status == "active",
+        KnowledgeBase.id.in_(kb_ids),
+    ).all()
+    active_ids = {row[0] for row in rows}
+    if set(kb_ids) - active_ids:
+        raise HTTPException(403, {
+            "code": "KNOWLEDGE_BASE_INACTIVE",
+            "message": "The requested Knowledge Base is disabled, draft, deleted, or unavailable to MCP.",
+            "retryable": False,
+        })
+    return list(kb_ids)
+
+
 @app.post("/api/v1/query")
-def admin_query(payload: QueryRequest, _: User = Depends(current_admin), db: Session = Depends(get_db)):
-    return authorized_query(payload, None, db)
+def admin_query(payload: QueryRequest, request: Request, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    result = authorized_query(payload, None, db)
+    record_retrieval_execution(db, request.state.request_id, result, actor_id=user.id)
+    db.commit()
+    return result
 
 
 @app.get("/api/v1/query/results/{result_id}/sources")
@@ -700,6 +774,118 @@ def list_audit_logs(limit: int = 100, _: User = Depends(current_admin), db: Sess
              "target_id": row.target_id, "metadata": row.metadata_json, "created_at": row.created_at} for row in rows]
 
 
+@app.get("/api/v1/logs/transactions")
+def list_request_transactions(limit: int = 100, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Return recent request transactions for the operator UI.
+
+    Records contain only request metadata collected by the middleware. Request
+    bodies, authorization headers, cookies, prompts, and token values are never
+    persisted or returned here.
+    """
+    rows = db.query(AuditLog).filter(AuditLog.action == REQUEST_TRANSACTION_ACTION).order_by(
+        AuditLog.created_at.desc()
+    ).limit(min(max(limit, 1), 500)).all()
+    request_ids = [(row.metadata_json or {}).get("request_id") or row.target_id for row in rows]
+    execution_rows = db.query(AuditLog).filter(
+        AuditLog.action == "retrieval.execution", AuditLog.target_id.in_([item for item in request_ids if item]),
+    ).order_by(AuditLog.created_at.desc()).all() if request_ids else []
+    executions = {row.target_id: row.metadata_json for row in execution_rows}
+    return [{
+        "id": row.id,
+        "request_id": (row.metadata_json or {}).get("request_id") or row.target_id,
+        "method": (row.metadata_json or {}).get("method", "UNKNOWN"),
+        "path": (row.metadata_json or {}).get("path", ""),
+        "status_code": (row.metadata_json or {}).get("status_code", 0),
+        "duration_ms": (row.metadata_json or {}).get("duration_ms", 0),
+        "authentication": (row.metadata_json or {}).get("authentication", "unknown"),
+        "retrieval": executions.get((row.metadata_json or {}).get("request_id") or row.target_id),
+        "created_at": row.created_at,
+    } for row in rows]
+
+
+def trace_spans(metadata: dict) -> list[dict]:
+    """Normalize current spans and give historical audit entries a readable fallback."""
+    cursor = 0
+    spans = []
+    for index, raw in enumerate(metadata.get("retrieval_trace") or [], 1):
+        span = dict(raw)
+        duration = int(span.get("duration_ms", 0) or 0)
+        span.setdefault("span_id", f"span-{index}")
+        span.setdefault("parent_span_id", "root")
+        span.setdefault("offset_ms", cursor)
+        cursor = max(cursor, int(span["offset_ms"] or 0) + duration)
+        spans.append(span)
+    return spans
+
+
+def trace_summary(row: AuditLog) -> dict:
+    metadata = row.metadata_json or {}
+    spans = trace_spans(metadata)
+    total_duration = max((int(span.get("offset_ms", 0)) + int(span.get("duration_ms", 0)) for span in spans), default=0)
+    return {
+        "trace_id": metadata.get("trace_id") or row.target_id,
+        "request_id": metadata.get("request_id") or row.target_id,
+        "transport": metadata.get("transport", "api"),
+        "tool": metadata.get("tool"),
+        "status": metadata.get("trace_status", "success"),
+        "intent": (metadata.get("retrieval_plan") or {}).get("intent"),
+        "knowledge_base_ids": metadata.get("knowledge_base_ids") or [],
+        "source_count": metadata.get("source_count", 0),
+        "duration_ms": total_duration,
+        "created_at": row.created_at,
+    }
+
+
+@app.get("/api/v1/traces")
+def list_retrieval_traces(limit: int = 100, transport: str | None = None, status: str | None = None,
+                          search: str | None = None, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """List safe RetrievalExecutor trace summaries for the Trace Explorer."""
+    rows = db.query(AuditLog).filter(AuditLog.action == "retrieval.execution").order_by(
+        AuditLog.created_at.desc()
+    ).limit(min(max(limit, 1), 500)).all()
+    needle = (search or "").strip().lower()
+    summaries = []
+    for row in rows:
+        item = trace_summary(row)
+        if transport and item["transport"] != transport:
+            continue
+        if status and item["status"] != status:
+            continue
+        if needle and needle not in " ".join(str(value) for value in (item["trace_id"], item["tool"], item["intent"], item["transport"])).lower():
+            continue
+        summaries.append(item)
+    return summaries
+
+
+@app.get("/api/v1/traces/{trace_id}")
+def get_retrieval_trace(trace_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Return a root span and safe child spans for one retrieval execution."""
+    row = db.query(AuditLog).filter(AuditLog.action == "retrieval.execution", AuditLog.target_id == trace_id).order_by(
+        AuditLog.created_at.desc()
+    ).first()
+    if not row:
+        raise HTTPException(404, "Trace not found")
+    metadata = row.metadata_json or {}
+    summary = trace_summary(row)
+    return {**summary, "root_span": {"span_id": "root", "name": metadata.get("tool") or "knowledge query",
+                                      "status": summary["status"], "duration_ms": summary["duration_ms"]},
+            "retrieval_plan": metadata.get("retrieval_plan"), "spans": trace_spans(metadata)}
+
+
+@app.get("/api/v1/mcp/activity")
+def list_mcp_activity(limit: int = 50, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Return operator-safe MCP tool traces, newest first.
+
+    Token secrets and request headers are never persisted. Query text is capped
+    so this remains an audit trail rather than a second document store.
+    """
+    rows = db.query(AuditLog).filter(AuditLog.action.in_(["mcp.tool.call", "mcp.tool.error"])).order_by(
+        AuditLog.created_at.desc()
+    ).limit(min(max(limit, 1), 200)).all()
+    return [{"id": row.id, "action": row.action, "target_id": row.target_id,
+             "metadata": row.metadata_json, "created_at": row.created_at} for row in rows]
+
+
 MCP_TOOLS = [
     {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning", "inputSchema": QueryRequest.model_json_schema()},
     {"name": "find_entities", "description": "Find entities by name or alias", "inputSchema": {"type": "object", "properties": {"search_text": {"type": "string"}}, "required": ["search_text"]}},
@@ -713,12 +899,50 @@ def mcp_error(request_id: Any, code: str, message: str, *, retryable: bool = Fal
     return JSONResponse(status_code=200, content={"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message, "retryable": retryable}})
 
 
+def mcp_audit_arguments(name: str, arguments: dict[str, Any], effective_kb_ids: list[str] | None = None) -> dict:
+    """Keep request context useful for operators without storing credentials."""
+    query = arguments.get("query") or arguments.get("search_text") or arguments.get("subject") or arguments.get("question")
+    requested_kb_ids = arguments.get("knowledge_base_ids", [])
+    item: dict[str, Any] = {"knowledge_base_ids": effective_kb_ids if effective_kb_ids is not None else requested_kb_ids}
+    if effective_kb_ids is not None and requested_kb_ids:
+        item["client_knowledge_base_ids_ignored"] = True
+    if query is not None:
+        value = str(query)
+        item["query"] = value[:2000]
+        item["query_truncated"] = len(value) > 2000
+    if name == "analyze_relationships":
+        item["subjects"] = [str(subject)[:500] for subject in arguments.get("subjects", [])[:20]]
+    return item
+
+
+def record_mcp_tool_audit(db: Session, token: TokenKey, request_id: Any, name: str, arguments: dict[str, Any],
+                          route: list[dict], started_at: float, *, retrieval_plan: dict | None = None,
+                          error_code: str | None = None, effective_kb_ids: list[str] | None = None) -> None:
+    metadata = {
+        "request_id": str(request_id)[:100] if request_id is not None else None,
+        "tool": name,
+        "token_name": token.name,
+        "duration_ms": round((time.monotonic() - started_at) * 1000),
+        "route": route,
+        **mcp_audit_arguments(name, arguments, effective_kb_ids),
+    }
+    if retrieval_plan:
+        metadata["retrieval_plan"] = retrieval_plan
+    if error_code:
+        metadata["error_code"] = error_code
+    record_audit(db, "mcp.tool.error" if error_code else "mcp.tool.call", None, "token", token.id, metadata)
+    db.commit()
+
+
 @app.post("/mcp")
 async def mcp(request: Request, db: Session = Depends(get_db)):
     request_id = None
     token = None
     deadline_token = None
     acquired = False
+    mcp_started_at = time.monotonic()
+    tool_name = None
+    tool_arguments: dict[str, Any] = {}
     try:
         body: dict[str, Any] = await request.json(); request_id = body.get("id")
         token = bearer_token(request, db); mcp_limiter.acquire(token); acquired = True
@@ -727,23 +951,28 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
         if method == "initialize": result = {"protocolVersion": "2025-03-26", "serverInfo": {"name": "softnix-knowledge", "version": "0.1.0"}, "capabilities": {"tools": {}}}
         elif method == "tools/list": result = {"tools": [tool for tool in MCP_TOOLS if not token.allowed_tools or tool["name"] in token.allowed_tools]}
         elif method == "tools/call":
-            name = params.get("name"); arguments = params.get("arguments", {}); authorize(token, name, arguments.get("knowledge_base_ids", token.allowed_knowledge_base_ids))
+            name = params.get("name"); arguments = params.get("arguments", {}); tool_name, tool_arguments = name, arguments
+            authorize(token, name, list(token.allowed_knowledge_base_ids or []))
+            effective_kb_ids = effective_mcp_knowledge_base_ids(db, token)
             if name == "search_knowledge":
                 payload = QueryRequest.model_validate(arguments)
-                payload.knowledge_base_ids = active_mcp_knowledge_base_ids(db, payload.knowledge_base_ids or token.allowed_knowledge_base_ids)
+                payload.knowledge_base_ids = effective_kb_ids
                 result = authorized_query(payload, token, db)
             elif name == "find_entities":
-                kb_ids = active_mcp_knowledge_base_ids(db, arguments.get("knowledge_base_ids") or token.allowed_knowledge_base_ids)
+                kb_ids = effective_kb_ids
                 rows = db.query(Entity).filter(Entity.knowledge_base_id.in_(kb_ids), Entity.deleted_at.is_(None), Entity.name.ilike(f"%{arguments.get('search_text', '')}%")).limit(min(arguments.get("limit", 10), 50)).all()
                 result = {"status": "success", "entities": [EntityOut.model_validate(row).model_dump() for row in rows]}
+                result["metadata"] = {"retrieval_trace": [{"channel": "entity_lookup", "system": "PostgreSQL entity tables", "status": "used", "result_count": len(rows), "detail": "name and alias lookup"}]}
             elif name == "analyze_relationships":
-                kb_ids = active_mcp_knowledge_base_ids(db, arguments.get("knowledge_base_ids") or token.allowed_knowledge_base_ids)
+                kb_ids = effective_kb_ids
                 entity = resolve_entity(db, kb_ids, arguments.get("subjects", [""])[0])
                 result = {"status": "success", "graph": entity_graph(db, entity, min(arguments.get("max_depth", 1), 3)) if entity else {"nodes": [], "edges": []}}
+                result["metadata"] = {"retrieval_trace": [{"channel": "graph_relationships", "system": "PostgreSQL graph tables", "status": "used", "result_count": len(result["graph"]["edges"]), "detail": "bounded relationship traversal"}]}
             elif name == "analyze_impact":
                 impact = ImpactRequest.model_validate(arguments)
-                kb_ids = active_mcp_knowledge_base_ids(db, impact.knowledge_base_ids or token.allowed_knowledge_base_ids)
+                kb_ids = effective_kb_ids
                 result = analyze_impact(db, impact.subject, kb_ids, impact.max_depth, impact.include_indirect)
+                result["metadata"] = {"retrieval_trace": [{"channel": "graph_impact", "system": "PostgreSQL graph tables", "status": "used", "result_count": len(result.get("direct_impacts", [])) + len(result.get("indirect_impacts", [])), "detail": "bounded impact traversal"}]}
             elif name == "get_sources":
                 saved = db.get(QueryResult, arguments.get("result_id"))
                 if saved:
@@ -751,20 +980,35 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
                     authorize(token, "get_sources", source_kb_ids)
                     active_mcp_knowledge_base_ids(db, source_kb_ids)
                 result = {"sources": saved.result_json.get("sources", [])} if saved else {"sources": []}
+                result["metadata"] = {"retrieval_trace": [{"channel": "result_sources", "system": "PostgreSQL query result store", "status": "used", "result_count": len(result["sources"]), "detail": "stored cited sources"}]}
             else: return mcp_error(request_id, "MCP_TOOL_NOT_FOUND", "Tool not found")
+            route = result.get("metadata", {}).get("retrieval_trace", [])
+            record_retrieval_execution(db, request.state.request_id, result, transport="mcp", tool=name,
+                                       rpc_request_id=str(request_id) if request_id is not None else None)
+            record_mcp_tool_audit(db, token, request_id, name, arguments, route, mcp_started_at,
+                                  retrieval_plan=result.get("metadata", {}).get("retrieval_plan"),
+                                  effective_kb_ids=effective_kb_ids)
             result.setdefault("request_id", request_id)
             result = {"content": [{"type": "text", "text": result.get("answer", "Structured knowledge result available.")}], "structuredContent": result}
         else: return mcp_error(request_id, "MCP_METHOD_NOT_FOUND", "Method not found")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {"code": "MCP_REQUEST_INVALID", "message": str(exc.detail)}
+        if token is not None and tool_name:
+            record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code=detail.get("code", "MCP_REQUEST_INVALID"))
         return mcp_error(request_id, detail.get("code", "MCP_REQUEST_INVALID"), detail.get("message", "Request rejected"), retryable=detail.get("retryable", False))
     except McpLimitExceeded as exc:
+        if token is not None and tool_name:
+            record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code=exc.code)
         return mcp_error(request_id, exc.code, exc.message, retryable=exc.code == "MCP_LIMIT_STORE_UNAVAILABLE")
     except RuntimeError as exc:
+        if token is not None and tool_name:
+            record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code=str(exc))
         if str(exc) == "MCP_TIMEOUT": return mcp_error(request_id, "MCP_TIMEOUT", "Token query timeout exceeded", retryable=True)
         return mcp_error(request_id, "MCP_EXECUTION_FAILED", "Tool execution failed", retryable=True)
     except Exception:
+        if token is not None and tool_name:
+            record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code="MCP_REQUEST_INVALID")
         return mcp_error(request_id, "MCP_REQUEST_INVALID", "Invalid MCP request")
     finally:
         if deadline_token is not None: reset_deadline(deadline_token)

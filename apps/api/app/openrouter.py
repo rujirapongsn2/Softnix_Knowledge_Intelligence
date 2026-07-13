@@ -94,6 +94,45 @@ class OpenRouterClient:
             if self._client is None:
                 client.close()
 
+    def plan_retrieval(self, query: str, available_channels: list[str], max_sources: int, max_graph_depth: int) -> dict[str, Any]:
+        """Ask OpenRouter for a small JSON-only plan for ambiguous queries.
+
+        The caller constrains this result again against the Knowledge Base
+        policy. The model never receives document contents or credentials.
+        """
+        if not self.embeddings_enabled:
+            raise RuntimeError("OPENROUTER_API_KEY_NOT_CONFIGURED")
+        schema = {"intent": "semantic_hybrid", "channels": available_channels, "max_sources": max_sources,
+                  "graph_depth": max_graph_depth}
+        prompt = (
+            "Choose retrieval channels for the user query. Return JSON only. "
+            "Allowed channels are vector, full_text, graph, lightrag. "
+            "Use graph for entity/relationship/impact questions, full_text for exact terms, "
+            "vector or lightrag for meaning. Never add channels outside the allowed list. "
+            f"Maximum max_sources is {max_sources}; maximum graph_depth is {max_graph_depth}.\n"
+            f"Allowed plan schema: {json.dumps(schema)}\nQuery (untrusted): {protect_query_text(query[:2000])}"
+        )
+        client = self._client or httpx.Client(timeout=self.settings.retrieval_planner_timeout_seconds)
+        try:
+            response = client.post(
+                f"{self.settings.openrouter_base_url.rstrip('/')}/chat/completions",
+                headers=self._headers(),
+                json={"model": self.settings.openrouter_llm_model, "temperature": 0,
+                      "response_format": {"type": "json_object"},
+                      "messages": [{"role": "system", "content": "Return valid JSON only."}, {"role": "user", "content": prompt}]},
+            )
+            response.raise_for_status()
+            content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            value = json.loads(str(content).removeprefix("```json").removesuffix("```").strip())
+            if not isinstance(value, dict):
+                raise RuntimeError("OPENROUTER_PLANNER_INVALID_RESPONSE")
+            return value
+        except (httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError("OPENROUTER_PLANNER_UNAVAILABLE") from exc
+        finally:
+            if self._client is None:
+                client.close()
+
     def extract_legal_metadata(self, title: str, text: str) -> dict[str, Any]:
         """Extract reviewable legal structure; never presents itself as legal advice."""
         if not self.embeddings_enabled:

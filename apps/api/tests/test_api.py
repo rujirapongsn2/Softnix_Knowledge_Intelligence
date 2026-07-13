@@ -44,6 +44,16 @@ def test_vertical_slice():
     assert reply.status_code == 200
     assert reply.json()["result"]["structuredContent"]["sources"]
     assert reply.json()["result"]["structuredContent"]["request_id"] == 1
+    assert reply.json()["result"]["structuredContent"]["metadata"]["retrieval_plan"]["intent"] == "entity_lookup"
+    activity = test_client.get("/api/v1/mcp/activity").json()
+    call = next(row for row in activity if row["metadata"].get("tool") == "search_knowledge")
+    assert call["metadata"]["query"] == "What runs on APP-01?"
+    assert any(step["channel"] == "full_text" and step["status"] == "used" for step in call["metadata"]["route"])
+    transactions = test_client.get("/api/v1/logs/transactions?limit=100").json()
+    mcp_transaction = next(row for row in transactions if row["path"] == "/mcp" and row["retrieval"])
+    assert mcp_transaction["retrieval"]["transport"] == "mcp"
+    assert mcp_transaction["retrieval"]["retrieval_plan"]["intent"] == "entity_lookup"
+    assert any(step["channel"] == "full_text" for step in mcp_transaction["retrieval"]["retrieval_trace"])
 
 
 def test_knowledge_base_can_be_disabled_activated_and_safely_deleted():
@@ -63,6 +73,18 @@ def test_knowledge_base_can_be_disabled_activated_and_safely_deleted():
     assert nonempty.status_code == 409 and nonempty.json()["error"]["code"] == "KNOWLEDGE_BASE_NOT_EMPTY"
     assert uploaded["status"] == "queued"
     assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True
+
+
+def test_retrieval_policy_can_be_updated_and_is_returned_in_kb_contract():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Planner policy", "code": "planner-policy"}).json()
+    updated = test_client.patch(f"/api/v1/knowledge-bases/{kb['id']}/retrieval-config", json={
+        "retrieval_mode": "precision", "enable_lightrag": False, "maximum_graph_depth": 2,
+    })
+    assert updated.status_code == 200
+    assert updated.json()["retrieval_config"]["retrieval_mode"] == "precision"
+    assert updated.json()["retrieval_config"]["enable_lightrag"] is False
+    assert updated.json()["retrieval_config"]["maximum_graph_depth"] == 2
 
 
 def test_legal_document_type_queues_automatic_metadata_extraction():
@@ -136,10 +158,17 @@ def test_mcp_only_reads_active_knowledge_bases():
     token = test_client.post("/api/v1/tokens", json={"name": "active-only-agent", "allowed_knowledge_base_ids": [active["id"], disabled["id"]], "allowed_tools": ["search_knowledge"]}).json()
     assert test_client.post(f"/api/v1/knowledge-bases/{disabled['id']}/disable").status_code == 200
 
-    active_response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_knowledge", "arguments": {"query": "Active MCP evidence", "knowledge_base_ids": [active["id"]]}}})
+    # The client-supplied KB value is ignored; the token scope is authoritative.
+    active_response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_knowledge", "arguments": {"query": "Active MCP evidence", "knowledge_base_ids": ["client-controlled-value"]}}})
     assert active_response.json()["result"]["structuredContent"]["sources"][0]["document_id"] == active_doc["document_id"]
+    call = next(row for row in test_client.get("/api/v1/mcp/activity").json() if row["metadata"].get("request_id") == "1")
+    assert call["metadata"]["knowledge_base_ids"] == [active["id"]]
+    assert call["metadata"]["client_knowledge_base_ids_ignored"] is True
     disabled_response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "search_knowledge", "arguments": {"query": "anything", "knowledge_base_ids": [disabled["id"]]}}})
-    assert disabled_response.json()["error"]["code"] == "KNOWLEDGE_BASE_INACTIVE"
+    assert disabled_response.json()["result"]["structuredContent"]["metadata"]["knowledge_base_ids"] == [active["id"]]
+    assert test_client.post(f"/api/v1/knowledge-bases/{active['id']}/disable").status_code == 200
+    no_active_scope = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "search_knowledge", "arguments": {"query": "anything"}}})
+    assert no_active_scope.json()["error"]["code"] == "KNOWLEDGE_BASE_INACTIVE"
 
 
 def test_mcp_token_scope_must_reference_active_knowledge_bases():
@@ -386,6 +415,42 @@ def test_metrics_and_audit_log_are_exposed():
     metrics = test_client.get("/metrics")
     assert metrics.status_code == 200
     assert "softnix_http_requests_total" in metrics.text
+
+
+def test_request_transactions_are_operator_safe_and_include_request_metadata():
+    test_client = next(client())
+    created = test_client.post("/api/v1/knowledge-bases", json={"name": "Transaction", "code": "transaction-kb"})
+    request_id = created.headers["X-Request-ID"]
+    transactions = test_client.get("/api/v1/logs/transactions?limit=100")
+    assert transactions.status_code == 200
+    row = next(item for item in transactions.json() if item["request_id"] == request_id)
+    assert row["method"] == "POST"
+    assert row["path"] == "/api/v1/knowledge-bases"
+    assert row["status_code"] == 200
+    assert isinstance(row["duration_ms"], (int, float))
+    assert row["authentication"] == "admin_session"
+
+
+def test_admin_query_transaction_includes_retrieval_executor_trace():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Trace", "code": "trace-kb"}).json()
+    test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("trace.txt", b"The trace document describes the platform.", "text/plain")})
+    assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True
+    response = test_client.post("/api/v1/query", json={"query": "platform", "knowledge_base_ids": [kb["id"]]})
+    assert response.status_code == 200
+    request_id = response.headers["X-Request-ID"]
+    transactions = test_client.get("/api/v1/logs/transactions?limit=100").json()
+    row = next(item for item in transactions if item["request_id"] == request_id)
+    assert row["retrieval"]["transport"] == "api"
+    assert row["retrieval"]["retrieval_plan"]["intent"]
+    assert row["retrieval"]["retrieval_trace"]
+    traces = test_client.get("/api/v1/traces?transport=api").json()
+    trace = next(item for item in traces if item["request_id"] == request_id)
+    detail = test_client.get(f"/api/v1/traces/{trace['trace_id']}").json()
+    assert detail["root_span"]["span_id"] == "root"
+    assert detail["spans"]
+    assert all("offset_ms" in span and "duration_ms" in span for span in detail["spans"])
+    assert "query" not in detail
 
 
 def test_document_restore_graph_layout_and_feedback_lifecycle():

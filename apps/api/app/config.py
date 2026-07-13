@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     openrouter_app_url: str = ""
     openrouter_app_title: str = "Softnix Knowledge Intelligence Platform"
     reranker_enabled: bool = False
+    retrieval_planner_timeout_seconds: int = 4
     ext_ocr_base_url: str = "https://111.223.37.41:9001"
     ext_ocr_key: str = ""
     ext_ocr_verify_ssl: bool = False

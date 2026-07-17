@@ -20,10 +20,13 @@ from .config import get_settings
 from .db import SessionLocal
 from .external_ocr import ExternalOcrClient
 from .graph_store import Neo4jGraphStore
-from .models import Document, DocumentChunk, Entity, EntitySource, GraphProjectionEvent, KnowledgeBase, ProcessingJob, QueryResult, Relationship, RelationshipSource
+from .legal_registry import AUTHORITY_LEVELS, classify_kind, normalize_family_key, parse_provision_refs, parse_thai_date, provision_number_matches, resolve_instrument_statuses
+from .legal_resolver import resolve_legal_context
+from .legal_corpus import parse_legal_corpus_metadata
+from .models import Document, DocumentChunk, Entity, EntitySource, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .openrouter import OpenRouterClient
 from .observability import metrics
-from .planner import RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
+from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
 from .retrieval import LightRAGRetrievalEngine, RetrievalEvidence
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".html", ".htm", ".csv", ".json"}
@@ -204,7 +207,13 @@ def sync_lightrag_document_graph(db: Session, document: Document, max_labels: in
 
 LEGAL_GRAPH_RELATIONSHIPS = {
     "CONTAINS_PROVISION", "ISSUED_BY", "PARTY_TO", "REQUIRES", "GRANTS_RIGHT", "PROHIBITS", "DEFINES",
-    "ISSUED_UNDER", "IMPLEMENTS", "AMENDS", "REPEALS", "REFERS_TO", "GOVERNED_BY",
+    "ISSUED_UNDER", "IMPLEMENTS", "AMENDS", "REPEALS", "SUPERSEDES", "REFERS_TO", "GOVERNED_BY",
+}
+# Cross-instrument subset of LEGAL_GRAPH_RELATIONSHIPS; the rest (CONTAINS_PROVISION,
+# ISSUED_BY, PARTY_TO, ...) describe facts within a single document and never become
+# a legal_instrument_relations row.
+LEGAL_INSTRUMENT_RELATION_TYPES = {
+    "ISSUED_UNDER", "IMPLEMENTS", "AMENDS", "REPEALS", "SUPERSEDES", "REFERS_TO", "GOVERNED_BY",
 }
 
 
@@ -220,10 +229,25 @@ def _legal_evidence(item, fallback: str) -> str:
     return (_legal_value(item, "evidence_quote", "excerpt", "text", "description") or fallback)[:5000]
 
 
+def _reference_confidence(reference, default: float = 0.5) -> float:
+    """An explicit confidence of 0.0 is a real (low) signal, not a missing value."""
+    value = reference.get("confidence") if isinstance(reference, dict) else None
+    return float(value) if value is not None else default
+
+
 def legal_metadata_v2(document: Document) -> dict:
     """Normalize legacy legal metadata without discarding a human-edited value."""
     metadata = document.legal_metadata or {}
     if metadata.get("schema_version") == 2:
+        # Backfill official corpus identity for records created before the
+        # deterministic parser was introduced, while preserving curator edits.
+        parsed = parse_legal_corpus_metadata(document.extracted_text or "", document.title or document.original_filename)
+        current_instrument = metadata.get("instrument") if isinstance(metadata.get("instrument"), dict) else {}
+        metadata["instrument"] = {**parsed.get("instrument", {}), **current_instrument}
+        if not metadata.get("change_events") and parsed.get("change_events"):
+            metadata["change_events"] = parsed["change_events"]
+        if not metadata.get("amendments") and parsed.get("amendments"):
+            metadata["amendments"] = parsed["amendments"]
         return metadata
     kind_by_document_type = {"legal": "Act", "regulation": "Regulation", "contract": "Contract"}
     provisions = []
@@ -235,6 +259,8 @@ def legal_metadata_v2(document: Document) -> dict:
                 "heading": _legal_value(article, "heading", "title"), "text": _legal_value(article, "text"),
                 "evidence_quote": _legal_evidence(article, f"มาตรา {number}"),
             })
+    parsed = parse_legal_corpus_metadata(document.extracted_text or "", document.title or document.original_filename)
+    parsed_instrument = parsed.get("instrument", {})
     return {
         "schema_version": 2,
         # Compatibility aliases remain readable by existing clients while the
@@ -248,6 +274,7 @@ def legal_metadata_v2(document: Document) -> dict:
             "jurisdiction": metadata.get("jurisdiction"),
             "effective_date": metadata.get("effective_date"),
             "issuer": metadata.get("issuer"),
+            **parsed_instrument,
         },
         "provisions": provisions,
         "parties": metadata.get("parties") if isinstance(metadata.get("parties"), list) else [],
@@ -256,9 +283,11 @@ def legal_metadata_v2(document: Document) -> dict:
         "prohibitions": metadata.get("prohibitions") if isinstance(metadata.get("prohibitions"), list) else [],
         "penalties": metadata.get("penalties") if isinstance(metadata.get("penalties"), list) else [],
         "definitions": metadata.get("definitions") if isinstance(metadata.get("definitions"), list) else [],
-        "amendments": metadata.get("amendments") if isinstance(metadata.get("amendments"), list) else [],
+        "amendments": metadata.get("amendments") if isinstance(metadata.get("amendments"), list) else parsed.get("amendments", []),
+        "change_events": metadata.get("change_events") if isinstance(metadata.get("change_events"), list) else parsed.get("change_events", []),
         "references": metadata.get("references") if isinstance(metadata.get("references"), list) else [],
         "confidence": metadata.get("confidence", 0.0),
+        "provenance": {**parsed.get("provenance", {}), **(metadata.get("provenance") or {})},
     }
 
 
@@ -427,6 +456,149 @@ def sync_legal_document_graph(db: Session, document: Document, *, replace: bool 
     return {"entities": entity_count, "relationships": relationship_count}
 
 
+def _get_or_create_legal_family(db: Session, knowledge_base_id: str, title: str, normalized_key: str) -> LegalFamily:
+    family = db.query(LegalFamily).filter_by(knowledge_base_id=knowledge_base_id, normalized_key=normalized_key).first()
+    if family is None:
+        family = LegalFamily(knowledge_base_id=knowledge_base_id, base_title=title[:500], normalized_key=normalized_key)
+        db.add(family); db.flush()
+    return family
+
+
+def upsert_legal_instrument(db: Session, document: Document) -> LegalInstrument | None:
+    """Register or refresh the legal registry entry for one legal document.
+
+    Never touches `status`/`status_reason`; only resolve_instrument_statuses does,
+    so extraction re-runs cannot clobber a status derived from reviewed relations.
+    """
+    if document.document_type not in LEGAL_DOCUMENT_TYPES or not document.legal_metadata:
+        return None
+    metadata = legal_metadata_v2(document)
+    instrument_meta = metadata.get("instrument") if isinstance(metadata.get("instrument"), dict) else {}
+    title = _legal_value(instrument_meta, "official_title", "title") or document.title or document.original_filename
+    row = db.query(LegalInstrument).filter_by(document_id=document.id).first()
+    if row is None:
+        row = LegalInstrument(document_id=document.id, knowledge_base_id=document.knowledge_base_id,
+                              status_source="resolver", review_status="unreviewed")
+        db.add(row)
+    if row.status_source != "manual":
+        base_title_key, version_label, enacted_year = normalize_family_key(title)
+        legal_work_key = _legal_value(instrument_meta, "legal_work_key") or base_title_key
+        # Header parser canonicalizes the common Thai typo and amendment prefix.
+        legal_work_key = canonical_entity_name(legal_work_key)
+        family = _get_or_create_legal_family(db, document.knowledge_base_id, title, legal_work_key)
+        row.family_id = family.id
+        row.kind = classify_kind(title, _legal_value(instrument_meta, "kind") or None)
+        row.authority_level = AUTHORITY_LEVELS.get(row.kind, AUTHORITY_LEVELS["other"])
+        row.official_title = title[:500]
+        row.official_number = _legal_value(instrument_meta, "official_number") or None
+        row.issuer = _legal_value(instrument_meta.get("issuer"), "name", "organization") or None
+        row.jurisdiction = _legal_value(instrument_meta, "jurisdiction") or None
+        row.version_label = version_label
+        row.enacted_year = enacted_year
+        row.legal_work_key = legal_work_key
+        row.document_class = _legal_value(instrument_meta, "document_class") or None
+        row.version_date = parse_thai_date(instrument_meta.get("version_date")) or document.published_at
+        row.effective_from = parse_thai_date(instrument_meta.get("effective_date")) or parse_thai_date(instrument_meta.get("version_date")) or document.published_at
+        row.effective_to = parse_thai_date(instrument_meta.get("effective_to"))
+        # Extraction may provide an official source, but a curator's manual
+        # provenance must never be overwritten by a re-process.
+        if not row.source_uri:
+            row.source_uri = _legal_value(instrument_meta, "source_uri", "official_source_url", "source_url") or None
+        if not row.source_reference:
+            row.source_reference = _legal_value(instrument_meta, "source_reference", "gazette_reference", "ราชกิจจานุเบกษา") or None
+    db.flush()
+    return row
+
+
+def _sync_deterministic_change_events(db: Session, knowledge_base_id: str) -> int:
+    """Materialize explicit amendment/repeal clauses as verified registry edges.
+
+    The target is the latest consolidated expression at or before the amendment
+    date.  This prevents a 1977 amendment from being linked to the 2019 text.
+    """
+    instruments = db.query(LegalInstrument).filter_by(knowledge_base_id=knowledge_base_id).all()
+    docs = {doc.id: doc for doc in db.query(Document).filter(Document.id.in_([row.document_id for row in instruments])).all()}
+    by_id = {row.id: row for row in instruments}
+    changed = 0
+    for source in instruments:
+        if source.document_class != "amendment":
+            continue
+        source_doc = docs.get(source.document_id)
+        events = (legal_metadata_v2(source_doc).get("change_events", []) if source_doc else [])
+        if not events:
+            continue
+        candidates = [row for row in instruments if row.id != source.id and row.legal_work_key == source.legal_work_key and row.document_class in {"main", "consolidated"}]
+        source_date = source.version_date or source.effective_from
+        prior = [row for row in candidates if not source_date or not row.version_date or row.version_date <= source_date]
+        target = max(prior or candidates, key=lambda row: row.version_date or row.effective_from or datetime.min.date(), default=None)
+        if not target:
+            continue
+        for event in events:
+            action = str(event.get("action") or "replace").casefold()
+            relation_type = "REPEALS" if action == "repeal" else "AMENDS"
+            target_provision = str(event.get("target_provision") or event.get("provision_number") or "")[:120] or None
+            row = db.query(LegalInstrumentRelation).filter_by(
+                source_instrument_id=source.id, relation=relation_type,
+                target_instrument_id=target.id, target_provision=target_provision,
+            ).first()
+            if not row:
+                row = LegalInstrumentRelation(knowledge_base_id=knowledge_base_id,
+                    source_instrument_id=source.id, target_instrument_id=target.id,
+                    relation=relation_type, target_provision=target_provision,
+                    origin="legal_schema", review_status="verified")
+                db.add(row); changed += 1
+            row.evidence_quote = str(event.get("evidence_quote") or "")[:5000]
+            row.confidence, row.origin, row.review_status = 1.0, "legal_schema", "verified"
+    db.flush()
+    return changed
+
+
+def _sync_legal_instrument_relation(db: Session, document: Document, target_document: Document | None,
+                                    relationship: Relationship | None, relationship_type: str, reference: dict) -> None:
+    """Mirror one cross-document suggestion into the legal registry so the status
+    resolver and query-time resolver can reason about it without re-parsing text."""
+    if relationship_type not in LEGAL_INSTRUMENT_RELATION_TYPES:
+        return
+    source_instrument = db.query(LegalInstrument).filter_by(document_id=document.id).first()
+    if not source_instrument:
+        return
+    target_instrument = db.query(LegalInstrument).filter_by(document_id=target_document.id).first() if target_document else None
+    target_provision = _legal_value(reference, "target_provision") or None
+    row = db.query(LegalInstrumentRelation).filter_by(
+        source_instrument_id=source_instrument.id, relation=relationship_type,
+        target_instrument_id=target_instrument.id if target_instrument else None,
+        target_provision=target_provision,
+    ).first()
+    if row and row.origin == "manual":
+        return
+    if not row:
+        row = LegalInstrumentRelation(
+            knowledge_base_id=document.knowledge_base_id, source_instrument_id=source_instrument.id,
+            relation=relationship_type, origin="ai_suggestion", review_status="suggested",
+        )
+        db.add(row)
+    row.target_instrument_id = target_instrument.id if target_instrument else None
+    row.target_text = (_legal_value(reference, "target_title", "title", "instrument_title") or None or "")[:700] or None
+    row.target_provision = target_provision
+    row.evidence_quote = _legal_evidence(reference, relationship_type)[:5000]
+    row.confidence = _reference_confidence(reference)
+    row.relationship_id = relationship.id if relationship else None
+    if relationship and relationship.review_status in {"verified", "rejected"}:
+        row.review_status = relationship.review_status
+    db.flush()
+
+
+def sync_legal_instrument_relation_review(db: Session, relationship: Relationship) -> None:
+    """Propagate an admin's approve/reject decision to the registry and re-resolve status."""
+    rows = db.query(LegalInstrumentRelation).filter_by(relationship_id=relationship.id).all()
+    manual_rows = [row for row in rows if row.origin != "manual"]
+    for row in manual_rows:
+        row.review_status = relationship.review_status
+    db.flush()
+    for knowledge_base_id in {row.knowledge_base_id for row in manual_rows}:
+        resolve_instrument_statuses(db, knowledge_base_id)
+
+
 def _clear_legal_suggestions(db: Session, knowledge_base_id: str) -> None:
     rows = db.query(Relationship).filter_by(knowledge_base_id=knowledge_base_id, origin="ai_suggestion", is_legal=True, review_status="suggested").all()
     for relationship in rows:
@@ -440,15 +612,29 @@ def _target_instrument(db: Session, document: Document, reference: dict) -> Docu
         Document.knowledge_base_id == document.knowledge_base_id, Document.id != document.id,
         Document.document_type.in_(LEGAL_DOCUMENT_TYPES), Document.status == "completed", Document.deleted_at.is_(None),
     ).all()
+    matches = []
+    source_meta = legal_metadata_v2(document).get("instrument") or {}
+    source_work = canonical_entity_name(_legal_value(source_meta, "legal_work_key"))
+    source_date = parse_thai_date(source_meta.get("version_date")) or document.published_at
     for candidate in candidates:
         metadata = legal_metadata_v2(candidate)
         instrument = metadata.get("instrument") or {}
         candidate_title = _legal_value(instrument, "official_title") or candidate.title or candidate.original_filename
-        if title and (canonical_entity_name(title) in canonical_entity_name(candidate_title) or canonical_entity_name(candidate_title) in canonical_entity_name(title)):
-            return candidate
+        candidate_work = canonical_entity_name(_legal_value(instrument, "legal_work_key"))
+        if source_work and candidate_work and source_work != candidate_work:
+            continue
+        score = 0
         if number and number == str(instrument.get("official_number") or ""):
-            return candidate
-    return None
+            score += 100
+        if title and (canonical_entity_name(title) in canonical_entity_name(candidate_title) or canonical_entity_name(candidate_title) in canonical_entity_name(title)):
+            score += 50
+        if score:
+            candidate_date = parse_thai_date(instrument.get("version_date")) or candidate.published_at
+            # Prefer the latest expression not newer than the referring act.
+            if source_date and candidate_date and candidate_date > source_date:
+                score -= 20
+            matches.append((score, candidate_date or datetime.min.date(), candidate))
+    return max(matches, key=lambda item: (item[0], item[1]))[2] if matches else None
 
 
 def build_legal_cross_document_suggestions(db: Session, knowledge_base_id: str) -> int:
@@ -485,12 +671,13 @@ def build_legal_cross_document_suggestions(db: Session, knowledge_base_id: str) 
                 relationship_type = "REFERS_TO"
             target_document = _target_instrument(db, document, reference)
             target = legal_instrument_entity(db, target_document) if target_document else None
-            _, created = _upsert_legal_relationship(
+            relationship, created = _upsert_legal_relationship(
                 db, document, source=source, target=target, relationship_type=relationship_type,
                 excerpt=_legal_evidence(reference, relationship_type), origin="ai_suggestion", review_status="suggested",
-                confidence=float(reference.get("confidence") or 0.5), attributes={"reference": reference},
+                confidence=_reference_confidence(reference), attributes={"reference": reference},
             )
             count += int(created)
+            _sync_legal_instrument_relation(db, document, target_document, relationship, relationship_type, reference)
     db.flush()
     return count
 
@@ -505,7 +692,11 @@ def rebuild_legal_graph(db: Session, knowledge_base_id: str) -> dict[str, int]:
     for document in documents:
         result = sync_legal_document_graph(db, document, replace=True)
         totals["entities"] += result["entities"]; totals["relationships"] += result["relationships"]
+        upsert_legal_instrument(db, document)
+        link_provisions_to_chunks(db, document)
+    totals["deterministic_relations"] = _sync_deterministic_change_events(db, knowledge_base_id)
     totals["suggestions"] = build_legal_cross_document_suggestions(db, knowledge_base_id)
+    totals["status_changes"] = resolve_instrument_statuses(db, knowledge_base_id)["changed"]
     db.commit()
     return totals
 
@@ -570,8 +761,10 @@ def entity_graph(db: Session, entity: Entity, depth: int = 1) -> dict:
     }
 
 
-def analyze_impact(db: Session, subject: str, knowledge_base_ids: list[str], max_depth: int, include_indirect: bool) -> dict:
-    entity = resolve_entity(db, knowledge_base_ids, subject)
+def analyze_impact(db: Session, subject: str, knowledge_base_ids: list[str], max_depth: int, include_indirect: bool, entity_id: str | None = None) -> dict:
+    entity = db.get(Entity, entity_id) if entity_id else resolve_entity(db, knowledge_base_ids, subject)
+    if entity and knowledge_base_ids and entity.knowledge_base_id not in knowledge_base_ids:
+        entity = None
     if not entity:
         return {"status": "success", "subject": None, "direct_impacts": [], "indirect_impacts": [], "sources": [], "insufficient_evidence": True, "warnings": ["Entity was not found."]}
     graph = entity_graph(db, entity, max_depth if include_indirect else 1)
@@ -753,12 +946,55 @@ def split_text(text: str, chunk_size: int, overlap: int) -> list[tuple[int, int,
     return chunks
 
 
+_LEGAL_SECTION_PATTERN = re.compile(
+    r"^[ \t]*(มาตรา|ข้อ|หมวด|ส่วนที่|บทเฉพาะกาล|บทนิยาม)\s*([0-9๐-๙]+(?:/[0-9๐-๙]+)?)?\s*(ทวิ|ตรี|จัตวา|เบญจ)?",
+    re.MULTILINE,
+)
+_LEGAL_SECTION_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+
+
+def _legal_section_identity(raw_kind: str, number: str | None, suffix: str | None) -> tuple[str, str | None, str]:
+    if not number:
+        return raw_kind, None, raw_kind
+    normalized_number = number.translate(_LEGAL_SECTION_DIGITS) + (f" {suffix}" if suffix else "")
+    return raw_kind, normalized_number, f"{raw_kind} {normalized_number}"
+
+
+def split_legal_text(text: str, chunk_size: int, overlap: int) -> list[tuple[int, int, str, str | None, str | None, str | None]]:
+    """Split on มาตรา/ข้อ/หมวด headings so each chunk keeps its section identity.
+
+    A heading is only recognized at the start of a line, so a mid-sentence
+    cross-reference like "ให้เป็นไปตามมาตรา 15" never starts a new section. A
+    section body that still exceeds chunk_size falls back to split_text's
+    word-boundary sub-split, and every resulting piece inherits that section's
+    identity. Text before the first heading is tagged "preamble".
+    """
+    text = text or ""
+    matches = list(_LEGAL_SECTION_PATTERN.finditer(text))
+    spans: list[tuple[int, int, str, str | None, str | None]] = []
+    if not matches:
+        spans.append((0, len(text), "preamble", None, None))
+    else:
+        if matches[0].start() > 0:
+            spans.append((0, matches[0].start(), "preamble", None, None))
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            kind, number, label = _legal_section_identity(match.group(1), match.group(2), match.group(3))
+            spans.append((match.start(), end, kind, number, label))
+    pieces: list[tuple[int, int, str, str | None, str | None, str | None]] = []
+    for span_start, span_end, section_kind, section_number, section_label in spans:
+        for offset, sub_end, content in split_text(text[span_start:span_end], chunk_size, overlap):
+            pieces.append((span_start + offset, span_start + sub_end, content, section_kind, section_number, section_label))
+    return pieces
+
+
 def replace_document_chunks(db: Session, document: Document, text: str) -> None:
     settings = get_settings()
     db.query(DocumentChunk).filter_by(document_id=document.id).delete(synchronize_session=False)
-    for index, (char_start, char_end, content) in enumerate(
-        split_text(text, settings.default_chunk_size, settings.default_chunk_overlap)
-    ):
+    splitter = split_legal_text if document.document_type in LEGAL_DOCUMENT_TYPES else split_text
+    for index, piece in enumerate(splitter(text, settings.default_chunk_size, settings.default_chunk_overlap)):
+        char_start, char_end, content = piece[0], piece[1], piece[2]
+        section_kind, section_number, section_label = piece[3:] if len(piece) > 3 else (None, None, None)
         db.add(DocumentChunk(
             document_id=document.id,
             knowledge_base_id=document.knowledge_base_id,
@@ -768,8 +1004,40 @@ def replace_document_chunks(db: Session, document: Document, text: str) -> None:
             char_start=char_start,
             char_end=char_end,
             token_count=len(re.findall(r"\S+", content)),
+            section_kind=section_kind,
+            section_number=section_number,
+            section_label=section_label,
         ))
     db.flush()
+
+
+def link_provisions_to_chunks(db: Session, document: Document) -> int:
+    """Attach matching chunk IDs to each Provision entity so the query-time
+    resolver can fetch a provision's exact chunk instead of relying on similarity."""
+    if document.document_type not in LEGAL_DOCUMENT_TYPES:
+        return 0
+    provisions = db.query(Entity).filter(
+        Entity.knowledge_base_id == document.knowledge_base_id, Entity.entity_type == "Provision",
+        Entity.identity_key.like(f"legal:provision:{document.id}:%"), Entity.deleted_at.is_(None),
+    ).all()
+    if not provisions:
+        return 0
+    chunks = db.query(DocumentChunk).filter(
+        DocumentChunk.document_id == document.id, DocumentChunk.section_number.is_not(None),
+    ).all()
+    by_number: dict[str, list[str]] = {}
+    for chunk in chunks:
+        by_number.setdefault(re.sub(r"\s+", "", chunk.section_number).casefold(), []).append(chunk.id)
+    linked = 0
+    for provision in provisions:
+        number = (provision.attributes or {}).get("provision_number")
+        chunk_ids = by_number.get(re.sub(r"\s+", "", str(number)).casefold()) if number else None
+        if not chunk_ids:
+            continue
+        provision.attributes = {**(provision.attributes or {}), "chunk_ids": chunk_ids}
+        linked += 1
+    db.flush()
+    return linked
 
 
 def embed_document_chunks(db: Session, document_id: str) -> None:
@@ -853,13 +1121,36 @@ def process_next_job(db: Session) -> bool:
         if legal_only:
             job.current_stage, job.progress_percent = "legal_extraction", 60
             db.commit()
-            doc.legal_metadata = OpenRouterClient().extract_legal_metadata(doc.title or doc.original_filename, text)
+            deterministic = parse_legal_corpus_metadata(text, doc.title or doc.original_filename)
+            try:
+                extracted = OpenRouterClient().extract_legal_metadata(doc.title or doc.original_filename, text)
+            except Exception:
+                # Header/change clauses are sufficient to preserve a traceable
+                # legal instrument even when the optional LLM is unavailable.
+                extracted = {}
+            if isinstance(extracted, dict):
+                extracted["schema_version"] = 2
+                extracted["instrument"] = {**(extracted.get("instrument") or {}), **deterministic["instrument"]}
+                extracted["change_events"] = deterministic.get("change_events", []) or extracted.get("change_events", [])
+                extracted["amendments"] = deterministic.get("amendments", []) or extracted.get("amendments", [])
+                extracted["provenance"] = {**(extracted.get("provenance") or {}), **deterministic.get("provenance", {})}
+                doc.legal_metadata = extracted
+            else:
+                doc.legal_metadata = deterministic
             sync_legal_document_graph(db, doc)
+            upsert_legal_instrument(db, doc)
+            link_provisions_to_chunks(db, doc)
+            resolve_instrument_statuses(db, doc.knowledge_base_id)
             job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
             db.commit()
             return True
         job.current_stage, job.progress_percent = "chunking", 45
-        if reindex_only and db.query(DocumentChunk.id).filter_by(document_id=doc.id).first():
+        existing_chunks = db.query(DocumentChunk.id, DocumentChunk.section_kind).filter_by(document_id=doc.id).all() if reindex_only else []
+        # A forced reindex re-chunks a legal document that predates section-aware
+        # splitting (no chunk has a section identity yet); every other reindex
+        # keeps its existing chunks and only refreshes embeddings.
+        needs_legal_rechunk = doc.document_type in LEGAL_DOCUMENT_TYPES and existing_chunks and not any(section_kind for _, section_kind in existing_chunks)
+        if reindex_only and existing_chunks and not needs_legal_rechunk:
             pass
         else:
             replace_document_chunks(db, doc, text)
@@ -959,18 +1250,22 @@ def plan_intent(query: str) -> str:
     return "hybrid_fallback"
 
 
-def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources: int, query_filters=None) -> PlannerDecision:
+def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources: int, query_filters=None,
+                         trace: list[dict] | None = None) -> PlannerDecision:
     """Build a policy-constrained plan; invoke the LLM only when rules are ambiguous."""
     rows = db.query(KnowledgeBase).filter(KnowledgeBase.id.in_(kb_ids)).all() if kb_ids else []
     policy = intersect_policies([policy_from_config(row.retrieval_config) for row in rows])
     decision = rule_plan(query, policy, max_sources)
     requested_from = getattr(query_filters, "published_from", None) if query_filters else None
     requested_to = getattr(query_filters, "published_to", None) if query_filters else None
-    if requested_from or requested_to:
-        decision.plan = decision.plan.model_copy(update={
-            "published_from": requested_from or decision.plan.published_from,
-            "published_to": requested_to or decision.plan.published_to,
-        })
+    as_of_date = getattr(query_filters, "as_of_date", None) if query_filters else None
+    include_historical = bool(getattr(query_filters, "include_historical", False)) if query_filters else False
+    decision.plan = decision.plan.model_copy(update={
+        "published_from": requested_from or decision.plan.published_from,
+        "published_to": requested_to or decision.plan.published_to,
+        "as_of_date": as_of_date or decision.plan.as_of_date,
+        "include_historical": include_historical or decision.plan.include_historical,
+    })
     if decision.ambiguous and policy.planner_llm_fallback:
         try:
             available = [channel.value for channel, enabled in (
@@ -983,6 +1278,13 @@ def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources
             decision = apply_llm_plan(decision, value, policy, max_sources)
         except (RuntimeError, ValueError, TypeError) as exc:
             decision.plan = decision.plan.model_copy(update={"planner_source": "rules_fallback", "fallback_reason": str(exc)})
+    started_at = time.monotonic()
+    legal_context = resolve_legal_context(db, query, kb_ids, decision.plan, policy)
+    if legal_context is not None:
+        decision.plan = decision.plan.model_copy(update={"legal_context": legal_context})
+        _append_retrieval_trace(trace, channel="legal_resolver", system="PostgreSQL legal registry", status="used",
+                                started_at=started_at, result_count=len(legal_context.current_version_ids),
+                                detail=f"matched={len(legal_context.matched_instrument_ids)} excluded={len(legal_context.excluded_document_ids)}")
     metrics.observe_planner(decision.plan.intent, decision.plan.planner_source, decision.plan.fallback_reason is not None)
     return decision
 
@@ -1004,8 +1306,20 @@ def _append_retrieval_trace(trace: list[dict] | None, *, channel: str, system: s
 
 
 def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
-                    trace: list[dict] | None = None, plan: RetrievalPlan | None = None) -> RetrievalEvidence:
+                    trace: list[dict] | None = None, plan: RetrievalPlan | None = None,
+                    warnings: list[dict] | None = None) -> RetrievalEvidence:
     plan = plan or rule_plan(query, policy_from_config(None), limit).plan
+    if plan.legal_context and plan.legal_context.ambiguous_context and not plan.include_historical:
+        detail = plan.legal_context.ambiguity_reason or "The legal instrument or provision context is ambiguous."
+        if warnings is not None:
+            warnings.append({
+                "code": "AMBIGUOUS_LEGAL_CONTEXT",
+                "detail": detail,
+                "candidate_instrument_ids": plan.legal_context.candidate_instrument_ids,
+            })
+        _append_retrieval_trace(trace, channel="legal_resolver", system="PostgreSQL legal registry", status="ambiguous",
+                                started_at=time.monotonic(), result_count=0, detail=detail)
+        return RetrievalEvidence([], [], [], [])
     channels: list[RetrievalEvidence] = []
     db_channels = {
         RetrievalChannel.EXACT: lambda session: query_exact_documents(session, plan, kb_ids, limit, trace),
@@ -1042,7 +1356,80 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
                 _append_retrieval_trace(trace, channel=channel.value, system="executor", status="unavailable",
                                         started_at=time.monotonic(), detail=str(exc))
     channels = [channel_results[channel] for channel in (RetrievalChannel.EXACT, RetrievalChannel.VECTOR, RetrievalChannel.FULLTEXT, RetrievalChannel.GRAPH, RetrievalChannel.LIGHTRAG) if channel in channel_results]
-    evidence = rerank_evidence(query, fuse_evidence(*channels, limit=limit), limit, trace, plan.rerank_enabled)
+
+    if plan.legal_context and plan.legal_context.excluded_document_ids and not plan.include_historical:
+        excluded = set(plan.legal_context.excluded_document_ids)
+        removed, rebuilt = 0, []
+        for channel_evidence in channels:
+            kept = [source for source in channel_evidence.sources if source.get("document_id") not in excluded]
+            removed += len(channel_evidence.sources) - len(kept)
+            rebuilt.append(RetrievalEvidence(kept, channel_evidence.entities, channel_evidence.relationships, channel_evidence.paths, channel_evidence.answer))
+        channels = rebuilt
+        _append_retrieval_trace(trace, channel="legal_validity_filter", system="PostgreSQL legal registry", status="used",
+                                started_at=time.monotonic(), result_count=removed,
+                                detail=f"removed {removed} superseded/repealed source(s)")
+
+    if plan.legal_context and plan.legal_context.preferred_document_ids and not plan.include_historical:
+        preferred = set(plan.legal_context.preferred_document_ids)
+        removed, rebuilt = 0, []
+        for channel_evidence in channels:
+            kept = [source for source in channel_evidence.sources if source.get("document_id") in preferred]
+            removed += len(channel_evidence.sources) - len(kept)
+            rebuilt.append(RetrievalEvidence(kept, channel_evidence.entities, channel_evidence.relationships,
+                                              channel_evidence.paths, channel_evidence.answer))
+        channels = rebuilt
+        _append_retrieval_trace(trace, channel="legal_context_filter", system="PostgreSQL legal registry", status="used",
+                                started_at=time.monotonic(), result_count=removed,
+                                detail="preferred current consolidated instrument")
+
+    if plan.intent == "legal_provision" and plan.legal_context and plan.legal_context.provision_refs:
+        refs = parse_provision_refs(" ".join(plan.legal_context.provision_refs))
+        removed, rebuilt = 0, []
+        for channel_evidence in channels:
+            kept = [
+                source for source in channel_evidence.sources
+                if any(
+                    provision_number_matches(ref["number"], source.get("section_number"))
+                    and (not source.get("section_kind") or source.get("section_kind") == ref["kind"])
+                    for ref in refs
+                )
+            ]
+            removed += len(channel_evidence.sources) - len(kept)
+            rebuilt.append(RetrievalEvidence(kept, channel_evidence.entities, channel_evidence.relationships,
+                                              channel_evidence.paths, channel_evidence.answer))
+        channels = rebuilt
+        _append_retrieval_trace(trace, channel="provision_filter", system="PostgreSQL legal registry", status="used",
+                                started_at=time.monotonic(), result_count=removed,
+                                detail="kept only requested provision evidence")
+
+    channels = _prefer_consolidated_body_sources(db, channels, plan, trace)
+
+    document_ids = {source["document_id"] for channel_evidence in channels for source in channel_evidence.sources}
+    instruments_by_document = _legal_instruments_by_document(db, document_ids)
+    legal_meta = {doc_id: {"authority_level": row.authority_level, "status": row.status, "effective_from": row.effective_from}
+                 for doc_id, row in instruments_by_document.items()}
+    fused = fuse_evidence(*channels, limit=limit, legal_meta=legal_meta, legal_context=plan.legal_context,
+                          authority_weight=plan.authority_weight, status_weight=plan.status_weight, recency_weight=plan.recency_weight)
+    evidence = rerank_evidence(query, fused, limit, trace, plan.rerank_enabled)
+    if evidence.sources is not fused.sources:
+        # The cross-encoder reranker has no legal awareness and can drop the
+        # current-version guarantee fuse_evidence already applied; restore it
+        # from the pre-rerank ranking, still capped at `limit`.
+        guaranteed_sources = _apply_current_version_guarantee(evidence.sources, plan.legal_context, limit, fused.sources)
+        if guaranteed_sources != evidence.sources:
+            sources = [{**item, "citation_id": f"S{index}"} for index, item in enumerate(guaranteed_sources, 1)]
+            evidence = RetrievalEvidence(sources, evidence.entities, evidence.relationships, evidence.paths, evidence.answer)
+
+    if instruments_by_document and evidence.sources:
+        conflict_warnings = validate_legal_evidence(db, evidence, plan, instruments_by_document)
+        if conflict_warnings:
+            if warnings is not None:
+                warnings.extend(conflict_warnings)
+            _append_retrieval_trace(trace, channel="conflict_check", system="Legal registry", status="used",
+                                    started_at=time.monotonic(), result_count=len(conflict_warnings),
+                                    detail="version/provision conflicts detected")
+        _decorate_sources_with_legal_metadata(evidence.sources, instruments_by_document)
+
     if evidence.sources:
         started_at = time.monotonic()
         try:
@@ -1053,6 +1440,7 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
             evidence.answer = None
             _append_retrieval_trace(trace, channel="answer_generation", system="OpenRouter LLM", status="unavailable",
                                     started_at=started_at, detail=str(exc))
+        _validate_answer_citations(evidence, warnings)
     return evidence
 
 
@@ -1089,6 +1477,98 @@ def _apply_published_filter(rows, plan: RetrievalPlan | None):
     return rows
 
 
+def _apply_legal_filter(rows, plan: RetrievalPlan | None):
+    """Drop rows for documents the legal resolver marked repealed/superseded at
+    the resolved as-of date; a no-op unless the query actually touched a legal KB."""
+    if not plan or plan.include_historical or not plan.legal_context or not plan.legal_context.excluded_document_ids:
+        return rows
+    return rows.filter(Document.id.notin_(plan.legal_context.excluded_document_ids))
+
+
+def _apply_provision_filter(rows, plan: RetrievalPlan | None):
+    """Restrict legal provision retrieval to the requested article/section.
+
+    A bare number such as 6 appears in every amendment file.  Once the legal
+    resolver selects an instrument, returning unrelated sections from that
+    instrument is still unsafe because the answer model may cite them.
+    """
+    if not plan or plan.intent != "legal_provision" or not plan.legal_context or not plan.legal_context.provision_refs:
+        return rows
+    refs = parse_provision_refs(" ".join(plan.legal_context.provision_refs))
+    if not refs:
+        return rows
+    predicates = [
+        (DocumentChunk.section_kind == ref["kind"]) & (DocumentChunk.section_number == ref["number"])
+        for ref in refs
+    ]
+    return rows.filter(or_(*predicates))
+
+
+def _prefer_consolidated_body_sources(db: Session, channels: list[RetrievalEvidence], plan: RetrievalPlan,
+                                      trace: list[dict] | None = None) -> list[RetrievalEvidence]:
+    """Select the code-body occurrence when a consolidated file also contains
+    the enabling Act and amendment footnotes with the same article number.
+
+    The official corpus intentionally preserves those appendices for
+    provenance.  They must not compete with the first occurrence in the
+    consolidated code body for a normal ``ประมวลกฎหมาย ... มาตรา`` query.
+    """
+    if not plan.legal_context or not plan.legal_context.preferred_document_ids or not plan.legal_context.provision_refs:
+        return channels
+    refs = parse_provision_refs(" ".join(plan.legal_context.provision_refs))
+    preferred = set(plan.legal_context.preferred_document_ids)
+    body_starts: dict[str, int] = {}
+    for document_id in preferred:
+        value = db.query(func.min(DocumentChunk.chunk_index)).filter(
+            DocumentChunk.document_id == document_id, DocumentChunk.section_kind == "หมวด"
+        ).scalar()
+        if value is not None:
+            body_starts[document_id] = int(value)
+    if not body_starts:
+        return channels
+
+    # Pick one canonical body chunk per requested provision.  We deliberately
+    # compare chunk indexes globally across channels because vector, FTS and
+    # LightRAG may return the same provision from different routes.
+    chosen_indices: dict[tuple[str, str], int] = {}
+    for channel in channels:
+        for source in channel.sources:
+            document_id = source.get("document_id")
+            chunk_index = source.get("chunk_index")
+            if document_id not in body_starts or chunk_index is None or int(chunk_index) < body_starts[document_id]:
+                continue
+            for ref in refs:
+                if provision_number_matches(ref["number"], source.get("section_number")) and (
+                    not source.get("section_kind") or source.get("section_kind") == ref["kind"]
+                ):
+                    key = (document_id, ref["number"])
+                    idx = int(chunk_index)
+                    chosen_indices[key] = min(chosen_indices.get(key, idx), idx)
+
+    if not chosen_indices:
+        return channels
+    rebuilt, removed = [], 0
+    # Keep the earliest matching body chunk per requested number.  This also
+    # removes the same-number enabling-Act and amendment appendix chunks.
+    for channel in channels:
+        kept = []
+        for source in channel.sources:
+            if any(
+                source.get("document_id") == document_id
+                and provision_number_matches(number, source.get("section_number"))
+                and source.get("chunk_index") == chosen_indices.get((document_id, number))
+                for document_id, number in chosen_indices
+            ):
+                kept.append(source)
+            elif source.get("document_id") in preferred:
+                removed += 1
+        rebuilt.append(RetrievalEvidence(kept, channel.entities, channel.relationships, channel.paths, channel.answer))
+    _append_retrieval_trace(trace, channel="legal_body_selector", system="PostgreSQL legal registry", status="used",
+                            started_at=time.monotonic(), result_count=removed,
+                            detail="selected earliest occurrence in consolidated code body")
+    return rebuilt
+
+
 def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: int,
                            trace: list[dict] | None = None, plan: RetrievalPlan | None = None) -> RetrievalEvidence:
     started_at = time.monotonic()
@@ -1114,9 +1594,12 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
     if kb_ids:
         rows = rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
     rows = _apply_published_filter(rows, plan)
+    rows = _apply_legal_filter(rows, plan)
+    rows = _apply_provision_filter(rows, plan)
     records = rows.order_by(distance).limit(limit).all()
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
-                "chunk_id": chunk.id, "excerpt": chunk.content[:500], "relevance": max(0.0, 1.0 - float(item_distance))}
+                "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": max(0.0, 1.0 - float(item_distance)),
+                "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}
                for i, (chunk, document, item_distance) in enumerate(records, 1)]
     _append_retrieval_trace(trace, channel="semantic_vector", system="OpenRouter embeddings → PostgreSQL + pgvector",
                             status="used", started_at=started_at, result_count=len(sources), detail="cosine similarity")
@@ -1133,6 +1616,8 @@ def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int
     if kb_ids:
         base_rows = base_rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
     base_rows = _apply_published_filter(base_rows, plan)
+    base_rows = _apply_legal_filter(base_rows, plan)
+    base_rows = _apply_provision_filter(base_rows, plan)
     rows = base_rows
     if words:
         if db.get_bind().dialect.name == "postgresql":
@@ -1147,7 +1632,8 @@ def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int
         # choice, then use an explicit phrase/token fallback in the same scope.
         records = base_rows.filter(or_(*[DocumentChunk.content.ilike(f"%{word}%") for word in words[:8]])).limit(limit).all()
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
-                "chunk_id": chunk.id, "excerpt": chunk.content[:500], "relevance": 1.0 / i}
+                "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": 1.0 / i,
+                "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}
                for i, (chunk, document) in enumerate(records, 1)]
     system = "PostgreSQL full-text search" if db.get_bind().dialect.name == "postgresql" else "SQL text fallback"
     _append_retrieval_trace(trace, channel="full_text", system=system, status="used",
@@ -1169,13 +1655,16 @@ def query_exact_documents(db: Session, plan: RetrievalPlan, kb_ids: list[str], l
     if kb_ids:
         rows = rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
     rows = _apply_published_filter(rows, plan)
+    rows = _apply_legal_filter(rows, plan)
+    rows = _apply_provision_filter(rows, plan)
     predicates = []
     for identifier in identifiers:
         pattern = f"%{identifier}%"
         predicates.extend((Document.title.ilike(pattern), Document.original_filename.ilike(pattern), DocumentChunk.content.ilike(pattern)))
     records = rows.filter(or_(*predicates)).order_by(DocumentChunk.chunk_index).limit(limit).all()
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
-                "chunk_id": chunk.id, "excerpt": chunk.content[:500], "relevance": 1.0 / i}
+                "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": 1.0 / i,
+                "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}
                for i, (chunk, document) in enumerate(records, 1)]
     _append_retrieval_trace(trace, channel="exact_document", system="PostgreSQL document metadata", status="used",
                             started_at=started_at, result_count=len(sources), detail="title, filename, and document ID lookup")
@@ -1273,8 +1762,48 @@ def query_database_graph(db: Session, query: str, kb_ids: list[str], limit: int,
     return RetrievalEvidence(sources, graph["nodes"], graph["edges"], graph["edges"])
 
 
-def fuse_evidence(*channels: RetrievalEvidence, limit: int) -> RetrievalEvidence:
-    """Use reciprocal-rank fusion across semantic, FTS, and graph channels."""
+_LEGAL_STATUS_FACTORS = {
+    "in_force": 1.0, "amended": 0.85, "not_yet_effective": 0.3, "unknown": 0.5, "superseded": 0.1, "repealed": 0.1,
+}
+
+
+def _legal_instruments_by_document(db: Session, document_ids: set[str]) -> dict[str, LegalInstrument]:
+    if not document_ids:
+        return {}
+    rows = db.query(LegalInstrument).filter(LegalInstrument.document_id.in_(document_ids)).all()
+    return {row.document_id: row for row in rows}
+
+
+def _apply_current_version_guarantee(kept_sources: list[dict], legal_context: LegalContext | None, limit: int,
+                                     pool: list[dict]) -> list[dict]:
+    """`kept_sources` is already ranked and capped at `limit`. If a document the
+    resolver marked as a current legal version is missing from it, backfill the
+    first matching source found in `pool` (a superset, e.g. the pre-rerank
+    ranking) and trim back down to `limit` -- the result never exceeds `limit`
+    even when several documents need backfilling. A no-op without legal_context."""
+    if not legal_context or not legal_context.current_version_ids:
+        return kept_sources
+    present = {source["document_id"] for source in kept_sources}
+    missing = [doc_id for doc_id in legal_context.current_version_ids if doc_id not in present]
+    if not missing:
+        return kept_sources
+    missing_set, seen, backfill = set(missing), set(), []
+    for source in pool:
+        document_id = source["document_id"]
+        if document_id in missing_set and document_id not in seen:
+            seen.add(document_id)
+            backfill.append(source)
+    backfill = backfill[:limit]
+    return kept_sources[:max(0, limit - len(backfill))] + backfill
+
+
+def fuse_evidence(*channels: RetrievalEvidence, limit: int, legal_meta: dict[str, dict] | None = None,
+                  legal_context: LegalContext | None = None, authority_weight: float = 0.0,
+                  status_weight: float = 0.0, recency_weight: float = 0.0) -> RetrievalEvidence:
+    """Use reciprocal-rank fusion across semantic, FTS, and graph channels, then
+    apply an authority/status/recency boost for any document with a legal
+    registry entry. A document absent from legal_meta gets boost 0, so a
+    Knowledge Base with no legal instruments scores exactly as before."""
     candidates: dict[str, dict] = {}
     for channel in channels:
         for rank, source in enumerate(channel.sources, 1):
@@ -1287,8 +1816,33 @@ def fuse_evidence(*channels: RetrievalEvidence, limit: int) -> RetrievalEvidence
             candidate["score"] += score
             if source.get("relevance", 0.0) > candidate["source"].get("relevance", 0.0):
                 candidate["source"] = source
-    ordered = sorted(candidates.values(), key=lambda item: item["score"], reverse=True)[:limit]
-    sources = [{**item["source"], "citation_id": f"S{index}", "relevance": round(item["score"], 6)} for index, item in enumerate(ordered, 1)]
+
+    legal_meta = legal_meta or {}
+    dated_documents = sorted(
+        (doc_id for doc_id, meta in legal_meta.items() if meta.get("effective_from")),
+        key=lambda doc_id: legal_meta[doc_id]["effective_from"], reverse=True,
+    )
+    recency_rank = {doc_id: 1.0 - (index / max(len(dated_documents) - 1, 1)) for index, doc_id in enumerate(dated_documents)}
+    for candidate in candidates.values():
+        meta = legal_meta.get(candidate["source"]["document_id"])
+        if not meta:
+            continue
+        boost = (
+            authority_weight * (meta["authority_level"] / 100)
+            + status_weight * _LEGAL_STATUS_FACTORS.get(meta["status"], 0.5)
+            + recency_weight * recency_rank.get(candidate["source"]["document_id"], 0.5)
+        )
+        candidate["score"] *= (1 + boost)
+
+    ranked = sorted(candidates.values(), key=lambda item: item["score"], reverse=True)
+    ranked_sources = [{**item["source"], "relevance": round(item["score"], 6)} for item in ranked]
+
+    # Guaranteed representation: a "current version" document must appear even
+    # if raw similarity pushed it out of the top-`limit`, so an amended act
+    # never gets silently displaced by an unrelated FAQ hit. The result never
+    # exceeds `limit`, even when several documents need backfilling.
+    ordered_sources = _apply_current_version_guarantee(ranked_sources[:limit], legal_context, limit, ranked_sources)
+    sources = [{**item, "citation_id": f"S{index}"} for index, item in enumerate(ordered_sources, 1)]
     answer = next((channel.answer for channel in channels if channel.answer), None)
     entities = [item for channel in channels for item in channel.entities]
     relationships = [item for channel in channels for item in channel.relationships]
@@ -1326,7 +1880,186 @@ def rerank_evidence(query: str, evidence: RetrievalEvidence, limit: int,
     return RetrievalEvidence(sources, evidence.entities, evidence.relationships, evidence.paths, evidence.answer)
 
 
-def compose_cited_answer(evidence: RetrievalEvidence) -> str:
+_LEGAL_STATUS_LABELS_TH = {
+    "in_force": "บังคับใช้", "amended": "แก้ไขเพิ่มเติมแล้ว", "superseded": "ถูกแทนที่",
+    "repealed": "ถูกยกเลิก", "not_yet_effective": "ยังไม่มีผลบังคับใช้", "unknown": "ไม่ทราบสถานะ",
+}
+
+
+def validate_legal_evidence(db: Session, evidence: RetrievalEvidence, plan: RetrievalPlan | None,
+                            instruments_by_document: dict[str, LegalInstrument]) -> list[dict]:
+    """Detect same-provision version conflicts and provision-level overrides in
+    the fused evidence before the LLM sees it; mutates evidence.sources in place."""
+    if not evidence.sources or not plan:
+        return []
+    warnings: list[dict] = []
+
+    instrument_ids = [row.id for row in instruments_by_document.values()]
+    relations = db.query(LegalInstrumentRelation).filter(
+        LegalInstrumentRelation.target_instrument_id.in_(instrument_ids), LegalInstrumentRelation.review_status == "verified",
+        LegalInstrumentRelation.target_provision.is_not(None), LegalInstrumentRelation.relation.in_(("REPEALS", "SUPERSEDES", "AMENDS")),
+    ).all() if instrument_ids else []
+    relations_by_target: dict[str, list[LegalInstrumentRelation]] = {}
+    for relation in relations:
+        relations_by_target.setdefault(relation.target_instrument_id, []).append(relation)
+
+    def overriding_relation(instrument: LegalInstrument, section_number: str) -> LegalInstrumentRelation | None:
+        return next((relation for relation in relations_by_target.get(instrument.id, [])
+                    if provision_number_matches(relation.target_provision, section_number)), None)
+
+    # 1. Same family + same section kind + same provision number, appearing in
+    # MORE THAN ONE DOCUMENT: a verified provision-level edge is the strongest
+    # signal of which one is current; fall back to legal_context, then to
+    # whichever source ranked first. section_kind is part of the key because a
+    # bare number collides across heading kinds (มาตรา 2 and หมวด 2 are not the
+    # same provision); requiring >1 document_id avoids treating a long
+    # provision's own sub-split chunks (same document) as a version conflict.
+    groups: dict[tuple, list[dict]] = {}
+    for source in evidence.sources:
+        instrument = instruments_by_document.get(source["document_id"])
+        section_number = source.get("section_number")
+        if not instrument or not instrument.family_id or not section_number:
+            continue
+        groups.setdefault((instrument.family_id, source.get("section_kind"), section_number), []).append(source)
+    current_ids = set(plan.legal_context.current_version_ids) if plan.legal_context else set()
+    to_remove: set[int] = set()
+    for (_, _, section_number), group in groups.items():
+        group_document_ids = {source["document_id"] for source in group}
+        if len(group_document_ids) < 2:
+            continue
+        overridden_ids = {id(source) for source in group
+                          if overriding_relation(instruments_by_document[source["document_id"]], section_number)}
+        current_in_group = group_document_ids & current_ids
+        if overridden_ids and len(overridden_ids) < len(group):
+            keep_candidates = [source for source in group if id(source) not in overridden_ids]
+        elif current_in_group and current_in_group != group_document_ids:
+            # A strict subset is current; a full or empty overlap is ambiguous.
+            keep_candidates = [source for source in group if source["document_id"] in current_in_group]
+        elif plan.legal_context is not None:
+            # The resolver evaluated this Knowledge Base and could not
+            # disambiguate without a reviewed relationship; trust that
+            # ambiguity rather than guessing which version to drop.
+            continue
+        else:
+            keep_candidates = group
+        keep = keep_candidates[0]
+        for source in group:
+            if source is keep:
+                continue
+            if not plan.include_historical:
+                to_remove.add(id(source))
+            warnings.append({
+                "code": "SUPERSEDED_VERSION_REMOVED" if not plan.include_historical else "SUPERSEDED_VERSION_PRESENT",
+                "detail": f"{source.get('title')} {section_number} is superseded by the current version",
+            })
+    if to_remove:
+        evidence.sources[:] = [source for source in evidence.sources if id(source) not in to_remove]
+
+    # 2. Provision-level repeal/supersede/amend that still targets a chunk left
+    # in evidence (e.g. the whole instrument otherwise remains in force).
+    for source in evidence.sources:
+        instrument = instruments_by_document.get(source["document_id"])
+        section_number = source.get("section_number")
+        if not instrument or not section_number:
+            continue
+        relation = overriding_relation(instrument, section_number)
+        if relation and relation.relation in {"REPEALS", "SUPERSEDES"}:
+            warnings.append({
+                "code": "PROVISION_REPEALED",
+                "detail": f"{instrument.official_title or source.get('title')} {section_number} was {relation.relation.lower()}; verify against the amending instrument",
+            })
+        elif relation and relation.relation == "AMENDS":
+            warnings.append({
+                "code": "PROVISION_AMENDED",
+                "detail": f"{instrument.official_title or source.get('title')} {section_number} was amended; verify against the amending instrument",
+            })
+
+    # 3. Unverified validity: source document has no resolvable status.
+    for source in evidence.sources:
+        instrument = instruments_by_document.get(source["document_id"])
+        if instrument and instrument.status == "unknown":
+            warnings.append({
+                "code": "UNVERIFIED_VALIDITY",
+                "detail": f"{instrument.official_title or source.get('title')} has no confirmed effective date",
+            })
+    return warnings
+
+
+def _decorate_sources_with_legal_metadata(sources: list[dict], instruments_by_document: dict[str, LegalInstrument]) -> None:
+    """Attach version/status metadata to each source so citations and the LLM
+    prompt can tell an in-force provision from a repealed or amended one."""
+    for source in sources:
+        instrument = instruments_by_document.get(source["document_id"])
+        if not instrument:
+            continue
+        source["document_status"] = instrument.status
+        source["authority_level"] = instrument.authority_level
+        source["kind"] = instrument.kind
+        source["version_label"] = instrument.version_label
+        source["effective_from"] = instrument.effective_from.isoformat() if instrument.effective_from else None
+        source["effective_to"] = instrument.effective_to.isoformat() if instrument.effective_to else None
+        source["version_date"] = instrument.version_date.isoformat() if instrument.version_date else None
+        source["legal_work_key"] = instrument.legal_work_key
+        source["document_class"] = instrument.document_class
+        source["source_uri"] = instrument.source_uri
+        source["source_reference"] = instrument.source_reference
+        source["provenance"] = {"origin": "legal_registry", "review_status": instrument.review_status,
+                                 "document_id": instrument.document_id, "source_uri": instrument.source_uri,
+                                 "source_reference": instrument.source_reference}
+        parts = [instrument.official_title or source.get("title"),
+                f"สถานะ: {_LEGAL_STATUS_LABELS_TH.get(instrument.status, instrument.status)}"]
+        if source.get("section_label"):
+            parts.append(source["section_label"])
+        if instrument.effective_from:
+            parts.append(f"มีผล: {instrument.effective_from.isoformat()}")
+        source["legal_label"] = " | ".join(str(part) for part in parts if part)
+
+
+_CITATION_RE = re.compile(r"\[(S\d+)\]")
+
+
+def _validate_answer_citations(evidence: RetrievalEvidence, warnings: list[dict] | None = None) -> None:
+    """Keep only evidence IDs actually cited by the generated answer.
+
+    Retrieval returns a candidate pool, while the answer is the user-visible
+    claim set.  Persisting all candidates as claim citations made unrelated
+    chunks look like proof.  A missing/unknown citation is fail-closed.
+    """
+    answer = (evidence.answer or "").strip()
+    if not answer:
+        return
+    cited_ids = set(_CITATION_RE.findall(answer))
+    available = {str(source.get("citation_id")): source for source in evidence.sources}
+    valid_ids = cited_ids & available.keys()
+    unknown_ids = sorted(cited_ids - available.keys())
+    if not valid_ids:
+        if warnings is not None:
+            warnings.append({
+                "code": "ANSWER_CITATIONS_MISSING",
+                "detail": "The generated answer did not cite a valid supplied evidence ID.",
+                "unknown_citation_ids": unknown_ids,
+            })
+        evidence.answer = None
+        evidence.sources = []
+        return
+    if unknown_ids:
+        if warnings is not None:
+            warnings.append({
+                "code": "ANSWER_CITATION_ID_INVALID",
+                "detail": "The generated answer referenced an evidence ID that was not supplied.",
+                "unknown_citation_ids": unknown_ids,
+            })
+        evidence.answer = None
+        evidence.sources = []
+        return
+    evidence.sources = [available[citation_id] for citation_id in sorted(valid_ids, key=lambda value: int(value[1:]))]
+
+
+def compose_cited_answer(evidence: RetrievalEvidence, warnings: list[dict] | None = None) -> str:
+    if warnings and any(item.get("code") == "AMBIGUOUS_LEGAL_CONTEXT" for item in warnings):
+        return "ยังไม่สามารถตอบได้อย่างปลอดภัย เนื่องจากพบหลายฉบับที่อาจตรงกับมาตราที่ระบุ โปรดระบุชื่อฉบับกฎหมายหรือวันที่มีผลบังคับใช้ให้ชัดเจน"
+    if warnings and any(item.get("code") in {"ANSWER_CITATIONS_MISSING", "ANSWER_CITATION_ID_INVALID"} for item in warnings):
+        return "ยังไม่สามารถสร้างคำตอบที่มีหลักฐานอ้างอิงที่ตรวจสอบได้จากคำขอนี้"
     if not evidence.sources:
         return "Insufficient evidence was found in the selected knowledge bases."
     citations = " ".join(f"[{source['citation_id']}]" for source in evidence.sources)
@@ -1340,24 +2073,34 @@ def compose_cited_answer(evidence: RetrievalEvidence) -> str:
 
 def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: int, token_id: str | None = None, query_filters=None) -> dict:
     retrieval_trace: list[dict] = []
-    decision = build_retrieval_plan(db, query, kb_ids, max_sources, query_filters)
-    evidence = query_documents(db, query, kb_ids, decision.plan.max_sources, retrieval_trace, decision.plan)
+    legal_warnings: list[dict] = []
+    decision = build_retrieval_plan(db, query, kb_ids, max_sources, query_filters, retrieval_trace)
+    evidence = query_documents(db, query, kb_ids, decision.plan.max_sources, retrieval_trace, decision.plan, legal_warnings)
     intent = decision.plan.intent
-    answer = compose_cited_answer(evidence)
+    answer = compose_cited_answer(evidence, legal_warnings)
+    legal_context = decision.plan.legal_context.model_dump(mode="json") if decision.plan.legal_context else None
+    legal_status = "not_applicable"
+    if legal_context is not None:
+        legal_status = "insufficient" if not evidence.sources else ("partial" if legal_warnings else "verified")
+    answer_contract = {"status": legal_status, "as_of_date": decision.plan.as_of_date.isoformat() if decision.plan.as_of_date else None,
+                       "warnings": legal_warnings, "citation_required": bool(evidence.sources),
+                       "claim_citations": [source.get("citation_id") for source in evidence.sources]}
     metrics.observe_query_outcome("insufficient_evidence" if not evidence.sources else "evidence_found")
     result = {"status": "success", "result_id": "", "answer": answer,
               "insufficient_evidence": not bool(evidence.sources), "entities": evidence.entities,
               "relationships": evidence.relationships, "paths": evidence.paths, "sources": evidence.sources,
-              "warnings": [], "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": intent,
+              "warnings": legal_warnings, "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": intent,
                                                 "retrieval_plan": decision.plan.model_dump(mode="json"),
                                                 "planner_policy_version": decision.policy_version,
                                                 "retrieval_trace": retrieval_trace,
+                                                "legal_context": legal_context,
+                                                "answer_contract": answer_contract,
                                                 # Safe observability summaries. Full prompts, provider
                                                 # payloads, and document bodies are never persisted.
-                                                "query_preview": query[:500],
+                                                "query_preview": query[:500] if get_settings().log_query_text else None,
                                                 "query_length": len(query),
                                                 "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
-                                                "answer_preview": answer[:800],
+                                                "answer_preview": answer[:800] if get_settings().log_query_text else None,
                                                 "citation_ids": [source.get("citation_id") for source in evidence.sources],
                                                 "filter_summary": query_filters.model_dump(mode="json") if query_filters else {},
                                                 "response_summary": {"status": "success", "insufficient_evidence": not bool(evidence.sources),

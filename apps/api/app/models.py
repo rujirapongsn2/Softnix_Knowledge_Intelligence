@@ -81,6 +81,74 @@ class DocumentChunk(Timestamped, Base):
     char_end: Mapped[int] = mapped_column(Integer)
     token_count: Mapped[int] = mapped_column(Integer)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536).with_variant(JSON, "sqlite"), nullable=True)
+    # Populated only for legal documents by the section-aware splitter; None for
+    # fixed-size chunks of general documents.
+    section_kind: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    section_number: Mapped[str | None] = mapped_column(String(60), nullable=True, index=True)
+    section_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+
+class LegalFamily(Timestamped, Base):
+    __tablename__ = "legal_families"
+    __table_args__ = (UniqueConstraint("knowledge_base_id", "normalized_key", name="uq_legal_family_key"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+    base_title: Mapped[str] = mapped_column(String(500))
+    normalized_key: Mapped[str] = mapped_column(String(700), index=True)
+
+
+class LegalInstrument(Timestamped, Base):
+    __tablename__ = "legal_instruments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), unique=True, index=True)
+    family_id: Mapped[str | None] = mapped_column(ForeignKey("legal_families.id"), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(40), default="other", index=True)
+    authority_level: Mapped[int] = mapped_column(Integer, default=20)
+    official_title: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    official_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    issuer: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    jurisdiction: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    version_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    enacted_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effective_from: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    effective_to: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    # in_force | amended | superseded | repealed | not_yet_effective | unknown
+    status: Mapped[str] = mapped_column(String(20), default="unknown", index=True)
+    status_source: Mapped[str] = mapped_column(String(20), default="resolver")
+    status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_status: Mapped[str] = mapped_column(String(20), default="unreviewed")
+    # Curator-facing provenance.  These fields are intentionally nullable so
+    # legacy legal metadata can be migrated without inventing an authority.
+    source_uri: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    source_reference: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Stable identity for a legal work across main, consolidated and amendment
+    # expressions.  These fields are populated from the official corpus header.
+    legal_work_key: Mapped[str | None] = mapped_column(String(700), nullable=True, index=True)
+    document_class: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    version_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class LegalInstrumentRelation(Timestamped, Base):
+    __tablename__ = "legal_instrument_relations"
+    __table_args__ = (
+        UniqueConstraint("source_instrument_id", "relation", "target_instrument_id", "target_provision",
+                         name="uq_legal_instrument_relation"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+    source_instrument_id: Mapped[str] = mapped_column(ForeignKey("legal_instruments.id"), index=True)
+    target_instrument_id: Mapped[str | None] = mapped_column(ForeignKey("legal_instruments.id"), nullable=True, index=True)
+    relationship_id: Mapped[str | None] = mapped_column(ForeignKey("relationships.id"), nullable=True, index=True)
+    target_text: Mapped[str | None] = mapped_column(String(700), nullable=True)
+    target_provision: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    relation: Mapped[str] = mapped_column(String(30), index=True)
+    evidence_quote: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    origin: Mapped[str] = mapped_column(String(30), default="legal_schema")
+    review_status: Mapped[str] = mapped_column(String(20), default="suggested", index=True)
 
 
 class ProcessingJob(Timestamped, Base):
@@ -187,6 +255,46 @@ class AuditLog(Base):
     target_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
     target_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class TraceRun(Base):
+    """Normalized, query-friendly retrieval trace root.
+
+    AuditLog remains the immutable compliance record and compatibility source;
+    this table is the hot observability index used by Trace Explorer.
+    """
+    __tablename__ = "trace_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    request_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    transport: Mapped[str] = mapped_column(String(30), default="api", index=True)
+    tool: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    trace_status: Mapped[str] = mapped_column(String(20), default="success", index=True)
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    knowledge_base_ids: Mapped[list] = mapped_column(JSON, default=list)
+    retrieval_plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    request_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    response_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class TraceSpan(Base):
+    __tablename__ = "trace_spans"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    trace_id: Mapped[str] = mapped_column(ForeignKey("trace_runs.id"), index=True)
+    span_id: Mapped[str] = mapped_column(String(100), index=True)
+    parent_span_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    channel: Mapped[str] = mapped_column(String(80), index=True)
+    system: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    result_count: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    offset_ms: Mapped[int] = mapped_column(Integer, default=0)
+    reason_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    detail: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    input_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    output_summary: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 

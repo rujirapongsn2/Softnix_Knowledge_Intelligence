@@ -17,3 +17,23 @@ Entities, relationships, and their document excerpts are persisted by the platfo
 When `NEO4J_HTTP_URL` and `NEO4J_PASSWORD` are configured, entity and relationship writes are projected to Neo4j through parameterized Cypher, including origin, review status, and legal flags. The projection is best-effort: PostgreSQL remains authoritative and a transient Neo4j failure cannot discard an accepted administration change. The planner treats Neo4j as an accelerator, never as the provenance authority.
 
 Graph writes now create a transactional `graph_projection_events` outbox row alongside the PostgreSQL entity or relationship. The worker delivers one event at a time, tracks attempts, and retries transient Neo4j failures with bounded exponential backoff. The projection status is available to an authenticated administrator at `GET /api/v1/system/graph-projection`.
+
+## Legal registry and temporal/relationship-aware retrieval
+
+Legal Graph Schema v2 extraction populates `documents.legal_metadata`, but a `legal_metadata` blob alone cannot answer "which version is current." A deterministic legal registry sits alongside the existing legal graph:
+
+- `legal_families` groups an instrument with its amendments under one canonical title (`app/legal_registry.py:normalize_family_key`), independent of `(ฉบับที่ N)` suffixes and พ.ศ./ค.ศ. year notation.
+- `legal_instruments` (one row per legal/regulation/contract document) carries a rule-based authority level (`app/legal_registry.py:AUTHORITY_LEVELS`, รัฐธรรมนูญ=100 down to FAQ=20), effective_from/effective_to, and a status (`in_force`, `amended`, `superseded`, `repealed`, `not_yet_effective`, `unknown`).
+- `legal_instrument_relations` mirrors the reviewed AMENDS/REPEALS/SUPERSEDES/ISSUED_UNDER/IMPLEMENTS/REFERS_TO/GOVERNED_BY edges already produced by cross-document suggestion (`build_legal_cross_document_suggestions`), optionally scoped to one provision (`target_provision`).
+
+For official Department of Lands corpus imports, `app/legal_corpus.py` parses the
+five-line source header deterministically. Each instrument stores `legal_work_key`,
+`document_class` (`main`, `consolidated`, `amendment`), `version_date`, the official
+source URL and corpus reference code. Explicit clauses such as "ให้ยกเลิกความใน
+มาตรา ..." become evidence-backed verified AMENDS/REPEALS registry edges. During a
+rebuild, an amendment is linked to the latest consolidated expression not newer
+than its own version date; this avoids linking a historical act to the current text.
+
+`resolve_instrument_statuses` (`app/legal_registry.py`) is a pure SQL/date resolver — no LLM call — that only touches rows with `status_source = 'resolver'`; a `PATCH /legal-instruments/{id}` admin override sets `status_source = 'manual'` and is never overwritten again. It runs after legal extraction, after a KB-wide legal graph rebuild, and after an admin approves or rejects a suggested relationship (`sync_legal_instrument_relation_review`), so status only changes once a human has verified the relationship that justifies it.
+
+At query time, `app/legal_resolver.py` (`resolve_legal_context`) detects a named instrument or a cited มาตรา/ข้อ provision, selects the version valid at `as_of_date` (default today), expands one hop of AMENDS/ISSUED_UNDER/IMPLEMENTS, and returns a `LegalContext` carrying `current_version_ids` and `excluded_document_ids`. This only runs for a Knowledge Base that actually has legal instruments, so a general KB pays no cost and behaves exactly as before. `query_documents` filters excluded documents out of every channel's evidence (both at the SQL layer and as a channel-agnostic safety net covering LightRAG and graph sources), then `fuse_evidence` boosts reciprocal-rank-fusion scores by authority level, legal status, and recency — a document without a registry entry gets boost 0, so plain retrieval is bit-for-bit unchanged. `validate_legal_evidence` performs a final conflict check: it collapses duplicate provisions across versions to the current one (or flags both under `include_historical`), flags a provision hit by a verified provision-level REPEALS/SUPERSEDES/AMENDS edge, and flags an instrument whose status remains `unknown`. Citations sent to the LLM and returned to the client carry the resolved status, authority level, kind, version label, and effective dates.

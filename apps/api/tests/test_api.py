@@ -56,6 +56,32 @@ def test_vertical_slice():
     assert any(step["channel"] == "full_text" for step in mcp_transaction["retrieval"]["retrieval_trace"])
 
 
+def test_mcp_legal_tools_are_agent_safe_and_scope_bound():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Legal MCP", "code": "legal-mcp-agent"}).json()
+    assert test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/activate").status_code == 200
+    worklist = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/legal-registry/worklist")
+    assert worklist.status_code == 200 and worklist.json()["ready"] is True
+    token = test_client.post("/api/v1/tokens", json={
+        "name": "legal-agent", "allowed_knowledge_base_ids": [kb["id"]],
+        "allowed_tools": ["resolve_legal_context", "get_legal_instrument", "get_provision_history"],
+    }).json()
+    headers = {"Authorization": f"Bearer {token['token']}"}
+    listed = test_client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()
+    names = {tool["name"] for tool in listed["result"]["tools"]}
+    assert {"resolve_legal_context", "get_legal_instrument", "get_provision_history"}.issubset(names)
+    resolved = test_client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+        "name": "resolve_legal_context", "arguments": {"query": "มาตรา 39", "knowledge_base_ids": ["client-cannot-expand-scope"]}
+    }}).json()
+    structured = resolved["result"]["structuredContent"]
+    assert structured["knowledge_base_ids"] == [kb["id"]]
+    assert structured["metadata"]["source_of_truth"] == "PostgreSQL legal registry"
+    denied = test_client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "get_legal_instrument", "arguments": {"instrument_id": "outside-scope"}
+    }}).json()
+    assert denied["error"]["code"] == "LEGAL_INSTRUMENT_NOT_FOUND"
+
+
 def test_knowledge_base_can_be_disabled_activated_and_safely_deleted():
     test_client = next(client())
     empty = test_client.post("/api/v1/knowledge-bases", json={"name": "Disposable", "code": "disposable-kb"}).json()
@@ -73,6 +99,19 @@ def test_knowledge_base_can_be_disabled_activated_and_safely_deleted():
     assert nonempty.status_code == 409 and nonempty.json()["error"]["code"] == "KNOWLEDGE_BASE_NOT_EMPTY"
     assert uploaded["status"] == "queued"
     assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True
+
+
+def test_knowledge_base_code_is_derived_safely_for_non_latin_and_repeated_names():
+    test_client = next(client())
+    first = test_client.post("/api/v1/knowledge-bases", json={"name": "กฎหมายคุ้มครองข้อมูลส่วนบุคคล"})
+    second = test_client.post("/api/v1/knowledge-bases", json={"name": "กฎหมายคุ้มครองข้อมูลส่วนบุคคล"})
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["code"].startswith("kb-")
+    assert second.json()["code"] != first.json()["code"]
+
+    duplicate = test_client.post("/api/v1/knowledge-bases", json={"name": "Another label", "code": first.json()["code"]})
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "KNOWLEDGE_BASE_CODE_EXISTS"
 
 
 def test_retrieval_policy_can_be_updated_and_is_returned_in_kb_contract():
@@ -209,6 +248,92 @@ def test_revoked_token_cannot_call_mcp():
     response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert response.status_code == 200
     assert response.json()["error"]["code"] == "AUTH_TOKEN_REVOKED"
+
+
+def test_token_rotation_replaces_secret_without_exposing_old_key():
+    test_client = next(client())
+    original = test_client.post("/api/v1/tokens", json={"name": "rotate-me", "allowed_tools": ["search_knowledge"]}).json()
+    rotated = test_client.post(f"/api/v1/tokens/{original['id']}/rotate")
+    assert rotated.status_code == 200
+    replacement = rotated.json()
+    assert replacement["token"] != original["token"]
+    assert replacement["name"] == original["name"]
+    assert replacement["allowed_tools"] == original["allowed_tools"]
+    old_response = test_client.post("/mcp", headers={"Authorization": f"Bearer {original['token']}"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert old_response.json()["error"]["code"] == "AUTH_TOKEN_REVOKED"
+    new_response = test_client.post("/mcp", headers={"Authorization": f"Bearer {replacement['token']}"}, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    assert new_response.json()["result"]["tools"]
+
+
+def test_token_rotation_preserves_disabled_state():
+    test_client = next(client())
+    original = test_client.post("/api/v1/tokens", json={"name": "disabled-rotation", "allowed_tools": ["search_knowledge"]}).json()
+    assert test_client.post(f"/api/v1/tokens/{original['id']}/disable").status_code == 200
+    rotated = test_client.post(f"/api/v1/tokens/{original['id']}/rotate")
+    assert rotated.status_code == 200
+    replacement = rotated.json()
+    assert replacement["status"] == "inactive"
+    blocked = test_client.post("/mcp", headers={"Authorization": f"Bearer {replacement['token']}"}, json={"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+    assert blocked.json()["error"]["code"] == "AUTH_TOKEN_INVALID"
+
+
+def test_batch_upload_queues_each_file_with_shared_document_type():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Batch upload"}).json()
+    response = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/documents/batch",
+        files=[
+            ("files", ("act.txt", "มาตรา 1 applies.".encode(), "text/plain")),
+            ("files", ("notice.txt", "ประกาศแก้ไข มาตรา 2".encode(), "text/plain")),
+        ],
+        data={"document_type": "legal"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "queued"
+    assert payload["queued_count"] == 2
+    assert [item["document_type"] for item in payload["results"]] == ["legal", "legal"]
+    assert all(item["status"] == "queued" and item["job_id"] for item in payload["results"])
+    for _ in range(3):
+        test_client.post("/api/v1/internal/process-next")
+
+
+def test_batch_upload_isolates_duplicate_failure_from_other_files():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Batch partial"}).json()
+    assert test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("existing.txt", b"existing", "text/plain")}).status_code == 200
+    response = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/documents/batch",
+        files=[
+            ("files", ("existing.txt", b"existing", "text/plain")),
+            ("files", ("new.txt", b"new independent content", "text/plain")),
+        ],
+        data={"document_type": "general"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "partial"
+    assert payload["queued_count"] == 1 and payload["failed_count"] == 1
+    assert next(item for item in payload["results"] if item["filename"] == "existing.txt")["error_code"] == "FILE_DUPLICATE"
+    assert next(item for item in payload["results"] if item["filename"] == "new.txt")["status"] == "queued"
+    for _ in range(3):
+        test_client.post("/api/v1/internal/process-next")
+
+
+def test_document_list_exposes_latest_follow_up_job_status():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Legal job status"}).json()
+    uploaded = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/documents",
+        files={"file": ("law.txt", "มาตรา 1 applies.".encode(), "text/plain")},
+        data={"document_type": "legal"},
+    ).json()
+    rows = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/documents").json()
+    row = next(item for item in rows if item["id"] == uploaded["document_id"])
+    assert row["processing_job_status"] == "queued"
+    assert row["processing_job_type"] == "PROCESS_DOCUMENT"
+    for _ in range(3):
+        test_client.post("/api/v1/internal/process-next")
 
 
 def test_mcp_only_reads_active_knowledge_bases():
@@ -435,6 +560,22 @@ def test_legal_graph_v2_keeps_provisions_document_scoped_and_reviews_suggestions
         services.rebuild_legal_graph(db, kb["id"])
     verified_after = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/legal-graph?view=verified").json()
     assert any(item["id"] == edge["id"] and item["review_status"] == "verified" for item in verified_after["edges"])
+    definition = next(node for node in verified["nodes"] if node["entity_type"] == "Provision")
+    inspector = test_client.get(f"/api/v1/entities/{definition['id']}/inspector?depth=1")
+    assert inspector.status_code == 200
+    payload = inspector.json()
+    assert payload["entity"]["entity_type"] == "Provision"
+    assert payload["evidence"] and payload["context"]["documents"]
+    assert payload["relationships"]["outgoing"] or payload["relationships"]["incoming"]
+    assert "versions" in payload and "warnings" in payload["analysis"]
+    legal_map = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/legal-map?view=verified").json()
+    assert legal_map["mode"] == "map"
+    assert len(legal_map["instruments"]) == 2
+    assert all("entity_count" in item and "relationship_count" in item for item in legal_map["instruments"])
+    instrument_view = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/legal-map?view=verified&instrument_id={legal_map['instruments'][0]['id']}").json()
+    assert instrument_view["mode"] == "instrument"
+    assert instrument_view["nodes"]
+    assert all(node["entity_type"] in {"LegalInstrument", "Provision"} for node in instrument_view["nodes"])
 
 
 def test_database_chunk_retrieval_is_scoped_to_knowledge_base():
@@ -517,6 +658,11 @@ def test_admin_query_transaction_includes_retrieval_executor_trace():
     assert detail["request_summary"]["query_preview"] == "platform"
     assert detail["request_summary"]["query_sha256"]
     assert "Bearer " not in str(detail)
+    paged = test_client.get("/api/v1/traces?transport=api&limit=1&paginate=true").json()
+    assert "items" in paged and isinstance(paged["items"], list)
+    assert paged["items"][0]["trace_id"] == trace["trace_id"]
+    transaction_page = test_client.get("/api/v1/logs/transactions?limit=1&paginate=true").json()
+    assert "items" in transaction_page and transaction_page["items"]
 
 
 def test_document_restore_graph_layout_and_feedback_lifecycle():

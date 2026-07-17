@@ -32,6 +32,14 @@ class RetrievalPolicy(BaseModel):
     maximum_top_k: int = Field(default=30, ge=1, le=50)
     maximum_graph_depth: int = Field(default=3, ge=1, le=3)
     citation_required: bool = True
+    # Legal-registry-aware retrieval. A KB with no legal instruments is
+    # unaffected regardless of these values: the resolver finds nothing to
+    # match and the fusion boost multiplies against an empty legal_meta map.
+    legal_awareness: bool = True
+    exclude_invalid: bool = True
+    authority_weight: float = Field(default=0.30, ge=0, le=1)
+    recency_weight: float = Field(default=0.15, ge=0, le=1)
+    status_weight: float = Field(default=0.35, ge=0, le=1)
 
     @field_validator("retrieval_mode")
     @classmethod
@@ -39,6 +47,28 @@ class RetrievalPolicy(BaseModel):
         if value not in {"auto", "balanced", "precision", "recall"}:
             raise ValueError("retrieval_mode must be auto, balanced, precision, or recall")
         return value
+
+
+class LegalContext(BaseModel):
+    """Deterministic query-time legal resolution: which instruments were
+    matched, which document ids should be treated as current evidence, and
+    which document ids are known invalid at the resolved as-of date."""
+    matched_instrument_ids: list[str] = Field(default_factory=list)
+    current_version_ids: list[str] = Field(default_factory=list)
+    amending_instrument_ids: list[str] = Field(default_factory=list)
+    excluded_document_ids: list[str] = Field(default_factory=list)
+    # When the query names a legal family without an instrument/version, the
+    # resolver may select one canonical consolidated expression.  Retrieval
+    # uses this list as a hard preference so an amendment's standalone text
+    # cannot silently win over the current consolidated text.
+    preferred_document_ids: list[str] = Field(default_factory=list)
+    provision_refs: list[str] = Field(default_factory=list)
+    resolution_notes: list[str] = Field(default_factory=list)
+    # A legal provision number is not globally unique.  Never answer by
+    # guessing when more than one current candidate remains unresolved.
+    ambiguous_context: bool = False
+    ambiguity_reason: str | None = None
+    candidate_instrument_ids: list[str] = Field(default_factory=list)
 
 
 class RetrievalPlan(BaseModel):
@@ -52,6 +82,12 @@ class RetrievalPlan(BaseModel):
     document_identifiers: list[str] = Field(default_factory=list)
     published_from: date | None = None
     published_to: date | None = None
+    as_of_date: date | None = None
+    include_historical: bool = False
+    legal_context: LegalContext | None = None
+    authority_weight: float = Field(default=0.30, ge=0, le=1)
+    recency_weight: float = Field(default=0.15, ge=0, le=1)
+    status_weight: float = Field(default=0.35, ge=0, le=1)
     rerank_enabled: bool = True
     planner_source: str = "rules"
     rationale: str = ""
@@ -94,11 +130,14 @@ def intersect_policies(policies: list[RetrievalPolicy]) -> RetrievalPolicy:
     base = policies[0].model_dump()
     for policy in policies[1:]:
         values = policy.model_dump()
-        for key in ("enable_vector", "enable_fulltext", "enable_graph", "enable_lightrag", "enable_reranker", "planner_llm_fallback", "citation_required"):
+        for key in ("enable_vector", "enable_fulltext", "enable_graph", "enable_lightrag", "enable_reranker",
+                   "planner_llm_fallback", "citation_required", "legal_awareness", "exclude_invalid"):
             base[key] = bool(base[key] and values[key])
         base["default_top_k"] = min(base["default_top_k"], values["default_top_k"])
         base["maximum_top_k"] = min(base["maximum_top_k"], values["maximum_top_k"])
         base["maximum_graph_depth"] = min(base["maximum_graph_depth"], values["maximum_graph_depth"])
+        for key in ("authority_weight", "recency_weight", "status_weight"):
+            base[key] = min(base[key], values[key])
     return RetrievalPolicy.model_validate(base)
 
 
@@ -177,6 +216,7 @@ def rule_plan(query: str, policy: RetrievalPolicy, max_sources: int | None = Non
         intent=intent, channels=channels, max_sources=min(max_sources or policy.default_top_k, policy.maximum_top_k),
         graph_depth=depth, graph_scope=scope, entity_subjects=subjects, document_identifiers=document_ids,
         published_from=published_from, published_to=published_to, rerank_enabled=policy.enable_reranker,
+        authority_weight=policy.authority_weight, recency_weight=policy.recency_weight, status_weight=policy.status_weight,
         rationale=f"rule:{intent}",
     )
     return PlannerDecision(plan=plan, ambiguous=ambiguous, policy_version=policy.version)

@@ -1,13 +1,17 @@
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+import hashlib
+import re
 import time
+import unicodedata
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 import redis
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from .config import get_settings
@@ -15,14 +19,16 @@ from .audit import record_audit, record_retrieval_execution
 from .db import Base, engine, get_db, SessionLocal
 from .external_ocr import ExternalOcrClient
 from .graph_store import Neo4jGraphStore
-from .models import AuditLog, Document, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, KnowledgeBase, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, TokenKey, User
+from .legal_registry import provision_number_matches, resolve_instrument_statuses
+from .models import AuditLog, Document, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, TokenKey, TraceRun, TraceSpan, User
 from .observability import metrics, now
 from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
-from .schemas import DocumentMetadataUpdate, DocumentOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
+from .retention import prune_observability
+from .schemas import DocumentMetadataUpdate, DocumentOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
 from .security import authorize, bearer_token, create_session_token, create_token_secret, current_admin, password_hash, refresh_admin, token_digest, verify_password
-from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_query_result, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_legal_document_graph, sync_lightrag_document_graph
+from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8080", "http://localhost:8081"], allow_credentials=True,
@@ -178,8 +184,32 @@ def me(user: User = Depends(current_admin)): return {"id": user.id, "username": 
 
 @app.post("/api/v1/knowledge-bases", response_model=KnowledgeBaseOut)
 def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
-    if db.query(KnowledgeBase).filter_by(code=payload.code).first(): raise HTTPException(409, "Knowledge base code already exists")
-    kb = KnowledgeBase(**payload.model_dump(), retrieval_config=DEFAULT_RETRIEVAL_CONFIG.copy())
+    requested_code = payload.code
+    if requested_code:
+        existing = db.query(KnowledgeBase).filter_by(code=requested_code).first()
+        if existing:
+            raise HTTPException(409, {"code": "KNOWLEDGE_BASE_CODE_EXISTS",
+                                      "message": f"Knowledge Base code '{requested_code}' already exists. Choose another code.",
+                                      "retryable": False, "existing_status": existing.status,
+                                      "existing_deleted": bool(existing.deleted_at)})
+        code = requested_code
+    else:
+        # Keep human-readable slugs for Latin names.  A stable hash fallback
+        # prevents every Thai/non-Latin name from collapsing to
+        # "knowledge-base".  Suffixes keep codes unique across soft-deleted
+        # records and repeated names.
+        normalized = unicodedata.normalize("NFKD", payload.name).encode("ascii", "ignore").decode("ascii").lower()
+        base = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
+        if len(base) < 2:
+            base = f"kb-{hashlib.sha256(payload.name.strip().encode('utf-8')).hexdigest()[:10]}"
+        base = base[:120].rstrip("-")
+        code, suffix = base, 2
+        while db.query(KnowledgeBase.id).filter_by(code=code).first():
+            suffix_text = f"-{suffix}"
+            code = f"{base[:120 - len(suffix_text)].rstrip('-')}{suffix_text}"
+            suffix += 1
+    values = payload.model_dump(exclude={"code"})
+    kb = KnowledgeBase(**values, code=code, retrieval_config=DEFAULT_RETRIEVAL_CONFIG.copy())
     db.add(kb); db.flush(); record_audit(db, "knowledge_base.create", user.id, "knowledge_base", kb.id, {"code": kb.code}); db.commit(); db.refresh(kb); return kb
 
 
@@ -248,12 +278,71 @@ def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None 
     return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type, "legal_extraction_automatic": doc.document_type in {"legal", "regulation", "contract"}}
 
 
+@app.post("/api/v1/knowledge-bases/{kb_id}/documents/batch")
+def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), title: str | None = Form(None), document_type: str = Form("general"), user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Queue a bounded batch while keeping each file an independent job.
+
+    A validation, duplicate, or storage failure is isolated to its file so a
+    large batch can continue and the UI can retry only the failed documents.
+    The document type applies uniformly to the whole batch; titles are only
+    accepted for a single-file batch to avoid misleading shared titles.
+    """
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    if kb.status == "disabled":
+        raise HTTPException(409, {"code": "KNOWLEDGE_BASE_DISABLED", "message": "Activate this Knowledge Base before uploading documents.", "retryable": False})
+    if not files:
+        raise HTTPException(400, {"code": "BATCH_FILES_REQUIRED", "message": "Select at least one file.", "retryable": False})
+    if len(files) > 20:
+        raise HTTPException(400, {"code": "BATCH_TOO_MANY_FILES", "message": "A batch can contain at most 20 files.", "retryable": False})
+    if document_type not in {"general", "legal", "regulation", "contract"}:
+        raise HTTPException(400, {"code": "DOCUMENT_TYPE_INVALID", "message": "Document type is invalid.", "retryable": False})
+
+    results = []
+    for upload in files:
+        filename = upload.filename or "unnamed-file"
+        result = {"filename": filename, "status": "failed", "document_type": document_type}
+        try:
+            doc, job = create_document_job(db, kb_id, upload, title if len(files) == 1 else None, document_type)
+            record_audit(db, "document.upload", user.id, "document", doc.id, {"knowledge_base_id": kb_id, "filename": doc.original_filename, "document_type": doc.document_type, "batch": True})
+            db.commit()
+            result.update({"status": "queued", "document_id": doc.id, "job_id": job.id, "legal_extraction_automatic": document_type in {"legal", "regulation", "contract"}})
+        except ValueError as exc:
+            result.update({"error_code": str(exc), "message": "Upload rejected"})
+        except Exception:
+            db.rollback()
+            result.update({"error_code": "UPLOAD_FAILED", "message": "Upload could not be queued"})
+        results.append(result)
+
+    queued_count = sum(item["status"] == "queued" for item in results)
+    failed_count = len(results) - queued_count
+    return {"status": "queued" if failed_count == 0 else "partial", "document_type": document_type,
+            "total": len(results), "queued_count": queued_count, "failed_count": failed_count, "results": results}
+
+
 @app.get("/api/v1/knowledge-bases/{kb_id}/documents", response_model=list[DocumentOut])
 def list_documents(kb_id: str, include_deleted: bool = False, _: User = Depends(current_admin), db: Session = Depends(get_db)):
     rows = db.query(Document).filter_by(knowledge_base_id=kb_id)
     if not include_deleted:
         rows = rows.filter(Document.deleted_at.is_(None))
-    return rows.order_by(Document.created_at.desc()).limit(200).all()
+    documents = rows.order_by(Document.created_at.desc()).limit(200).all()
+    document_ids = [document.id for document in documents]
+    latest_jobs = {}
+    if document_ids:
+        jobs = db.query(ProcessingJob).filter(ProcessingJob.document_id.in_(document_ids)).order_by(ProcessingJob.created_at.desc()).all()
+        for job in jobs:
+            if job.document_id and job.document_id not in latest_jobs:
+                # The query is newest-first; keep the first row per document.
+                latest_jobs[job.document_id] = job
+    result = []
+    for document in documents:
+        item = DocumentOut.model_validate(document).model_dump()
+        job = latest_jobs.get(document.id)
+        if job:
+            item.update(processing_job_status=job.status, processing_job_type=job.job_type, processing_job_stage=job.current_stage)
+        result.append(item)
+    return result
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/documents/reindex")
@@ -508,6 +597,115 @@ def get_legal_graph(kb_id: str, view: str = "verified", _: User = Depends(curren
     }
 
 
+@app.get("/api/v1/knowledge-bases/{kb_id}/legal-map")
+def get_legal_map(kb_id: str, view: str = "verified", instrument_id: str | None = None,
+                  max_nodes: int = 80, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Return a bounded, document-scoped legal graph projection for progressive disclosure.
+
+    The full legal graph remains available through ``legal-graph`` for advanced users,
+    while this endpoint is the human-facing overview: one card per legal instrument,
+    followed by an explicitly selected instrument structure.
+    """
+    if view not in {"verified", "suggested", "all"}:
+        raise HTTPException(400, {"code": "LEGAL_GRAPH_VIEW_INVALID", "message": "view must be verified, suggested, or all", "retryable": False})
+    if max_nodes < 10 or max_nodes > 200:
+        raise HTTPException(400, {"code": "LEGAL_GRAPH_LIMIT_INVALID", "message": "max_nodes must be between 10 and 200", "retryable": False})
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+
+    instruments = db.query(LegalInstrument).filter_by(knowledge_base_id=kb_id).order_by(
+        LegalInstrument.family_id.asc(), LegalInstrument.version_date.asc(), LegalInstrument.created_at.asc()
+    ).all()
+    documents = {document.id: document for document in db.query(Document).filter(Document.id.in_([item.document_id for item in instruments])).all()} if instruments else {}
+    family_rows: dict[str, list[LegalInstrument]] = {}
+    for item in instruments:
+        family_rows.setdefault(item.family_id or item.id, []).append(item)
+
+    def entity_ids_for_document(document_id: str) -> set[str]:
+        rows = db.query(EntitySource.entity_id).filter(EntitySource.document_id == document_id).all()
+        return {row[0] for row in rows}
+
+    def edge_query(entity_ids: set[str]):
+        if not entity_ids:
+            return []
+        query = db.query(Relationship).filter(
+            Relationship.knowledge_base_id == kb_id,
+            Relationship.deleted_at.is_(None),
+            Relationship.source_entity_id.in_(entity_ids),
+            Relationship.target_entity_id.in_(entity_ids),
+            Relationship.is_legal.is_(True),
+        )
+        if view == "verified":
+            query = query.filter(Relationship.review_status == "verified")
+        elif view == "suggested":
+            query = query.filter(Relationship.review_status == "suggested")
+        return query.limit(max_nodes * 3).all()
+
+    summaries = []
+    instrument_entity_ids: dict[str, set[str]] = {}
+    for item in instruments:
+        ids = entity_ids_for_document(item.document_id)
+        instrument_entity_ids[item.id] = ids
+        edges = edge_query(ids)
+        document = documents.get(item.document_id)
+        summaries.append({
+            "id": item.id,
+            "document_id": item.document_id,
+            "title": item.official_title or (document.title if document else None) or (document.original_filename if document else "Untitled instrument"),
+            "filename": document.original_filename if document else None,
+            "kind": item.kind,
+            "document_class": item.document_class,
+            "status": item.status,
+            "review_status": item.review_status,
+            "family_id": item.family_id,
+            "version_label": item.version_label,
+            "version_date": item.version_date.isoformat() if item.version_date else None,
+            "effective_from": item.effective_from.isoformat() if item.effective_from else None,
+            "effective_to": item.effective_to.isoformat() if item.effective_to else None,
+            "entity_count": len(ids),
+            "relationship_count": len(edges),
+        })
+
+    cross_relations = db.query(LegalInstrumentRelation).filter(
+        LegalInstrumentRelation.knowledge_base_id == kb_id,
+        LegalInstrumentRelation.target_instrument_id.is_not(None),
+    )
+    if view == "verified":
+        cross_relations = cross_relations.filter(LegalInstrumentRelation.review_status == "verified")
+    elif view == "suggested":
+        cross_relations = cross_relations.filter(LegalInstrumentRelation.review_status == "suggested")
+    cross_edges = [{
+        "id": relation.id,
+        "source_instrument_id": relation.source_instrument_id,
+        "target_instrument_id": relation.target_instrument_id,
+        "relation": relation.relation,
+        "review_status": relation.review_status,
+        "origin": relation.origin,
+        "confidence": relation.confidence,
+        "evidence_quote": relation.evidence_quote,
+    } for relation in cross_relations.limit(300).all()]
+
+    result = {"knowledge_base_id": kb_id, "view": view, "mode": "map", "instruments": summaries,
+              "families": [{"id": family_id, "title": next((row["title"] for row in summaries if row["family_id"] == family_id), "Legal family"),
+                             "instrument_ids": [row.id for row in rows]} for family_id, rows in family_rows.items()],
+              "cross_document_relations": cross_edges}
+    if not instrument_id:
+        return result
+    selected = next((item for item in instruments if item.id == instrument_id), None)
+    if not selected:
+        raise HTTPException(404, "Legal instrument not found")
+    ids = instrument_entity_ids.get(selected.id, set())
+    entities = db.query(Entity).filter(Entity.id.in_(list(ids)), Entity.deleted_at.is_(None)).order_by(Entity.entity_type.asc(), Entity.name.asc()).limit(max_nodes).all() if ids else []
+    visible_ids = {entity.id for entity in entities}
+    edges = [edge for edge in edge_query(visible_ids) if edge.source_entity_id in visible_ids and edge.target_entity_id in visible_ids]
+    result["mode"] = "instrument"
+    result["instrument"] = next(item for item in summaries if item["id"] == selected.id)
+    result["nodes"] = [EntityOut.model_validate(entity).model_dump() for entity in entities]
+    result["edges"] = [RelationshipOut.model_validate(edge).model_dump() for edge in edges]
+    result["warnings"] = (["This instrument view is bounded to the selected document."] if len(ids) > max_nodes else [])
+    return result
+
+
 @app.post("/api/v1/knowledge-bases/{kb_id}/legal-graph/rebuild")
 def queue_legal_graph_rebuild(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
@@ -544,9 +742,130 @@ def review_legal_relationship(relationship_id: str, payload: LegalRelationshipRe
     relationship.review_status = payload.status
     relationship.attributes = {**(relationship.attributes or {}), "review_note": payload.note, "reviewed_by": user.username, "reviewed_at": datetime.utcnow().isoformat()}
     db.add(GraphProjectionEvent(event_type="relationship", relationship_id=relationship.id))
+    sync_legal_instrument_relation_review(db, relationship)
     record_audit(db, f"legal_graph.relationship.{payload.status}", user.id, "relationship", relationship.id, {"note": payload.note})
     db.commit(); db.refresh(relationship)
     return relationship
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/legal-registry", response_model=list[LegalInstrumentOut])
+def list_legal_registry(kb_id: str, status: str | None = None, kind: str | None = None, family_id: str | None = None,
+                        document_id: str | None = None, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+    rows = db.query(LegalInstrument).filter_by(knowledge_base_id=kb_id)
+    if status:
+        rows = rows.filter(LegalInstrument.status == status)
+    if kind:
+        rows = rows.filter(LegalInstrument.kind == kind)
+    if family_id:
+        rows = rows.filter(LegalInstrument.family_id == family_id)
+    if document_id:
+        rows = rows.filter(LegalInstrument.document_id == document_id)
+    return rows.order_by(LegalInstrument.official_title).limit(500).all()
+
+
+@app.get("/api/v1/legal-instruments/{instrument_id}")
+def get_legal_instrument(instrument_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    instrument = db.get(LegalInstrument, instrument_id)
+    if not instrument:
+        raise HTTPException(404, "Legal instrument not found")
+    family_members = []
+    if instrument.family_id:
+        family_members = db.query(LegalInstrument).filter_by(
+            family_id=instrument.family_id, knowledge_base_id=instrument.knowledge_base_id,
+        ).order_by(LegalInstrument.effective_from).all()
+    outgoing = db.query(LegalInstrumentRelation).filter_by(source_instrument_id=instrument.id).all()
+    incoming = db.query(LegalInstrumentRelation).filter_by(target_instrument_id=instrument.id).all()
+    relation_out = lambda row: {"id": row.id, "relation": row.relation, "target_instrument_id": row.target_instrument_id,
+                                "target_text": row.target_text, "target_provision": row.target_provision,
+                                "review_status": row.review_status, "confidence": row.confidence}
+    return {
+        "instrument": LegalInstrumentOut.model_validate(instrument).model_dump(),
+        "family": [LegalInstrumentOut.model_validate(row).model_dump() for row in family_members],
+        "outgoing_relations": [relation_out(row) for row in outgoing],
+        "incoming_relations": [relation_out(row) for row in incoming],
+    }
+
+
+@app.patch("/api/v1/legal-instruments/{instrument_id}", response_model=LegalInstrumentOut)
+def update_legal_instrument(instrument_id: str, payload: LegalInstrumentUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    instrument = db.get(LegalInstrument, instrument_id)
+    if not instrument:
+        raise HTTPException(404, "Legal instrument not found")
+    if payload.family_id:
+        family = db.get(LegalFamily, payload.family_id)
+        if not family or family.knowledge_base_id != instrument.knowledge_base_id:
+            raise HTTPException(400, "family_id does not exist in this Knowledge Base")
+    fields = payload.model_dump(exclude_unset=True)
+    for field, value in fields.items():
+        setattr(instrument, field, value)
+    # An admin decision is authoritative: the resolver never overwrites this row again.
+    instrument.status_source, instrument.review_status = "manual", "verified"
+    instrument.reviewed_at, instrument.reviewed_by = datetime.utcnow(), user.username
+    if "status" in fields:
+        instrument.status_reason = f"manual override by {user.username}"
+    record_audit(db, "legal_instrument.update", user.id, "legal_instrument", instrument.id, {"fields": sorted(fields.keys())})
+    db.commit(); db.refresh(instrument)
+    return instrument
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/legal-registry/worklist")
+def legal_registry_worklist(kb_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Return legal curation gaps instead of silently treating them as facts.
+
+    The worklist is deliberately read-only and bounded.  It gives an operator
+    the exact instruments/relations that need an authoritative source, review,
+    effective date, or target resolution before they can influence legal
+    retrieval as verified evidence.
+    """
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+    instruments = db.query(LegalInstrument).filter_by(knowledge_base_id=kb_id).order_by(LegalInstrument.official_title).limit(500).all()
+    relations = db.query(LegalInstrumentRelation).filter_by(knowledge_base_id=kb_id).limit(1000).all()
+    instrument_by_id = {row.id: row for row in instruments}
+    instrument_items = []
+    for row in instruments:
+        reasons = []
+        if row.review_status != "verified": reasons.append("instrument_not_verified")
+        if not row.source_uri and not row.source_reference: reasons.append("missing_source_provenance")
+        if not row.effective_from: reasons.append("missing_effective_date")
+        if reasons:
+            instrument_items.append({"instrument_id": row.id, "document_id": row.document_id,
+                                     "title": row.official_title, "status": row.status,
+                                     "review_status": row.review_status, "reasons": reasons})
+    relation_items = []
+    for row in relations:
+        reasons = []
+        if row.target_instrument_id is None: reasons.append("target_unresolved")
+        if row.review_status != "verified": reasons.append("relation_not_verified")
+        if not row.evidence_quote: reasons.append("missing_evidence")
+        if reasons:
+            source = instrument_by_id.get(row.source_instrument_id)
+            target = instrument_by_id.get(row.target_instrument_id) if row.target_instrument_id else None
+            relation_items.append({"relation_id": row.id, "relation": row.relation,
+                                   "source_instrument_id": row.source_instrument_id,
+                                   "source_title": source.official_title if source else None,
+                                   "target_instrument_id": row.target_instrument_id,
+                                   "target_title": target.official_title if target else row.target_text,
+                                   "target_provision": row.target_provision,
+                                   "review_status": row.review_status, "origin": row.origin,
+                                   "evidence_quote": row.evidence_quote, "confidence": row.confidence,
+                                   "reasons": reasons})
+    return {"knowledge_base_id": kb_id, "instrument_count": len(instruments),
+            "relation_count": len(relations), "instrument_items": instrument_items,
+            "relation_items": relation_items,
+            "ready": not instrument_items and not relation_items}
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/legal-registry/resolve")
+def resolve_legal_registry(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+    result = resolve_instrument_statuses(db, kb_id)
+    record_audit(db, "legal_registry.resolve", user.id, "knowledge_base", kb_id, result)
+    db.commit()
+    return result
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/graph/sync")
@@ -620,9 +939,96 @@ def get_entity_sources(entity_id: str, _: User = Depends(current_admin), db: Ses
     return {"entity_id": entity_id, "sources": [{"document_id": document.id, "title": document.title, "excerpt": source.excerpt} for source, document in rows]}
 
 
+@app.get("/api/v1/entities/{entity_id}/inspector")
+def get_entity_inspector(entity_id: str, depth: int = 1, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Return the evidence-backed context used by the graph inspector.
+
+    The graph payload intentionally stays lightweight.  This endpoint is lazy
+    loaded after a node click and is the canonical place to expose legal
+    provenance, document/version context and bounded neighbours.
+    """
+    entity = db.get(Entity, entity_id)
+    if not entity or entity.deleted_at:
+        raise HTTPException(404, "Entity not found")
+    depth = max(1, min(depth, 3))
+    source_rows = db.query(EntitySource, Document).join(Document, Document.id == EntitySource.document_id).filter(
+        EntitySource.entity_id == entity.id, Document.deleted_at.is_(None)
+    ).order_by(EntitySource.created_at.desc()).limit(50).all()
+    document_ids = {document.id for _, document in source_rows}
+    attr_document_id = (entity.attributes or {}).get("document_id")
+    if attr_document_id:
+        document_ids.add(attr_document_id)
+    documents = db.query(Document).filter(Document.id.in_(document_ids)).all() if document_ids else []
+    documents_by_id = {document.id: document for document in documents}
+    instruments = db.query(LegalInstrument).filter(LegalInstrument.document_id.in_(document_ids)).all() if document_ids else []
+    instrument_by_document = {instrument.document_id: instrument for instrument in instruments}
+    context_documents = []
+    for document_id in sorted(document_ids):
+        document = documents_by_id.get(document_id)
+        if not document:
+            continue
+        instrument = instrument_by_document.get(document_id)
+        context_documents.append({
+            "document_id": document.id,
+            "title": document.title or document.original_filename,
+            "filename": document.original_filename,
+            "document_type": document.document_type,
+            "status": document.status,
+            "instrument": LegalInstrumentOut.model_validate(instrument).model_dump() if instrument else None,
+        })
+    edges = db.query(Relationship).filter(
+        Relationship.knowledge_base_id == entity.knowledge_base_id,
+        Relationship.deleted_at.is_(None),
+        (Relationship.source_entity_id == entity.id) | (Relationship.target_entity_id == entity.id),
+    ).order_by(Relationship.relationship_type).limit(200).all()
+    related_ids = {edge.source_entity_id for edge in edges} | {edge.target_entity_id for edge in edges}
+    related_entities = db.query(Entity).filter(Entity.id.in_(related_ids), Entity.deleted_at.is_(None)).all() if related_ids else []
+    related_by_id = {row.id: row for row in related_entities}
+    edge_source_rows = db.query(RelationshipSource, Document).join(Document, Document.id == RelationshipSource.document_id).filter(
+        RelationshipSource.relationship_id.in_([edge.id for edge in edges]) if edges else False
+    ).all()
+    edge_sources: dict[str, list[dict]] = {}
+    for source, document in edge_source_rows:
+        edge_sources.setdefault(source.relationship_id, []).append({
+            "document_id": document.id, "title": document.title or document.original_filename, "excerpt": source.excerpt,
+        })
+    def edge_view(edge: Relationship) -> dict:
+        other_id = edge.target_entity_id if edge.source_entity_id == entity.id else edge.source_entity_id
+        other = related_by_id.get(other_id)
+        return {
+            **RelationshipOut.model_validate(edge).model_dump(),
+            "direction": "outgoing" if edge.source_entity_id == entity.id else "incoming",
+            "other_entity": {"id": other.id, "name": other.name, "entity_type": other.entity_type, "review_status": other.review_status} if other else None,
+            "sources": edge_sources.get(edge.id, []),
+        }
+    family = []
+    relation_rows = []
+    for instrument in instruments:
+        if instrument.family_id:
+            members = db.query(LegalInstrument).filter_by(family_id=instrument.family_id, knowledge_base_id=entity.knowledge_base_id).order_by(LegalInstrument.effective_from, LegalInstrument.version_date).all()
+            family.extend(LegalInstrumentOut.model_validate(row).model_dump() for row in members if row.id not in {item.get("id") for item in family})
+        relation_rows.extend(db.query(LegalInstrumentRelation).filter(
+            (LegalInstrumentRelation.source_instrument_id == instrument.id) | (LegalInstrumentRelation.target_instrument_id == instrument.id)
+        ).all())
+    warning_list = ["Entity has no stored evidence."] if not source_rows else []
+    for instrument in instruments:
+        if instrument.status in {"superseded", "repealed", "amended"}:
+            warning_list.append(f"Instrument status is {instrument.status}; verify the applicable version before relying on it.")
+    if any(edge.review_status == "suggested" for edge in edges):
+        warning_list.append("Some connected relationships are suggestions and require review.")
+    return {
+        "entity": EntityOut.model_validate(entity).model_dump(),
+        "context": {"documents": context_documents, "instruments": [LegalInstrumentOut.model_validate(row).model_dump() for row in instruments]},
+        "evidence": [{"document_id": document.id, "title": document.title or document.original_filename, "excerpt": source.excerpt} for source, document in source_rows],
+        "relationships": {"incoming": [edge_view(edge) for edge in edges if edge.target_entity_id == entity.id], "outgoing": [edge_view(edge) for edge in edges if edge.source_entity_id == entity.id]},
+        "versions": {"family": family, "relations": [{"id": row.id, "relation": row.relation, "target_instrument_id": row.target_instrument_id, "target_provision": row.target_provision, "review_status": row.review_status, "confidence": row.confidence, "evidence_quote": row.evidence_quote} for row in relation_rows]},
+        "analysis": {"depth": depth, "neighbour_count": len(related_entities), "warnings": warning_list},
+    }
+
+
 @app.post("/api/v1/query/impact")
 def query_impact(payload: ImpactRequest, _: User = Depends(current_admin), db: Session = Depends(get_db)):
-    return analyze_impact(db, payload.subject, payload.knowledge_base_ids, payload.max_depth, payload.include_indirect)
+    return analyze_impact(db, payload.subject, payload.knowledge_base_ids, payload.max_depth, payload.include_indirect, payload.entity_id)
 
 
 @app.post("/api/v1/tokens", response_model=TokenCreated)
@@ -693,6 +1099,51 @@ def revoke_token(token_id: str, user: User = Depends(current_admin), db: Session
     token.revoked_at = datetime.utcnow()
     record_audit(db, "token.revoke", user.id, "token", token.id); db.commit()
     return {"status": "success"}
+
+
+@app.post("/api/v1/tokens/{token_id}/rotate", response_model=TokenCreated)
+def rotate_token(token_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Issue a replacement secret without ever recovering the old plaintext key.
+
+    Token hashes are intentionally one-way. Rotation preserves the original
+    scope and limits, revokes the old credential atomically, and returns the new
+    secret exactly once in the response.
+    """
+    previous = db.get(TokenKey, token_id)
+    if not previous:
+        raise HTTPException(404, "Token not found")
+    if previous.status == "revoked":
+        raise HTTPException(409, {"code": "TOKEN_ALREADY_REVOKED", "message": "A revoked token cannot be rotated.", "retryable": False})
+    requested_kb_ids = set(previous.allowed_knowledge_base_ids or [])
+    if requested_kb_ids:
+        active_kb_ids = {
+            row.id for row in db.query(KnowledgeBase.id).filter(
+                KnowledgeBase.id.in_(requested_kb_ids), KnowledgeBase.status == "active", KnowledgeBase.deleted_at.is_(None),
+            ).all()
+        }
+        if active_kb_ids != requested_kb_ids:
+            raise HTTPException(status_code=400, detail={
+                "code": "KNOWLEDGE_BASE_INACTIVE",
+                "message": "The token includes a Knowledge Base that is no longer active; activate it or create a new scope before rotating.",
+                "retryable": False,
+            })
+    secret = create_token_secret()
+    replacement = TokenKey(
+        name=previous.name, description=previous.description, token_prefix=secret[:16], token_hash=token_digest(secret),
+        allowed_knowledge_base_ids=list(previous.allowed_knowledge_base_ids or []), allowed_tools=list(previous.allowed_tools or []),
+        expires_at=previous.expires_at, requests_per_minute=previous.requests_per_minute,
+        max_concurrent_requests=previous.max_concurrent_requests, query_timeout_seconds=previous.query_timeout_seconds,
+        # Preserve a disabled credential's safety posture. Rotating a key must
+        # not be a way to bypass an administrator's Disable action.
+        status=previous.status,
+    )
+    previous.status, previous.revoked_at = "revoked", datetime.utcnow()
+    db.add(replacement); db.flush()
+    record_audit(db, "token.rotate", user.id, "token", replacement.id, {
+        "replaced_token_id": previous.id, "name": previous.name, "allowed_knowledge_base_count": len(requested_kb_ids),
+    })
+    db.commit(); db.refresh(replacement)
+    return {**TokenOut.model_validate(replacement).model_dump(), "token": secret}
 
 
 def authorized_query(payload: QueryRequest, token: TokenKey | None, db: Session):
@@ -778,6 +1229,15 @@ def graph_projection_status(_: User = Depends(current_admin), db: Session = Depe
     return {"status": "success", "events": {status: count for status, count in rows}}
 
 
+@app.post("/api/v1/system/observability/cleanup")
+def observability_cleanup(user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Run the bounded observability retention job on demand."""
+    result = prune_observability(db)
+    record_audit(db, "observability.cleanup", user.id, "system", "observability", result)
+    db.commit()
+    return {"status": "success", **result}
+
+
 @app.get("/api/v1/audit-logs")
 def list_audit_logs(limit: int = 100, _: User = Depends(current_admin), db: Session = Depends(get_db)):
     rows = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(min(max(limit, 1), 500)).all()
@@ -786,22 +1246,31 @@ def list_audit_logs(limit: int = 100, _: User = Depends(current_admin), db: Sess
 
 
 @app.get("/api/v1/logs/transactions")
-def list_request_transactions(limit: int = 100, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def list_request_transactions(limit: int = 100, cursor: str | None = None, from_ts: str | None = None,
+                              to_ts: str | None = None, method: str | None = None, status_code: int | None = None,
+                              paginate: bool = False, _: User = Depends(current_admin), db: Session = Depends(get_db)):
     """Return recent request transactions for the operator UI.
 
     Records contain only request metadata collected by the middleware. Request
     bodies, authorization headers, cookies, prompts, and token values are never
     persisted or returned here.
     """
-    rows = db.query(AuditLog).filter(AuditLog.action == REQUEST_TRANSACTION_ACTION).order_by(
-        AuditLog.created_at.desc()
-    ).limit(min(max(limit, 1), 500)).all()
+    bounded_limit = min(max(limit, 1), 200)
+    query = db.query(AuditLog).filter(AuditLog.action == REQUEST_TRANSACTION_ACTION).order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+    if (parsed := _parse_log_cursor(cursor)): query = query.filter(AuditLog.created_at < parsed)
+    if (parsed := _parse_log_cursor(from_ts)): query = query.filter(AuditLog.created_at >= parsed)
+    if (parsed := _parse_log_cursor(to_ts)): query = query.filter(AuditLog.created_at <= parsed)
+    if method: query = query.filter(AuditLog.metadata_json["method"].as_string() == method)
+    if status_code is not None: query = query.filter(AuditLog.metadata_json["status_code"].as_integer() == status_code)
+    rows = query.limit(bounded_limit + 1).all()
+    has_more = len(rows) > bounded_limit
+    rows = rows[:bounded_limit]
     request_ids = [(row.metadata_json or {}).get("request_id") or row.target_id for row in rows]
     execution_rows = db.query(AuditLog).filter(
         AuditLog.action == "retrieval.execution", AuditLog.target_id.in_([item for item in request_ids if item]),
     ).order_by(AuditLog.created_at.desc()).all() if request_ids else []
     executions = {row.target_id: row.metadata_json for row in execution_rows}
-    return [{
+    items = [{
         "id": row.id,
         "request_id": (row.metadata_json or {}).get("request_id") or row.target_id,
         "method": (row.metadata_json or {}).get("method", "UNKNOWN"),
@@ -812,6 +1281,10 @@ def list_request_transactions(limit: int = 100, _: User = Depends(current_admin)
         "retrieval": executions.get((row.metadata_json or {}).get("request_id") or row.target_id),
         "created_at": row.created_at,
     } for row in rows]
+    if paginate:
+        return {"items": items, "next_cursor": rows[-1].created_at.isoformat() if has_more and rows else None,
+                "has_more": has_more, "limit": bounded_limit}
+    return items
 
 
 def trace_spans(metadata: dict) -> list[dict]:
@@ -849,39 +1322,80 @@ def trace_summary(row: AuditLog) -> dict:
     }
 
 
+def trace_run_summary(row: TraceRun) -> dict:
+    """Serialize the normalized hot trace index without loading span payloads."""
+    plan = row.retrieval_plan or {}
+    return {
+        "trace_id": row.id,
+        "request_id": row.request_id or row.id,
+        "transport": row.transport,
+        "tool": row.tool,
+        "status": row.trace_status,
+        "intent": plan.get("intent"),
+        "knowledge_base_ids": row.knowledge_base_ids or [],
+        "source_count": row.source_count,
+        "duration_ms": row.duration_ms,
+        "request_summary": row.request_summary or {},
+        "response_summary": row.response_summary or {},
+        "created_at": row.created_at,
+    }
+
+
+def _parse_log_cursor(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        raise HTTPException(400, {"code": "LOG_CURSOR_INVALID", "message": "cursor must be an ISO timestamp", "retryable": False})
+
+
 @app.get("/api/v1/traces")
 def list_retrieval_traces(limit: int = 100, transport: str | None = None, status: str | None = None,
-                          search: str | None = None, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+                          tool: str | None = None, search: str | None = None, cursor: str | None = None,
+                          from_ts: str | None = None, to_ts: str | None = None, paginate: bool = False,
+                          _: User = Depends(current_admin), db: Session = Depends(get_db)):
     """List safe RetrievalExecutor trace summaries for the Trace Explorer."""
-    rows = db.query(AuditLog).filter(AuditLog.action == "retrieval.execution").order_by(
-        AuditLog.created_at.desc()
-    ).limit(min(max(limit, 1), 500)).all()
-    needle = (search or "").strip().lower()
-    summaries = []
-    for row in rows:
-        item = trace_summary(row)
-        if transport and item["transport"] != transport:
-            continue
-        if status and item["status"] != status:
-            continue
-        if needle and needle not in " ".join(str(value) for value in (item["trace_id"], item["tool"], item["intent"], item["transport"])).lower():
-            continue
-        summaries.append(item)
-    return summaries
+    bounded_limit = min(max(limit, 1), 200)
+    query = db.query(TraceRun).order_by(TraceRun.created_at.desc(), TraceRun.id.desc())
+    if transport: query = query.filter(TraceRun.transport == transport)
+    if status: query = query.filter(TraceRun.trace_status == status)
+    if tool: query = query.filter(TraceRun.tool == tool)
+    if (parsed := _parse_log_cursor(cursor)): query = query.filter(TraceRun.created_at < parsed)
+    if (parsed := _parse_log_cursor(from_ts)): query = query.filter(TraceRun.created_at >= parsed)
+    if (parsed := _parse_log_cursor(to_ts)): query = query.filter(TraceRun.created_at <= parsed)
+    needle = (search or "").strip()
+    if needle:
+        pattern = f"%{needle}%"
+        query = query.filter(or_(TraceRun.id.ilike(pattern), TraceRun.request_id.ilike(pattern),
+                                 TraceRun.transport.ilike(pattern), TraceRun.tool.ilike(pattern)))
+    rows = query.limit(bounded_limit + 1).all()
+    has_more = len(rows) > bounded_limit
+    rows = rows[:bounded_limit]
+    items = [trace_run_summary(row) for row in rows]
+    next_cursor = rows[-1].created_at.isoformat() if has_more and rows else None
+    if paginate:
+        return {"items": items, "next_cursor": next_cursor, "has_more": has_more, "limit": bounded_limit}
+    return items
 
 
 @app.get("/api/v1/traces/{trace_id}")
 def get_retrieval_trace(trace_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
     """Return a root span and safe child spans for one retrieval execution."""
-    row = db.query(AuditLog).filter(AuditLog.action == "retrieval.execution", AuditLog.target_id == trace_id).order_by(
-        AuditLog.created_at.desc()
-    ).first()
-    if not row:
-        raise HTTPException(404, "Trace not found")
-    metadata = row.metadata_json or {}
-    summary = trace_summary(row)
-    return {**summary, "root_span": {"span_id": "root", "name": metadata.get("tool") or "knowledge query",
-                                      "status": summary["status"], "duration_ms": summary["duration_ms"]},
+    run = db.get(TraceRun, trace_id)
+    if run:
+        spans = db.query(TraceSpan).filter(TraceSpan.trace_id == trace_id).order_by(TraceSpan.offset_ms, TraceSpan.created_at).all()
+        summary = trace_run_summary(run)
+        return {**summary, "root_span": {"span_id": "root", "name": run.tool or "knowledge query",
+                                          "status": run.trace_status, "duration_ms": run.duration_ms},
+                "retrieval_plan": run.retrieval_plan, "spans": [{"span_id": span.span_id, "parent_span_id": span.parent_span_id,
+                    "channel": span.channel, "system": span.system, "status": span.status, "result_count": span.result_count,
+                    "duration_ms": span.duration_ms, "offset_ms": span.offset_ms, "reason_code": span.reason_code,
+                    "detail": span.detail, "input_summary": span.input_summary, "output_summary": span.output_summary} for span in spans]}
+    row = db.query(AuditLog).filter(AuditLog.action == "retrieval.execution", AuditLog.target_id == trace_id).order_by(AuditLog.created_at.desc()).first()
+    if not row: raise HTTPException(404, "Trace not found")
+    metadata = row.metadata_json or {}; summary = trace_summary(row)
+    return {**summary, "root_span": {"span_id": "root", "name": metadata.get("tool") or "knowledge query", "status": summary["status"], "duration_ms": summary["duration_ms"]},
             "retrieval_plan": metadata.get("retrieval_plan"), "spans": trace_spans(metadata)}
 
 
@@ -905,7 +1419,24 @@ MCP_TOOLS = [
     {"name": "analyze_relationships", "description": "Analyze entity relationships", "inputSchema": {"type": "object", "properties": {"subjects": {"type": "array"}, "question": {"type": "string"}}, "required": ["subjects", "question"]}},
     {"name": "analyze_impact", "description": "Analyze direct and indirect impact", "inputSchema": ImpactRequest.model_json_schema()},
     {"name": "get_sources", "description": "Retrieve sources for a result", "inputSchema": {"type": "object", "properties": {"result_id": {"type": "string"}}, "required": ["result_id"]}},
+    {"name": "resolve_legal_context", "description": "Resolve the in-force legal instruments and provisions relevant to a query within this MCP key's scope", "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 10000}, "as_of_date": {"type": "string", "format": "date"}, "include_historical": {"type": "boolean"}}, "required": ["query"]}},
+    {"name": "get_legal_instrument", "description": "Get one legal instrument, its family and reviewed cross-document relations", "inputSchema": {"type": "object", "properties": {"instrument_id": {"type": "string"}}, "required": ["instrument_id"]}},
+    {"name": "get_provision_history", "description": "List document versions containing a legal provision, scoped to the MCP key", "inputSchema": {"type": "object", "properties": {"instrument_id": {"type": "string"}, "provision_number": {"type": "string", "maxLength": 120}}, "required": ["instrument_id", "provision_number"]}},
 ]
+
+
+def _mcp_scoped_instrument(db: Session, token: TokenKey, instrument_id: str, effective_kb_ids: list[str]) -> LegalInstrument:
+    instrument = db.get(LegalInstrument, instrument_id)
+    if not instrument or instrument.knowledge_base_id not in set(effective_kb_ids):
+        raise HTTPException(404, {"code": "LEGAL_INSTRUMENT_NOT_FOUND", "message": "Legal instrument is not available in this MCP scope.", "retryable": False})
+    return instrument
+
+
+def _legal_relation_payload(db: Session, relation: LegalInstrumentRelation) -> dict[str, Any]:
+    return {"id": relation.id, "relation": relation.relation, "source_instrument_id": relation.source_instrument_id,
+            "target_instrument_id": relation.target_instrument_id, "target_text": relation.target_text,
+            "target_provision": relation.target_provision, "evidence_quote": relation.evidence_quote,
+            "confidence": relation.confidence, "origin": relation.origin, "review_status": relation.review_status}
 
 
 def mcp_error(request_id: Any, code: str, message: str, *, retryable: bool = False):
@@ -925,6 +1456,10 @@ def mcp_audit_arguments(name: str, arguments: dict[str, Any], effective_kb_ids: 
         item["query_truncated"] = len(value) > 2000
     if name == "analyze_relationships":
         item["subjects"] = [str(subject)[:500] for subject in arguments.get("subjects", [])[:20]]
+    if name in {"get_legal_instrument", "get_provision_history"}:
+        item["instrument_id"] = str(arguments.get("instrument_id", ""))[:100]
+    if name == "get_provision_history":
+        item["provision_number"] = str(arguments.get("provision_number", ""))[:120]
     return item
 
 
@@ -994,6 +1529,56 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
                     active_mcp_knowledge_base_ids(db, source_kb_ids)
                 result = {"sources": saved.result_json.get("sources", [])} if saved else {"sources": []}
                 result["metadata"] = {"retrieval_trace": [{"channel": "result_sources", "system": "PostgreSQL query result store", "status": "used", "result_count": len(result["sources"]), "detail": "stored cited sources"}]}
+            elif name == "resolve_legal_context":
+                query = str(arguments.get("query", "")).strip()
+                if not query:
+                    raise HTTPException(422, {"code": "LEGAL_QUERY_REQUIRED", "message": "query is required", "retryable": False})
+                filters = {"as_of_date": arguments.get("as_of_date"), "include_historical": bool(arguments.get("include_historical", False))}
+                payload = QueryRequest.model_validate({"query": query, "knowledge_base_ids": effective_kb_ids,
+                                                       "filters": filters, "max_sources": 1})
+                trace: list[dict] = []
+                decision = build_retrieval_plan(db, query, effective_kb_ids, 1, payload.filters, trace)
+                legal_context = decision.plan.legal_context
+                result = {"status": "success", "text": "Legal context resolved from the MCP key's active Knowledge Base scope.",
+                          "knowledge_base_ids": effective_kb_ids,
+                          "legal_context": legal_context.model_dump(mode="json") if legal_context else None,
+                          "retrieval_plan": decision.plan.model_dump(mode="json"),
+                          "metadata": {"retrieval_plan": decision.plan.model_dump(mode="json"), "retrieval_trace": trace,
+                                       "source_of_truth": "PostgreSQL legal registry"}}
+            elif name == "get_legal_instrument":
+                instrument = _mcp_scoped_instrument(db, token, str(arguments.get("instrument_id", "")), effective_kb_ids)
+                family = db.query(LegalInstrument).filter_by(knowledge_base_id=instrument.knowledge_base_id, family_id=instrument.family_id).order_by(LegalInstrument.effective_from).all() if instrument.family_id else [instrument]
+                outgoing = db.query(LegalInstrumentRelation).filter_by(source_instrument_id=instrument.id).all()
+                incoming = db.query(LegalInstrumentRelation).filter_by(target_instrument_id=instrument.id).all()
+                result = {"status": "success", "text": "Legal instrument and reviewed provenance loaded.",
+                          "instrument": LegalInstrumentOut.model_validate(instrument).model_dump(),
+                          "family": [LegalInstrumentOut.model_validate(row).model_dump() for row in family],
+                          "outgoing_relations": [_legal_relation_payload(db, row) for row in outgoing],
+                          "incoming_relations": [_legal_relation_payload(db, row) for row in incoming],
+                          "knowledge_base_ids": [instrument.knowledge_base_id],
+                          "metadata": {"retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": 1 + len(outgoing) + len(incoming), "detail": "scope-checked instrument provenance"}]}}
+            elif name == "get_provision_history":
+                instrument = _mcp_scoped_instrument(db, token, str(arguments.get("instrument_id", "")), effective_kb_ids)
+                number = str(arguments.get("provision_number", "")).strip()
+                if not number:
+                    raise HTTPException(422, {"code": "PROVISION_NUMBER_REQUIRED", "message": "provision_number is required", "retryable": False})
+                family_rows = db.query(LegalInstrument).filter_by(knowledge_base_id=instrument.knowledge_base_id, family_id=instrument.family_id).order_by(LegalInstrument.effective_from).all() if instrument.family_id else [instrument]
+                document_ids = [row.document_id for row in family_rows]
+                entities = db.query(Entity).filter(Entity.knowledge_base_id == instrument.knowledge_base_id, Entity.entity_type == "Provision", Entity.deleted_at.is_(None)).all()
+                family_doc_ids = set(document_ids)
+                matched_entities = []
+                for row in entities:
+                    attrs = row.attributes or {}
+                    if not any(f":provision:{doc_id}:" in row.identity_key for doc_id in family_doc_ids):
+                        continue
+                    if not provision_number_matches(number, str(attrs.get("provision_number") or "")):
+                        continue
+                    matched_entities.append(EntityOut.model_validate(row).model_dump())
+                result = {"status": "success", "text": "Provision history is scoped to one legal instrument family.",
+                          "instrument_id": instrument.id, "provision_number": number,
+                          "versions": [LegalInstrumentOut.model_validate(row).model_dump() for row in family_rows],
+                          "provisions": matched_entities, "knowledge_base_ids": [instrument.knowledge_base_id],
+                          "metadata": {"retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": len(family_rows) + len(matched_entities), "detail": "document-scoped provision identity"}]}}
             else: return mcp_error(request_id, "MCP_TOOL_NOT_FOUND", "Tool not found")
             route = result.get("metadata", {}).get("retrieval_trace", [])
             record_retrieval_execution(db, request.state.request_id, result, transport="mcp", tool=name,
@@ -1002,7 +1587,7 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
                                   retrieval_plan=result.get("metadata", {}).get("retrieval_plan"),
                                   effective_kb_ids=effective_kb_ids)
             result.setdefault("request_id", request_id)
-            result = {"content": [{"type": "text", "text": result.get("answer", "Structured knowledge result available.")}], "structuredContent": result}
+            result = {"content": [{"type": "text", "text": result.get("answer") or result.get("text", "Structured knowledge result available.")}], "structuredContent": result}
         else: return mcp_error(request_id, "MCP_METHOD_NOT_FOUND", "Method not found")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except HTTPException as exc:

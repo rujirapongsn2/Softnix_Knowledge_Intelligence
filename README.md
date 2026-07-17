@@ -13,7 +13,7 @@ Open the web UI at the port configured by `WEB_PORT` (default `http://localhost:
 
 For development, set `OPENROUTER_API_KEY` in `.env`. Docker Compose starts LightRAG with OpenRouter as its initial LLM and embedding provider; verify its credentials after login through `POST /api/v1/system/test-openrouter`.
 
-See [deployment](docs/DEPLOYMENT.md), [API](docs/API.md), [MCP](docs/MCP.md), [security](docs/SECURITY.md), and [architecture](docs/ARCHITECTURE.md).
+See [deployment](docs/DEPLOYMENT.md), [API](docs/API.md), [MCP](docs/MCP.md), [security](docs/SECURITY.md), [architecture](docs/ARCHITECTURE.md), and the [high-level data flow](docs/DATA_FLOW.md).
 
 ## Data flow
 
@@ -74,6 +74,10 @@ flowchart LR
 6. **Retrieval and answer** — the planner runs permitted vector, full-text, graph, and LightRAG retrieval in parallel. Results are fused and mapped to citations; OpenRouter receives only scope-filtered evidence and generates the final answer.
 7. **Response** — MCP returns a text summary, structured result, citations, and a request ID for tracing and audit.
 
+Agent-facing MCP contracts are bounded and typed: `tools/list` exposes JSON schemas, token scope is authoritative (client KB arguments cannot broaden it), and legal agents can use `resolve_legal_context`, `get_legal_instrument`, and `get_provision_history`. These tools are read-only, return provenance/review status and safe retrieval traces, and never promote unresolved legal relations to verified facts.
+
+Observability uses normalized `trace_runs` and `trace_spans` as the hot Trace Explorer index while retaining redacted `AuditLog` records for compatibility and compliance. Trace APIs support cursor pagination and time filters; the worker prunes high-volume request/retrieval/MCP events according to the configured retention windows.
+
 Each Knowledge Base exposes a versioned retrieval policy at `PATCH /api/v1/knowledge-bases/{id}/retrieval-config`. Rule-first planning selects an intent and only an ambiguous query uses the constrained OpenRouter planner fallback. The response metadata and MCP activity view expose the selected plan and actual channel trace; planner logs never contain bearer tokens or request headers.
 
 ### MarkItDown extraction
@@ -109,3 +113,17 @@ The upload form includes a **Document type** choice. Select **Legal document**, 
 Explore Graph opens **Verified legal structure** by default. It separates deterministic document structure from **Suggested relationships** such as `ISSUED_UNDER` and `IMPLEMENTS`. Suggestions are created only from explicit evidence, remain unavailable to impact analysis until an administrator approves them, and retain their excerpt, source document, confidence, reviewer, and audit trail. Use `POST /api/v1/knowledge-bases/{kb_id}/legal-graph/rebuild` to queue an idempotent rebuild; it replaces only system-generated legal graph data and preserves manual graph work.
 
 It is an information-extraction aid, not legal advice; reviewers must verify every extracted item against the source document. Scanned PDFs still require OCR before legal extraction can run.
+
+A legal document's chunks are split on มาตรา/ข้อ/หมวด headings rather than fixed character windows, so each chunk carries its own section identity (`section_kind`, `section_number`, `section_label`); a cross-reference such as "ให้เป็นไปตามมาตรา 15" mid-sentence never starts a spurious new section.
+
+### Legal registry: temporal and authority-aware retrieval
+
+Beyond the graph, every legal/regulation/contract document gets a **legal registry** entry: a rule-based kind (พระราชบัญญัติ, กฎกระทรวง, ประกาศ, ระเบียบ, ...) with an authority level, a family grouping it with its amendments, effective_from/effective_to, and a status (`in_force`, `amended`, `superseded`, `repealed`, `not_yet_effective`, `unknown`). The status is resolved deterministically — no LLM call — from reviewed AMENDS/REPEALS/SUPERSEDES relationships; an administrator's manual override at `PATCH /api/v1/legal-instruments/{id}` always wins and is never recomputed.
+
+Queries against a Knowledge Base with a legal registry get:
+
+- **Version resolution** — `filters.as_of_date` (default today) selects the instrument version that was in force at that date; `filters.include_historical` disables exclusion to compare every version.
+- **Weighted ranking** — fused evidence is boosted by authority level, legal status, and recency, tunable per Knowledge Base via `PATCH /knowledge-bases/{id}/retrieval-config` (`authority_weight`, `status_weight`, `recency_weight`, `legal_awareness`, `exclude_invalid`).
+- **Conflict detection** — duplicate provisions across versions collapse to the current one, and citations returned to the client and the LLM carry the resolved status, authority level, version label, and effective dates so an answer never silently mixes a repealed provision with its replacement.
+
+A Knowledge Base with no legal documents is completely unaffected: the resolver finds nothing to match and every weight multiplies against an empty registry.

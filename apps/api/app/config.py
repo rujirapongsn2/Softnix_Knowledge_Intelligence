@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     default_top_k: int = 12
     max_graph_depth: int = 3
     log_query_text: bool = True
+    observability_retention_days: int = 30
+    audit_retention_days: int = 180
     lightrag_base_url: str = ""
     lightrag_api_key: str = ""
     lightrag_timeout_seconds: int = 120

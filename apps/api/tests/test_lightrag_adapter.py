@@ -38,6 +38,54 @@ def test_lightrag_adapter_reads_processing_track_status():
     assert engine.track_status("track-1") == "processed"
 
 
+def test_lightrag_adapter_replaces_failed_source_before_retrying():
+    calls = []
+    failed = {"id": "remote-1", "status": "failed", "file_path": "softnix-kb=kb-1__doc=doc-1__Architecture"}
+
+    def handler(request: httpx.Request):
+        calls.append((request.method, request.url.path))
+        if request.method == "POST" and request.url.path == "/documents/text":
+            if calls.count(("POST", "/documents/text")) == 1:
+                return httpx.Response(409, json={"detail": "already exists"})
+            return httpx.Response(202, json={"track_id": "track-2"})
+        if request.method == "GET" and request.url.path == "/documents":
+            # The source disappears after the delete request.
+            return httpx.Response(200, json={"statuses": {"failed": [] if ("DELETE", "/documents/delete_document") in calls else [failed]}})
+        if request.method == "DELETE" and request.url.path == "/documents/delete_document":
+            return httpx.Response(200, json={"status": "deletion_started"})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url.path}")
+
+    engine = LightRAGRetrievalEngine(base_url="http://lightrag.test", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert engine.ingest("doc-1", "kb-1", "evidence", "Architecture") == "track-2"
+    assert calls == [
+        ("POST", "/documents/text"), ("GET", "/documents"),
+        ("DELETE", "/documents/delete_document"), ("GET", "/documents"),
+        ("POST", "/documents/text"),
+    ]
+
+
+def test_lightrag_adapter_reuses_processed_source_after_worker_retry():
+    calls = []
+    processed = {
+        "id": "remote-1",
+        "status": "processed",
+        "track_id": "track-existing",
+        "file_path": "softnix-kb=kb-1__doc=doc-1__Architecture",
+    }
+
+    def handler(request: httpx.Request):
+        calls.append((request.method, request.url.path))
+        if request.method == "POST" and request.url.path == "/documents/text":
+            return httpx.Response(409, json={"detail": "already exists"})
+        if request.method == "GET" and request.url.path == "/documents":
+            return httpx.Response(200, json={"statuses": {"processed": [processed]}})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url.path}")
+
+    engine = LightRAGRetrievalEngine(base_url="http://lightrag.test", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert engine.ingest("doc-1", "kb-1", "evidence", "Architecture") == "track-existing"
+    assert calls == [("POST", "/documents/text"), ("GET", "/documents")]
+
+
 def test_lightrag_adapter_requires_single_workspace():
     engine = LightRAGRetrievalEngine(base_url="http://lightrag.test", client=httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200))))
     try:

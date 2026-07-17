@@ -1,6 +1,7 @@
 """Engine-neutral retrieval contracts; LightRAG REST details are isolated here."""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -100,8 +101,62 @@ class LightRAGRetrievalEngine(RetrievalEngine):
         # basename in references, so keep platform identifiers in that basename.
         source_label = self._source_label(knowledge_base_id, document_id, title)
         payload = {"text": protect_document_text(text), "file_source": f"skip/{knowledge_base_id}/{source_label}"}
-        data = self._request("POST", "/documents/text", json=payload)
+        try:
+            data = self._request("POST", "/documents/text", json=payload)
+        except RuntimeError as exc:
+            if str(exc) != "RETRIEVAL_ENGINE_BUSY":
+                raise
+            # LightRAG returns 409 for both pipeline contention and a source
+            # that already exists. A failed source from an earlier attempt is
+            # safe to replace, while pending/processing sources must remain
+            # protected from duplicate ingestion.
+            existing = self.find_document(document_id, knowledge_base_id)
+            existing_status = str(existing.get("status") or "").lower() if existing else ""
+            if existing_status == "processed":
+                # A previous request may have completed in LightRAG after the
+                # platform worker lost its connection or failed a later stage.
+                # Reuse the canonical track instead of treating the source as
+                # contention; this makes Process again idempotent and avoids
+                # duplicating the source in the remote index.
+                return existing.get("track_id") or existing.get("id")
+            if not existing or existing_status != "failed":
+                raise
+            self.delete_remote_document(existing["id"])
+            data = self._request("POST", "/documents/text", json=payload)
         return data.get("track_id") or data.get("id")
+
+    def find_document(self, document_id: str, knowledge_base_id: str) -> dict[str, Any] | None:
+        """Find this platform document in LightRAG's source registry."""
+        data = self._request("GET", "/documents")
+        statuses = data.get("statuses", {}) if isinstance(data, dict) else {}
+        for rows in statuses.values():
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                identity = self._decode_source_label(str(row.get("file_path") or ""))
+                if identity and identity[0] == knowledge_base_id and identity[1] == document_id:
+                    return row
+        return None
+
+    def delete_remote_document(self, remote_document_id: str) -> None:
+        """Delete one failed LightRAG source and wait until it is gone."""
+        result = self._request("DELETE", "/documents/delete_document", json={
+            "doc_ids": [remote_document_id], "delete_file": False, "delete_llm_cache": True,
+        })
+        if result.get("status") == "busy":
+            raise RuntimeError("RETRIEVAL_ENGINE_BUSY")
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            data = self._request("GET", "/documents")
+            statuses = data.get("statuses", {}) if isinstance(data, dict) else {}
+            if not any(
+                isinstance(row, dict) and row.get("id") == remote_document_id
+                for rows in statuses.values() if isinstance(rows, list)
+                for row in rows
+            ):
+                return
+            time.sleep(0.25)
+        raise RuntimeError("RETRIEVAL_ENGINE_TIMEOUT")
 
     def ingest_document(self, document_id: str, text: str) -> None:
         self.ingest(document_id, "default", text, document_id)

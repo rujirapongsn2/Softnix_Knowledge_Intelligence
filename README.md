@@ -55,6 +55,15 @@ Web/API รองรับ PDF, DOCX, PPTX, XLSX/XLS, TXT, Markdown, HTML, CSV �
 
 เอกสารสามารถระบุ `published_at` (`YYYY-MM-DD`) ตอนอัปโหลดหรือแก้ไขภายหลังได้ วันที่นี้ใช้กรองข่าวตามเดือน/ปี และเอกสารที่ไม่มีวันที่จะไม่ผ่าน query ที่มี date filter
 
+### OCR สำหรับ PDF สแกน
+
+ระบบตรวจ text layer โดยแปลงด้วย MarkItDown (fallback เป็น pypdf) แล้วนับจำนวนตัวอักษรจริง หากได้น้อยกว่า 20 ตัวจะถือว่าเป็น PDF สแกนที่ไม่มี text layer
+
+- **ไม่ได้ตั้งค่า `EXT_OCR_KEY`**: เอกสารค้างที่สถานะ `ocr_required` ถาวร (ไม่ chunk/embed/index ต่อ) จนกว่าจะอัปโหลดใหม่หรือแอดมินตั้งค่า OCR แล้ว reindex
+- **ตั้งค่า `EXT_OCR_KEY` แล้ว**: worker ส่งไฟล์ไปยัง external OCR service (Softnix OCR v3) ผ่าน `EXT_OCR_BASE_URL`, poll สถานะทุก `EXT_OCR_POLL_INTERVAL_SECONDS` วินาที (default 2s) จนกว่าจะเสร็จหรือครบ `EXT_OCR_PROCESSING_TIMEOUT_SECONDS` (default 300s) แล้วนำ Markdown ที่ได้เข้า pipeline ปกติ (chunk → embed → index)
+- ความล้มเหลวชั่วคราวของ external OCR (`EXTERNAL_OCR_UNAVAILABLE`, `EXTERNAL_OCR_TIMEOUT`) จะ retry อัตโนมัติสูงสุด 3 ครั้งตาม backoff ของ processing job
+- ตัวแปรที่เกี่ยวข้อง: `EXT_OCR_KEY`, `EXT_OCR_BASE_URL`, `EXT_OCR_ENGINE` (default `tesseract`), `EXT_OCR_IMAGE_SIZE`, `EXT_OCR_VERIFY_SSL`, `EXT_OCR_REQUEST_TIMEOUT_SECONDS`, `EXT_OCR_PROCESSING_TIMEOUT_SECONDS`, `EXT_OCR_POLL_INTERVAL_SECONDS` — ดูค่า default ที่ `apps/api/app/config.py` และตั้งค่าใน `.env` ก่อนใช้งานจริง (ค่า default ของ `EXT_OCR_BASE_URL` เป็น endpoint ตัวอย่างเท่านั้น และ `EXT_OCR_VERIFY_SSL=false` โดย default ควรพิจารณาเปิดใน production)
+
 ## Auto Retrieval Strategy
 
 Planner ใช้กฎ deterministic ก่อนเสมอ และใช้ LLM fallback เฉพาะคำถามที่ไม่เข้ากฎ โดยส่งแผนและ trace กลับใน `metadata`

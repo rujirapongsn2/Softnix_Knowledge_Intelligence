@@ -4,7 +4,20 @@ server {
   client_max_body_size ${MAX_FILE_SIZE_MB}m;
 
   location / {
+    # Always revalidate the app shell so a new deployment is visible without
+    # requiring users to clear browser or CDN caches manually.
+    add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
     try_files $uri /index.html;
+  }
+
+  location = /index.html {
+    add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
+  }
+
+  location /assets/ {
+    # Vite emits content-hashed filenames, so these files are safe to cache.
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    try_files $uri =404;
   }
 
   location /api/ {

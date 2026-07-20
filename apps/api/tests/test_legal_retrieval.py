@@ -20,6 +20,7 @@ from app.main import app
 from app.models import Document, DocumentChunk, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation
 from app.planner import LegalContext, RetrievalPlan, RetrievalPolicy
 from app.retrieval import RetrievalEvidence
+from app.schemas import QueryFilters
 
 Base.metadata.create_all(engine)
 
@@ -93,6 +94,46 @@ def test_resolve_legal_context_selects_current_version_by_as_of_date():
         context_past = resolve_legal_context(db, "พระราชบัญญัติทดสอบ", [kb.id], _plan(as_of_date=date(2010, 1, 1)), RetrievalPolicy())
         assert base_doc.id in context_past.current_version_ids
         assert amend_doc.id not in context_past.current_version_ids
+
+
+def test_resolve_legal_context_prefers_publisher_latest_role_over_another_valid_consolidation():
+    with SessionLocal() as db:
+        kb = KnowledgeBase(code="resolve-latest-role", name="Resolve latest role")
+        db.add(kb); db.flush()
+        family = LegalFamily(knowledge_base_id=kb.id, base_title="ประมวลกฎหมายทดสอบ", normalized_key="ประมวลกฎหมายทดสอบ")
+        db.add(family); db.flush()
+        old_doc = Document(knowledge_base_id=kb.id, original_filename="old.txt", stored_filename="old.txt", storage_path="/tmp/old.txt",
+                           mime_type="text/plain", file_size=1, checksum_sha256="ra" * 32, title="ฉบับปรับปรุง", document_type="legal", status="completed")
+        latest_doc = Document(knowledge_base_id=kb.id, original_filename="latest.txt", stored_filename="latest.txt", storage_path="/tmp/latest.txt",
+                              mime_type="text/plain", file_size=1, checksum_sha256="rb" * 32, title="ฉบับปรับปรุงล่าสุด", document_type="legal", status="completed")
+        db.add_all([old_doc, latest_doc]); db.flush()
+        db.add_all([
+            LegalInstrument(document_id=old_doc.id, knowledge_base_id=kb.id, family_id=family.id, official_title=old_doc.title,
+                            document_class="consolidated", version_role="consolidated", effective_from=date(2010, 1, 1), status="in_force"),
+            LegalInstrument(document_id=latest_doc.id, knowledge_base_id=kb.id, family_id=family.id, official_title=latest_doc.title,
+                            document_class="consolidated", version_role="latest_consolidated", effective_from=date(2019, 1, 1), status="in_force"),
+        ])
+        db.commit()
+        context = resolve_legal_context(db, "ประมวลกฎหมายทดสอบ มาตรา 5", [kb.id], _plan(), RetrievalPolicy())
+        assert context.preferred_document_ids == [latest_doc.id]
+
+
+def test_direct_current_shortcuts_do_not_bypass_explicit_filters_or_a_historical_year():
+    assert services.allows_default_current_direct_path("มาตรา 104") is True
+    assert services.allows_default_current_direct_path("มาตรา 104", QueryFilters(as_of_date=date(2010, 1, 1))) is False
+    assert services.allows_default_current_direct_path("มาตรา 104", QueryFilters(include_historical=True)) is False
+    assert services.allows_default_current_direct_path("มาตรา 104 พ.ศ. 2543") is False
+
+
+def test_court_decision_scope_check_respects_available_corpus_material():
+    with SessionLocal() as db:
+        kb = KnowledgeBase(code="court-evidence", name="Court evidence")
+        db.add(kb); db.flush()
+        db.add(Document(knowledge_base_id=kb.id, original_filename="judgment.txt", stored_filename="judgment.txt",
+                        storage_path="/tmp/judgment.txt", mime_type="text/plain", file_size=1,
+                        checksum_sha256="court" * 16, title="คำพิพากษาศาลฎีกา", document_type="general", status="completed"))
+        db.commit()
+        assert services.has_court_decision_evidence(db, [kb.id]) is True
 
 
 def test_resolve_legal_context_exclusion_sweep_hides_repealed_instrument_without_explicit_mention():
@@ -585,3 +626,275 @@ def test_mcp_search_knowledge_tool_schema_exposes_legal_filters():
     filters_schema = tool["inputSchema"]["$defs"]["QueryFilters"]["properties"]
     assert "as_of_date" in filters_schema
     assert "include_historical" in filters_schema
+
+
+# --- provenance reconciliation and per-provision coverage ------------------
+
+def _provenance_kb(db, code):
+    kb = KnowledgeBase(code=code, name=code)
+    db.add(kb); db.flush()
+    family = LegalFamily(knowledge_base_id=kb.id, base_title="ประมวลกฎหมายที่ดิน", normalized_key="ประมวลกฎหมายที่ดิน")
+    db.add(family); db.flush()
+    current_doc = Document(knowledge_base_id=kb.id, original_filename="latest.txt", stored_filename="latest.txt",
+                           storage_path="/tmp/latest.txt", mime_type="text/plain", file_size=1,
+                           checksum_sha256="a1" * 32, title="ฉบับปรับปรุงล่าสุด", document_type="legal", status="completed")
+    db.add(current_doc); db.flush()
+    current = LegalInstrument(document_id=current_doc.id, knowledge_base_id=kb.id, family_id=family.id,
+                              official_title=current_doc.title, document_class="consolidated", status="in_force",
+                              version_role="latest_consolidated", effective_from=date(2019, 11, 21))
+    db.add(current); db.flush()
+    return kb, family, current
+
+
+def _amending(db, kb, family, *, title, when):
+    doc = Document(knowledge_base_id=kb.id, original_filename=f"{title}.txt", stored_filename=f"{title}.txt",
+                   storage_path=f"/tmp/{title}.txt", mime_type="text/plain", file_size=1,
+                   checksum_sha256=__import__("hashlib").sha256(title.encode()).hexdigest(), title=title,
+                   document_type="legal", status="completed")
+    db.add(doc); db.flush()
+    instrument = LegalInstrument(document_id=doc.id, knowledge_base_id=kb.id, family_id=family.id,
+                                 official_title=title, document_class="amendment", status="in_force", version_date=when)
+    db.add(instrument); db.flush()
+    return instrument
+
+
+def test_provenance_leads_with_the_repeal_and_flags_a_post_repeal_amend_as_another_work():
+    with SessionLocal() as db:
+        kb, family, current = _provenance_kb(db, "prov-reconcile")
+        repeal = _amending(db, kb, family, title="พระราชบัญญัติแก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน (ฉบับที่ 3) พ.ศ. 2526", when=date(1983, 6, 1))
+        amend = _amending(db, kb, family, title="พระราชบัญญัติแก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน (ฉบับที่ 9) พ.ศ. 2543", when=date(2000, 5, 1))
+        db.add_all([
+            LegalInstrumentRelation(knowledge_base_id=kb.id, source_instrument_id=repeal.id, target_instrument_id=current.id,
+                                    relation="REPEALS", target_provision="7", review_status="verified"),
+            LegalInstrumentRelation(knowledge_base_id=kb.id, source_instrument_id=amend.id, target_instrument_id=current.id,
+                                    relation="AMENDS", target_provision="7", review_status="verified"),
+        ])
+        db.commit()
+        result = services.build_legal_provenance_result(db, "มาตรา 7 มีสถานะอย่างไร และถูกยกเลิกโดยกฎหมายใด", [kb.id])
+        answer = result["answer"]
+        assert "มาตรา 7 ยกเลิกโดย" in answer
+        assert "(ฉบับที่ 3) พ.ศ. 2526" in answer
+        # The impossible "amended after repeal" edge is flagged, not emitted as a
+        # contradictory peer statement.
+        assert "หมายเหตุ" in answer and "คนละฉบับ" in answer
+        assert "มาตรา 7 แก้ไขเพิ่มเติมโดย" not in answer
+
+
+def test_provenance_reports_each_asked_provision_including_one_without_an_edge():
+    with SessionLocal() as db:
+        kb, family, current = _provenance_kb(db, "prov-per-provision")
+        amend = _amending(db, kb, family, title="พระราชบัญญัติแก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน (ฉบับที่ 8) พ.ศ. 2542", when=date(1999, 5, 1))
+        db.add(LegalInstrumentRelation(knowledge_base_id=kb.id, source_instrument_id=amend.id, target_instrument_id=current.id,
+                                       relation="AMENDS", target_provision="96 ทวิ", review_status="verified"))
+        db.commit()
+        result = services.build_legal_provenance_result(db, "มาตรา 96 ทวิ และมาตรา 96 ตรี เพิ่มโดยกฎหมายฉบับใด", [kb.id])
+        answer = result["answer"]
+        assert "มาตรา 96 ทวิ แก้ไขเพิ่มเติมโดย" in answer
+        assert "(ฉบับที่ 8) พ.ศ. 2542" in answer
+        assert "ไม่พบความสัมพันธ์การแก้ไขหรือยกเลิกที่ตรวจสอบแล้วสำหรับมาตรา 96 ตรี" in answer
+
+
+# --- trace-explorer observability fields on deterministic legal shortcuts ---
+
+def test_legal_provenance_result_populates_trace_preview_fields():
+    with SessionLocal() as db:
+        kb, family, current = _provenance_kb(db, "prov-trace-preview")
+        amend = _amending(db, kb, family, title="พระราชบัญญัติแก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน (ฉบับที่ 8) พ.ศ. 2542", when=date(1999, 5, 1))
+        db.add(LegalInstrumentRelation(knowledge_base_id=kb.id, source_instrument_id=amend.id, target_instrument_id=current.id,
+                                       relation="AMENDS", target_provision="96 ทวิ", review_status="verified"))
+        db.commit()
+        query = "มาตรา 96 ทวิ เพิ่มโดยกฎหมายฉบับใด"
+        result = services.build_legal_provenance_result(db, query, [kb.id])
+        metadata = result["metadata"]
+        # These are the fields the Trace Explorer reads (request_summary /
+        # response_summary in record_retrieval_execution); without them the UI
+        # falls back to "Query preview unavailable" / "No answer preview" even
+        # though the shortcut answered successfully.
+        assert metadata["query_preview"] == query
+        assert metadata["query_length"] == len(query)
+        assert metadata["query_sha256"]
+        assert metadata["answer_preview"].startswith("มาตรา 96 ทวิ แก้ไขเพิ่มเติมโดย")
+        assert metadata["citation_ids"] == [source["citation_id"] for source in result["sources"]]
+
+
+def test_persist_legal_clause_result_populates_trace_preview_fields():
+    with SessionLocal() as db:
+        kb, family, current = _provenance_kb(db, "clause-trace-preview")
+        result = services.build_default_current_legal_result(db, "หลักเกณฑ์ค่าธรรมเนียมปัจจุบัน", [kb.id])
+        metadata = result["metadata"]
+        assert metadata["query_preview"] == "หลักเกณฑ์ค่าธรรมเนียมปัจจุบัน"
+        assert metadata["query_sha256"]
+        assert "citation_ids" in metadata
+
+
+def test_persist_legal_clause_result_does_not_attribute_a_different_familys_amendment():
+    with SessionLocal() as db:
+        kb = KnowledgeBase(code="cross-family-attribution", name="Cross family attribution")
+        db.add(kb); db.flush()
+
+        # Family A: the instrument actually being answered about. Its มาตรา 104
+        # has no amendment of its own.
+        family_a = LegalFamily(knowledge_base_id=kb.id, base_title="กฎหมาย ก", normalized_key="กฎหมาย ก")
+        db.add(family_a); db.flush()
+        doc_a = Document(knowledge_base_id=kb.id, original_filename="a.txt", stored_filename="a.txt",
+                         storage_path="/tmp/a.txt", mime_type="text/plain", file_size=1,
+                         checksum_sha256="fa" * 32, title="กฎหมาย ก ฉบับปรับปรุงล่าสุด", document_type="legal", status="completed")
+        db.add(doc_a); db.flush()
+        instrument_a = LegalInstrument(document_id=doc_a.id, knowledge_base_id=kb.id, family_id=family_a.id,
+                                       official_title=doc_a.title, document_class="consolidated",
+                                       version_role="latest_consolidated", status="in_force")
+        db.add(instrument_a); db.flush()
+        chunk_a = DocumentChunk(document_id=doc_a.id, knowledge_base_id=kb.id, chunk_index=1,
+                                content="มาตรา ๑๐๔ ของกฎหมาย ก", content_sha256="fb" * 32,
+                                char_start=0, char_end=10, token_count=3, section_kind="มาตรา", section_number="104")
+        db.add(chunk_a); db.commit()
+
+        # Family B: an unrelated law that happens to also have a มาตรา 104,
+        # which WAS amended. Its amendment must never be attributed to Family A.
+        family_b = LegalFamily(knowledge_base_id=kb.id, base_title="กฎหมาย ข", normalized_key="กฎหมาย ข")
+        db.add(family_b); db.flush()
+        doc_b = Document(knowledge_base_id=kb.id, original_filename="b.txt", stored_filename="b.txt",
+                         storage_path="/tmp/b.txt", mime_type="text/plain", file_size=1,
+                         checksum_sha256="fc" * 32, title="กฎหมาย ข ฉบับปรับปรุงล่าสุด", document_type="legal", status="completed")
+        db.add(doc_b); db.flush()
+        instrument_b = LegalInstrument(document_id=doc_b.id, knowledge_base_id=kb.id, family_id=family_b.id,
+                                       official_title=doc_b.title, document_class="consolidated", status="in_force")
+        db.add(instrument_b); db.flush()
+        amend_b = _amending(db, kb, family_b, title="พระราชบัญญัติแก้ไขเพิ่มเติมกฎหมาย ข (ฉบับที่ 1) พ.ศ. 2560", when=date(2017, 1, 1))
+        db.add(LegalInstrumentRelation(knowledge_base_id=kb.id, source_instrument_id=amend_b.id,
+                                       target_instrument_id=instrument_b.id, relation="AMENDS",
+                                       target_provision="104", review_status="verified"))
+        db.commit()
+
+        result = services._persist_legal_clause_result(
+            db, query="มาตรา 104 ของกฎหมาย ก", kb_ids=[kb.id], token_id=None, intent="test",
+            detail="test", rows=[(chunk_a, doc_a, instrument_a)], attribute_amendments=True,
+        )
+        assert "แก้ไขเพิ่มเติมโดย" not in result["answer"]
+
+
+def test_resolve_legal_context_does_not_overwrite_a_correct_family_match_with_an_unrelated_latest_consolidated():
+    with SessionLocal() as db:
+        kb = KnowledgeBase(code="resolve-cross-family-guard", name="Resolve cross family guard")
+        db.add(kb); db.flush()
+
+        # Family A: named directly in the query. Its sole consolidated
+        # instrument is NOT tagged latest_consolidated, so it's matched via
+        # the plain `candidates` fallback (services.py:105), not the
+        # latest_consolidated tag.
+        family_a = LegalFamily(knowledge_base_id=kb.id, base_title="กฎหมายเอ", normalized_key="กฎหมายเอ")
+        db.add(family_a); db.flush()
+        doc_a = Document(knowledge_base_id=kb.id, original_filename="a.txt", stored_filename="a.txt",
+                         storage_path="/tmp/a.txt", mime_type="text/plain", file_size=1,
+                         checksum_sha256="ga" * 32, title="กฎหมายเอ ฉบับรวม", document_type="legal", status="completed")
+        db.add(doc_a); db.flush()
+        instrument_a = LegalInstrument(document_id=doc_a.id, knowledge_base_id=kb.id, family_id=family_a.id,
+                                       official_title=doc_a.title, document_class="consolidated",
+                                       status="in_force", effective_from=date(2015, 1, 1))
+        db.add(instrument_a)
+
+        # Family B: a completely unrelated law with exactly one
+        # latest_consolidated instrument, which must never win here.
+        family_b = LegalFamily(knowledge_base_id=kb.id, base_title="กฎหมายบี", normalized_key="กฎหมายบี")
+        db.add(family_b); db.flush()
+        doc_b = Document(knowledge_base_id=kb.id, original_filename="b.txt", stored_filename="b.txt",
+                         storage_path="/tmp/b.txt", mime_type="text/plain", file_size=1,
+                         checksum_sha256="gb" * 32, title="กฎหมายบี ฉบับปรับปรุงล่าสุด", document_type="legal", status="completed")
+        db.add(doc_b); db.flush()
+        instrument_b = LegalInstrument(document_id=doc_b.id, knowledge_base_id=kb.id, family_id=family_b.id,
+                                       official_title=doc_b.title, document_class="consolidated",
+                                       version_role="latest_consolidated", status="in_force", effective_from=date(2020, 1, 1))
+        db.add(instrument_b)
+        db.commit()
+
+        context = resolve_legal_context(db, "กฎหมายเอ มาตรา 5", [kb.id], _plan(), RetrievalPolicy())
+        assert context.matched_instrument_ids == [instrument_a.id]
+        assert instrument_b.id not in context.matched_instrument_ids
+        assert context.preferred_document_ids == [doc_a.id]
+
+
+def test_resolve_legal_context_ambiguity_candidates_exclude_the_non_tied_instrument():
+    with SessionLocal() as db:
+        kb = KnowledgeBase(code="resolve-ambiguity-candidates", name="Resolve ambiguity candidates")
+        db.add(kb); db.flush()
+        family = LegalFamily(knowledge_base_id=kb.id, base_title="กฎหมายซี", normalized_key="กฎหมายซี")
+        db.add(family); db.flush()
+
+        # One plain consolidated instrument that is NOT part of the tie.
+        plain_doc = Document(knowledge_base_id=kb.id, original_filename="plain.txt", stored_filename="plain.txt",
+                             storage_path="/tmp/plain.txt", mime_type="text/plain", file_size=1,
+                             checksum_sha256="gc" * 32, title="กฎหมายซี ฉบับรวม", document_type="legal", status="completed")
+        db.add(plain_doc); db.flush()
+        plain_instrument = LegalInstrument(document_id=plain_doc.id, knowledge_base_id=kb.id, family_id=family.id,
+                                           official_title=plain_doc.title, document_class="consolidated",
+                                           status="in_force", effective_from=date(2010, 1, 1))
+        db.add(plain_instrument)
+
+        # Two instruments mistakenly both tagged latest_consolidated -- these
+        # are the ones actually causing the ambiguity.
+        tied_ids = []
+        for index in (1, 2):
+            doc = Document(knowledge_base_id=kb.id, original_filename=f"tied-{index}.txt", stored_filename=f"tied-{index}.txt",
+                           storage_path=f"/tmp/tied-{index}.txt", mime_type="text/plain", file_size=1,
+                           checksum_sha256=f"gd{index}" * 21, title=f"กฎหมายซี ฉบับปรับปรุงล่าสุด {index}",
+                           document_type="legal", status="completed")
+            db.add(doc); db.flush()
+            instrument = LegalInstrument(document_id=doc.id, knowledge_base_id=kb.id, family_id=family.id,
+                                        official_title=doc.title, document_class="consolidated",
+                                        version_role="latest_consolidated", status="in_force",
+                                        effective_from=date(2020 + index, 1, 1))
+            db.add(instrument); db.flush()
+            tied_ids.append(instrument.id)
+        db.commit()
+
+        context = resolve_legal_context(db, "กฎหมายซี มาตรา 5", [kb.id], _plan(), RetrievalPolicy())
+        assert context.ambiguous_context is True
+        assert sorted(context.candidate_instrument_ids) == sorted(tied_ids)
+        assert plain_instrument.id not in context.candidate_instrument_ids
+
+
+def test_provenance_treats_supersedes_as_terminal_like_repeals():
+    with SessionLocal() as db:
+        kb, family, current = _provenance_kb(db, "prov-supersedes")
+        supersede = _amending(db, kb, family, title="พระราชบัญญัติแก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน (ฉบับที่ 6) พ.ศ. 2535", when=date(1992, 1, 1))
+        amend = _amending(db, kb, family, title="พระราชบัญญัติแก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน (ฉบับที่ 9) พ.ศ. 2543", when=date(2000, 5, 1))
+        db.add_all([
+            LegalInstrumentRelation(knowledge_base_id=kb.id, source_instrument_id=supersede.id, target_instrument_id=current.id,
+                                    relation="SUPERSEDES", target_provision="7", review_status="verified"),
+            LegalInstrumentRelation(knowledge_base_id=kb.id, source_instrument_id=amend.id, target_instrument_id=current.id,
+                                    relation="AMENDS", target_provision="7", review_status="verified"),
+        ])
+        db.commit()
+        result = services.build_legal_provenance_result(db, "มาตรา 7 มีสถานะอย่างไร และถูกยกเลิกโดยกฎหมายใด", [kb.id])
+        answer = result["answer"]
+        assert "มาตรา 7 แทนที่โดย" in answer
+        assert "(ฉบับที่ 6) พ.ศ. 2535" in answer
+        # The cross-work AMENDS edge is flagged, not emitted as a peer statement.
+        assert "หมายเหตุ" in answer and "คนละฉบับ" in answer
+        assert "มาตรา 7 แก้ไขเพิ่มเติมโดย" not in answer
+
+
+def test_build_default_current_legal_result_fails_closed_when_no_chunk_matches():
+    with SessionLocal() as db:
+        kb, family, current = _provenance_kb(db, "default-current-no-match")
+        db.add(DocumentChunk(document_id=current.document_id, knowledge_base_id=kb.id, chunk_index=1,
+                             content="เนื้อหาที่ไม่เกี่ยวข้องกับคำถามเลย", content_sha256="hb" * 32,
+                             char_start=0, char_end=10, token_count=3))
+        db.commit()
+        result = services.build_default_current_legal_result(db, "หลักเกณฑ์ค่าธรรมเนียมปัจจุบัน", [kb.id])
+        assert result["insufficient_evidence"] is True
+        assert result["sources"] == []
+
+
+def test_build_default_current_legal_result_uses_the_full_legal_concept_term_list():
+    with SessionLocal() as db:
+        kb, family, current = _provenance_kb(db, "default-current-full-terms")
+        # "หวงห้าม" is in _LEGAL_CONCEPT_TERMS but was missing from the old,
+        # smaller inline term list this builder used to hand-roll.
+        db.add(DocumentChunk(document_id=current.document_id, knowledge_base_id=kb.id, chunk_index=1,
+                             content="ที่ดินของรัฐที่ถูกหวงห้ามไว้เพื่อประโยชน์สาธารณะ", content_sha256="hc" * 32,
+                             char_start=0, char_end=10, token_count=5))
+        db.commit()
+        result = services.build_default_current_legal_result(db, "ที่ดินของรัฐที่หวงห้ามมีหลักเกณฑ์อย่างไร", [kb.id])
+        assert result["insufficient_evidence"] is False
+        assert len(result["sources"]) == 1

@@ -22,7 +22,7 @@ from app.config import Settings
 from app.db import SessionLocal
 from app.external_ocr import ExternalOcrClient
 from app.main import app
-from app.models import Document, DocumentChunk
+from app.models import Document, DocumentChunk, KnowledgeBase, LegalInstrument, LegalInstrumentRelation
 
 
 def client():
@@ -56,6 +56,72 @@ def test_vertical_slice():
     assert any(step["channel"] == "full_text" for step in mcp_transaction["retrieval"]["retrieval_trace"])
 
 
+def test_document_inventory_summary_is_deterministic_and_search_fallback_preserves_original_query():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Inventory", "code": "inventory-kb"}).json()
+    assert test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/activate").status_code == 200
+    first = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("one.txt", b"one", "text/plain")}).json()
+    second = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("two.txt", b"two", "text/plain")}, data={"document_type": "legal"}).json()
+    assert first["status"] == second["status"] == "queued"
+    token = test_client.post("/api/v1/tokens", json={
+        "name": "inventory-agent", "allowed_knowledge_base_ids": [kb["id"]],
+        "allowed_tools": ["search_knowledge", "document_inventory_summary"],
+    }).json()
+    headers = {"Authorization": f"Bearer {token['token']}"}
+    listed = test_client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()
+    assert "document_inventory_summary" in {tool["name"] for tool in listed["result"]["tools"]}
+
+    original = "ชุดเอกสารนี้มีกฎหมายทั้งหมดกี่ฉบับ และแบ่งเป็นประเภทใดบ้าง?"
+    inventory = test_client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+        "name": "document_inventory_summary", "arguments": {"query": original, "scope": "all", "include_documents": True},
+    }}).json()["result"]["structuredContent"]
+    assert inventory["total_documents"] == 2
+    assert {group["key"] for group in inventory["groups"] if group["dimension"] == "document_type"} == {"general", "legal"}
+    assert inventory["metadata"]["retrieval_plan"]["intent"] == "document_inventory"
+    assert inventory["metadata"]["retrieval_trace"][0]["channel"] == "document_registry"
+
+    fallback = test_client.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "search_knowledge", "arguments": {"query": original},
+    }}).json()["result"]["structuredContent"]
+    assert fallback["total_documents"] == 2
+    assert fallback["metadata"]["retrieval_plan"]["intent"] == "document_inventory"
+    activity = test_client.get("/api/v1/mcp/activity").json()
+    call = next(row for row in activity if row["metadata"].get("request_id") == "3")
+    assert call["metadata"]["query"] == original
+    inventory_call = next(row for row in activity if row["metadata"].get("request_id") == "2")
+    assert inventory_call["metadata"]["query"] == original
+    assert services.is_document_inventory_query("แสดงรายการเอกสารทั้งหมด") is True
+    assert services.is_document_inventory_query("ลบเอกสารทั้งหมดอย่างไร") is False
+    assert services.is_document_inventory_query("How do I archive all documents?") is False
+    # Keep the shared test worker queue isolated for subsequent API tests.
+    for _ in range(6):
+        if not test_client.post("/api/v1/internal/process-next").json().get("processed"):
+            break
+
+
+def test_documents_page_is_bounded_and_reports_global_processing_state():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Paged documents", "code": "paged-documents"}).json()
+    assert test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/activate").status_code == 200
+    first = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("land-law.txt", "มาตรา 4".encode("utf-8"), "text/plain")}, data={"document_type": "legal"}).json()
+    second = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("notes.txt", b"notes", "text/plain")}).json()
+    assert first["status"] == second["status"] == "queued"
+
+    page = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/documents/page?limit=1&search=land-law").json()
+    assert page["total"] == 1
+    assert len(page["items"]) == 1
+    assert page["has_legal_documents"] is True
+    assert page["has_completed_documents"] is False
+    assert page["processing_count"] == 2
+    assert page["items"][0]["processing_job_status"] == "queued"
+    assert page["items"][0]["processing_job_progress_percent"] == 0
+    # Do not leave initial or legal follow-up jobs in the shared fixture queue.
+    processed = []
+    for _ in range(5):
+        processed.append(test_client.post("/api/v1/internal/process-next").json()["processed"])
+    assert any(processed)
+
+
 def test_mcp_legal_tools_are_agent_safe_and_scope_bound():
     test_client = next(client())
     kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Legal MCP", "code": "legal-mcp-agent"}).json()
@@ -80,6 +146,11 @@ def test_mcp_legal_tools_are_agent_safe_and_scope_bound():
         "name": "get_legal_instrument", "arguments": {"instrument_id": "outside-scope"}
     }}).json()
     assert denied["error"]["code"] == "LEGAL_INSTRUMENT_NOT_FOUND"
+    # A rejected MCP call must still be visible in the Trace Explorer -- not
+    # just the raw audit log -- since record_retrieval_execution only ever
+    # fires on the success path.
+    error_traces = test_client.get("/api/v1/traces?tool=get_legal_instrument&status=error").json()
+    assert any(item["status"] == "error" for item in error_traces)
 
 
 def test_knowledge_base_can_be_disabled_activated_and_safely_deleted():
@@ -177,7 +248,7 @@ def test_refresh_cookie_restores_access_session():
     assert test_client.get("/api/v1/auth/me").status_code == 200
 
 
-def test_auto_retrieval_fixture_exercises_scopes_exact_dates_and_rerank_policy():
+def test_auto_retrieval_fixture_exercises_scopes_exact_dates_and_rerank_policy(monkeypatch):
     test_client = next(client())
     kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Auto retrieval fixture", "code": "auto-retrieval-fixture"}).json()
     test_client.patch(f"/api/v1/knowledge-bases/{kb['id']}/retrieval-config", json={
@@ -193,6 +264,7 @@ def test_auto_retrieval_fixture_exercises_scopes_exact_dates_and_rerank_policy()
             ("abc-june.txt", "ข่าวบริษัท ABC เดือนมิถุนายน 2026 เปิดศูนย์บริการ.", date(2026, 6, 15)),
             ("abc-may.txt", "ข่าวบริษัท ABC เดือนพฤษภาคม 2026 ไม่ควรถูกคืน.", date(2026, 5, 15)),
             ("SNX-2026-001.txt", "เอกสารเลขที่ SNX-2026-001: Information Security Standard.", None),
+            ("land-transfer.txt", "ขั้นตอนการโอนกรรมสิทธิ์หรือสิทธิครอบครองในที่ดินที่มีโฉนดที่ดินหรือหนังสือรับรองการทำประโยชน์ ต้องยื่นคำขอต่อสำนักงานที่ดินและแสดงเอกสารสิทธิ์.", None),
         ]):
             digest = hashlib.sha256(f"{name}:{text}".encode()).hexdigest()
             doc = Document(knowledge_base_id=kb["id"], original_filename=name, stored_filename=name,
@@ -204,6 +276,21 @@ def test_auto_retrieval_fixture_exercises_scopes_exact_dates_and_rerank_policy()
                                  content_sha256=hashlib.sha256(text.encode()).hexdigest(), char_start=0, char_end=len(text), token_count=len(text.split())))
             documents.append(doc)
         db.commit()
+    transfer_document_id = next(document.id for document in documents if document.original_filename == "land-transfer.txt")
+    from app.retrieval import RetrievalEvidence
+    import time
+    original_vector = services.query_database_vectors
+
+    def vector_probe(db, query, kb_ids, limit, trace=None, plan=None):
+        if query != "การโอนกรรมสิทธิ์หรือสิทธิครอบครองในที่ดินที่มีโฉนดที่ดินหรือหนังสือรับรองการทำประโยชน์ ต้องทำอย่างไร?":
+            return original_vector(db, query, kb_ids, limit, trace, plan)
+        services._append_retrieval_trace(trace, channel="semantic_vector", system="test vector probe", status="used",
+                                         started_at=time.monotonic(), result_count=1, detail="fixture embedding")
+        return RetrievalEvidence([{"citation_id": "V1", "document_id": transfer_document_id,
+                                   "chunk_id": "fixture-vector-chunk", "chunk_index": 0,
+                                   "title": "land-transfer", "excerpt": "fixture vector evidence", "relevance": 1.0}], [], [], [])
+
+    monkeypatch.setattr(services, "query_database_vectors", vector_probe)
     architecture = documents[0]
     app_entity = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/entities", json={"name": "APP-01", "entity_type": "Application"}).json()
     portal = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/entities", json={"name": "Customer Portal", "entity_type": "Application"}).json()
@@ -220,6 +307,7 @@ def test_auto_retrieval_fixture_exercises_scopes_exact_dates_and_rerank_policy()
         "ข่าวบริษัท ABC เดือนมิถุนายน 2026": ["full_text", "vector"],
         "เอกสารเลขที่ SNX-2026-001": ["exact_document", "full_text"],
         "ภาพรวมความสัมพันธ์ระหว่างหน่วยงาน": ["graph", "vector"],
+        "การโอนกรรมสิทธิ์หรือสิทธิครอบครองในที่ดินที่มีโฉนดที่ดินหรือหนังสือรับรองการทำประโยชน์ ต้องทำอย่างไร?": ["vector", "full_text"],
     }
     results = {}
     for query, channels in cases.items():
@@ -237,8 +325,24 @@ def test_auto_retrieval_fixture_exercises_scopes_exact_dates_and_rerank_policy()
     exact_trace = results["เอกสารเลขที่ SNX-2026-001"]["metadata"]["retrieval_trace"]
     assert next(item for item in exact_trace if item["channel"] == "exact_document")["result_count"] == 1
     assert all(item["channel"] != "graph" or item["status"] == "skipped" for item in exact_trace)
+    transfer_trace = results["การโอนกรรมสิทธิ์หรือสิทธิครอบครองในที่ดินที่มีโฉนดที่ดินหรือหนังสือรับรองการทำประโยชน์ ต้องทำอย่างไร?"]["metadata"]["retrieval_trace"]
+    assert next(item for item in transfer_trace if item["channel"] == "semantic_vector")["status"] == "used"
+    assert next(item for item in transfer_trace if item["channel"] == "full_text")["status"] == "used"
+    assert results["การโอนกรรมสิทธิ์หรือสิทธิครอบครองในที่ดินที่มีโฉนดที่ดินหรือหนังสือรับรองการทำประโยชน์ ต้องทำอย่างไร?"]["sources"]
     rerank_trace = results["เอกสารเลขที่ SNX-2026-001"]["metadata"]["retrieval_trace"]
     assert next(item for item in rerank_trace if item["channel"] == "rerank")["detail"] == "disabled by retrieval policy"
+    authority = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/entities", json={"name": "กรมทดสอบ", "entity_type": "Organization"}).json()
+    department = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/entities", json={"name": "ฝ่ายทดสอบ", "entity_type": "Organization"}).json()
+    assert test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/relationships", json={
+        "source_entity_id": authority["id"], "target_entity_id": department["id"], "relationship_type": "OVERSEES",
+        "document_id": documents[2].id, "excerpt": "กรมทดสอบดูแลฝ่ายทดสอบ",
+    }).status_code == 200
+    filtered_global = test_client.post("/api/v1/query", json={
+        "knowledge_base_ids": [kb["id"]], "query": "ภาพรวมความสัมพันธ์ระหว่างหน่วยงาน",
+        "filters": {"published_from": "2026-06-01", "published_to": "2026-07-01"},
+    }).json()
+    assert any(source["document_id"] == documents[2].id for source in filtered_global["sources"])
+    assert all(source["document_id"] != documents[3].id for source in filtered_global["sources"])
 
 
 def test_revoked_token_cannot_call_mcp():
@@ -248,6 +352,32 @@ def test_revoked_token_cannot_call_mcp():
     response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert response.status_code == 200
     assert response.json()["error"]["code"] == "AUTH_TOKEN_REVOKED"
+
+
+def test_lightrag_honors_publication_filter_before_fusion():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "LightRAG filter", "code": "lightrag-filter"}).json()
+    from datetime import date, datetime
+    import hashlib
+    with SessionLocal() as db:
+        documents = []
+        for name, published_at in (("in-range.txt", date(2026, 6, 10)), ("out-of-range.txt", date(2026, 5, 10))):
+            text = f"LightRAG source {name}"
+            document = Document(knowledge_base_id=kb["id"], original_filename=name, stored_filename=name,
+                                storage_path=f"/tmp/{name}", mime_type="text/plain", file_size=len(text),
+                                checksum_sha256=hashlib.sha256(f"{kb['id']}:{name}".encode()).hexdigest(),
+                                title=name.removesuffix(".txt"), document_type="general", published_at=published_at,
+                                tags=[], status="completed", extracted_text=text, indexed_at=datetime.utcnow())
+            db.add(document); db.flush(); documents.append(document)
+        db.commit()
+        from app.planner import RetrievalPlan
+        fake_engine = SimpleNamespace(query=lambda *_: services.RetrievalEvidence([
+            {"citation_id": "S1", "document_id": documents[0].id, "title": "in-range", "chunk_id": "1", "excerpt": "in", "relevance": 1.0},
+            {"citation_id": "S2", "document_id": documents[1].id, "title": "out-of-range", "chunk_id": "2", "excerpt": "out", "relevance": 0.9},
+        ], [], [], []))
+        plan = RetrievalPlan(intent="news_by_date", channels=["lightrag"], published_from=date(2026, 6, 1), published_to=date(2026, 7, 1))
+        evidence = services._query_lightrag(db, fake_engine, "news", [kb["id"]], 10, [], plan)
+    assert [source["document_id"] for source in evidence.sources] == [documents[0].id]
 
 
 def test_token_rotation_replaces_secret_without_exposing_old_key():
@@ -572,10 +702,25 @@ def test_legal_graph_v2_keeps_provisions_document_scoped_and_reviews_suggestions
     assert legal_map["mode"] == "map"
     assert len(legal_map["instruments"]) == 2
     assert all("entity_count" in item and "relationship_count" in item for item in legal_map["instruments"])
+    summary = legal_map["relationship_summary"]
+    assert {"verified", "suggested", "rejected", "manual", "internal", "cross_document"} <= summary.keys()
+    assert summary["internal"] >= 2 and summary["cross_document"] >= 0
+    with SessionLocal() as db:
+        source_instrument = db.query(LegalInstrument).filter_by(knowledge_base_id=kb["id"]).first()
+        db.add(LegalInstrumentRelation(
+            knowledge_base_id=kb["id"], source_instrument_id=source_instrument.id,
+            relation="REFERS_TO", target_text="Unresolved instrument", origin="ai_suggestion", review_status="suggested",
+        ))
+        db.commit()
+    summary_with_unresolved = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/legal-map?view=verified").json()["relationship_summary"]
+    assert summary_with_unresolved["cross_document"] == summary["cross_document"] + 1
+    assert summary_with_unresolved["suggested"] == summary["suggested"] + 1
     instrument_view = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/legal-map?view=verified&instrument_id={legal_map['instruments'][0]['id']}").json()
     assert instrument_view["mode"] == "instrument"
     assert instrument_view["nodes"]
     assert all(node["entity_type"] in {"LegalInstrument", "Provision"} for node in instrument_view["nodes"])
+    assert instrument_view["edges"]
+    assert all("sources" in edge for edge in instrument_view["edges"])
 
 
 def test_database_chunk_retrieval_is_scoped_to_knowledge_base():
@@ -693,3 +838,177 @@ def test_mcp_rate_limit_returns_jsonrpc_error():
     response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json=request)
     assert response.status_code == 200
     assert response.json()["error"]["code"] == "MCP_RATE_LIMITED"
+
+
+def test_custom_document_template_keeps_a_safe_processing_profile_and_user_metadata():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Template KB", "code": "template-kb"}).json()
+    created = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/document-templates", json={
+        "name": "Official notification", "base_document_type": "regulation",
+        "fields": [
+            {"key": "issuer", "label": "Issuing organisation", "field_type": "text", "required": True,
+             "filterable": True, "graph_entity_type": "Organization", "graph_relationship": "ISSUED_BY"},
+            {"key": "effective_date", "label": "Effective date", "field_type": "date", "filterable": True},
+            {"key": "internal_note", "label": "Internal note", "field_type": "text", "searchable": False},
+        ],
+    })
+    assert created.status_code == 200
+    template = created.json()
+    assert template["base_document_type"] == "regulation"
+    assert template["is_system"] is False
+    template_fields = {field["key"]: field for field in template["fields"]}
+    assert "reference_number" in template_fields  # profile baseline is inherited
+    assert template_fields["issuer"]["filterable"] is True
+    assert template_fields["issuer"]["graph_relationship"] == "ISSUED_BY"
+    listed = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/document-templates").json()
+    assert {"General document", "Official notification"}.issubset({row["name"] for row in listed})
+    uploaded = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/documents",
+        files={"file": ("notification.txt", "ประกาศ เรื่อง ทดสอบ".encode("utf-8"), "text/plain")},
+        data={"template_id": template["id"], "metadata_json": '{"issuer":"สำนักงานทดสอบ","effective_date":"2026-01-01","internal_note":"ไม่ควรค้นพบ"}'},
+    )
+    assert uploaded.status_code == 200
+    assert uploaded.json()["document_type"] == "regulation"
+    preview = test_client.get(f"/api/v1/documents/{uploaded.json()['document_id']}/text").json()
+    assert preview["metadata_template_id"] == template["id"]
+    assert preview["document_metadata"]["issuer"] == "สำนักงานทดสอบ"
+    assert preview["document_metadata"]["internal_note"] == "ไม่ควรค้นพบ"
+    filtered_page = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/documents/page", params={"template_id": template["id"]})
+    assert filtered_page.status_code == 200
+    assert filtered_page.json()["total"] == 1
+    invalid = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/documents",
+        files={"file": ("invalid.txt", b"test", "text/plain")},
+        data={"template_id": template["id"], "metadata_json": '{"unknown":"value"}'},
+    )
+    assert invalid.status_code == 400
+    updated = test_client.patch(f"/api/v1/documents/{uploaded.json()['document_id']}/metadata", json={"values": {"issuer": "สำนักงานใหม่", "effective_date": "2026-01-01", "internal_note": "หมายเหตุลับ"}})
+    assert updated.status_code == 200
+    assert updated.json()["document_metadata"] == {"issuer": "สำนักงานใหม่", "effective_date": "2026-01-01", "internal_note": "หมายเหตุลับ"}
+    assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True
+    filtered_query = test_client.post("/api/v1/query", json={
+        "knowledge_base_ids": [kb["id"]], "query": "ประกาศ", "filters": {"metadata": {"issuer": "สำนักงานใหม่", "effective_date": "2026-01-01"}},
+    })
+    assert filtered_query.status_code == 200
+    assert filtered_query.json()["sources"]
+    assert {source["document_id"] for source in filtered_query.json()["sources"]} == {uploaded.json()["document_id"]}
+    assert filtered_query.json()["metadata"]["retrieval_plan"]["metadata_filters"] == {"issuer": "สำนักงานใหม่", "effective_date": "2026-01-01"}
+    unsearchable_query = test_client.post("/api/v1/query", json={
+        "knowledge_base_ids": [kb["id"]], "query": "หมายเหตุลับ", "filters": {"metadata": {"issuer": "สำนักงานใหม่", "effective_date": "2026-01-01"}},
+    })
+    assert unsearchable_query.status_code == 200
+    assert not unsearchable_query.json()["sources"]
+    entities = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/entities?search=สำนักงานใหม่").json()
+    assert any(entity["name"] == "สำนักงานใหม่" for entity in entities)
+    graph_entity = next(entity for entity in entities if entity["name"] == "สำนักงานใหม่")
+    graph = test_client.get(f"/api/v1/entities/{graph_entity['id']}/graph").json()
+    assert any(edge["type"] == "ISSUED_BY" for edge in graph["edges"])
+    retired = test_client.delete(f"/api/v1/document-templates/{template['id']}")
+    assert retired.status_code == 200
+    listed_all = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/document-templates?include_inactive=true")
+    assert listed_all.status_code == 200
+    listed_by_name = {row["name"]: row for row in listed_all.json()}
+    assert {"General document", "Legal document", "Official notification"}.issubset(listed_by_name)
+    assert listed_by_name["Official notification"]["is_active"] is False
+    assert listed_by_name["Official notification"]["usage_count"] == 1
+    assert listed_by_name["General document"]["is_system"] is True
+    # Retiring a template blocks future uploads but does not erase its
+    # document-scoped metadata schema or prevent correcting historic data.
+    after_retirement = test_client.patch(
+        f"/api/v1/documents/{uploaded.json()['document_id']}/metadata",
+        json={"values": {"issuer": "สำนักงานหลังปิดประเภท"}},
+    )
+    assert after_retirement.status_code == 200
+    assert after_retirement.json()["document_metadata"] == {"issuer": "สำนักงานหลังปิดประเภท"}
+    blocked = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/documents",
+        files={"file": ("blocked.txt", b"test", "text/plain")},
+        data={"template_id": template["id"], "metadata_json": '{"issuer":"x"}'},
+    )
+    assert blocked.status_code == 400
+    activated = test_client.post(f"/api/v1/document-templates/{template['id']}/activate")
+    assert activated.status_code == 200
+    select_invalid = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/document-templates", json={
+        "name": "Invalid select", "fields": [{"key": "kind", "label": "Kind", "field_type": "select"}],
+    })
+    assert select_invalid.status_code == 422
+
+
+def test_document_template_api_rejects_duplicate_fields_and_does_not_keep_old_profile_defaults():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Template validation", "code": "template-validation"}).json()
+    duplicate = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/document-templates", json={
+        "name": "Duplicate fields", "base_document_type": "regulation",
+        "fields": [
+            {"key": "owner", "label": "Owner"},
+            {"key": "owner", "label": "Owner again"},
+        ],
+    })
+    assert duplicate.status_code == 422
+
+    created = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/document-templates", json={
+        "name": "Switchable type", "base_document_type": "regulation",
+        "fields": [{"key": "owner", "label": "Owner"}],
+    }).json()
+    switched = test_client.patch(f"/api/v1/document-templates/{created['id']}", json={"base_document_type": "general"})
+    assert switched.status_code == 200
+    assert {field["key"] for field in switched.json()["fields"]} == {"owner"}
+def test_document_template_guards_system_names_and_archived_empty_schema_snapshots():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Template Guard KB", "code": "template-guard-kb"}).json()
+
+    duplicate_system_name = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/document-templates",
+        json={"name": "Legal document"},
+    )
+    assert duplicate_system_name.status_code == 409
+
+    created = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/document-templates",
+        json={"name": "Empty metadata type"},
+    )
+    assert created.status_code == 200
+    template = created.json()
+
+    uploaded = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/documents",
+        files={"file": ("empty-schema.txt", b"test", "text/plain")},
+        data={"template_id": template["id"], "metadata_json": "{}"},
+    )
+    assert uploaded.status_code == 200
+    document_id = uploaded.json()["document_id"]
+
+    retired = test_client.delete(f"/api/v1/document-templates/{template['id']}")
+    assert retired.status_code == 200
+    after_retirement = test_client.patch(
+        f"/api/v1/documents/{document_id}/metadata",
+        json={"values": {}},
+    )
+    assert after_retirement.status_code == 200
+
+    active_override = test_client.patch(
+        f"/api/v1/document-templates/{template['id']}",
+        json={"is_active": True},
+    )
+    assert active_override.status_code == 422
+
+
+def test_sync_document_metadata_graph_counts_every_new_entity_it_creates():
+    next(client())  # ensure the schema exists (created on app startup)
+    with SessionLocal() as db:
+        kb = KnowledgeBase(code="metadata-graph-count", name="Metadata graph count")
+        db.add(kb); db.flush()
+        doc = Document(knowledge_base_id=kb.id, original_filename="doc.txt", stored_filename="doc.txt",
+                       storage_path="/tmp/doc.txt", mime_type="text/plain", file_size=1,
+                       checksum_sha256="ha" * 32, title="Metadata doc", document_type="general", status="completed",
+                       metadata_template_fields=[
+                           {"key": "issuer", "label": "Issuer", "graph_entity_type": "Organization", "graph_relationship": "ISSUED_BY"},
+                           {"key": "recipient", "label": "Recipient", "graph_entity_type": "Organization", "graph_relationship": "SENT_TO"},
+                       ],
+                       document_metadata={"issuer": "Ministry A", "recipient": "Ministry B"})
+        db.add(doc); db.commit()
+        # 1 anchor "Document" entity + 2 mapped-field target entities (issuer,
+        # recipient) must all be counted -- previously only the anchor was.
+        result = services.sync_document_metadata_graph(db, doc)
+        assert result["entities"] == 3
+        assert result["relationships"] == 2

@@ -1,129 +1,107 @@
-# Softnix Knowledge Intelligence Platform
+# Softnix Knowledge Intelligence
 
-Production-oriented MVP for document knowledge management, retrieval evidence, citations, and remote MCP tools.
+แพลตฟอร์มจัดการเอกสารและค้นคืนความรู้แบบมีหลักฐานอ้างอิง (citation) สำหรับผู้ดูแลระบบและ MCP/AI agent
 
-## Quick start
+## เริ่มใช้งานอย่างย่อ
 
 ```bash
 cp .env.example .env
+# แก้ APP_SECRET_KEY, TOKEN_HASH_SECRET, INITIAL_ADMIN_PASSWORD และ OPENROUTER_API_KEY
 docker compose up --build
 ```
 
-Open the web UI at the port configured by `WEB_PORT` (default `http://localhost:8081`), sign in with the initial-admin credentials from `.env`, create a knowledge base, upload a supported document, then use the Query Playground. The API is available at `http://localhost:8001`, health at `/health`, and MCP at `/mcp`.
+- Web UI: `http://localhost:8081` (ปรับด้วย `WEB_PORT`)
+- REST API: `http://localhost:8001` (ปรับด้วย `API_PORT`)
+- ตรวจสุขภาพ: `/health` และ `/ready`
+- MCP: `/mcp`
 
-For development, set `OPENROUTER_API_KEY` in `.env`. Docker Compose starts LightRAG with OpenRouter as its initial LLM and embedding provider; verify its credentials after login through `POST /api/v1/system/test-openrouter`.
+เข้าสู่ระบบด้วยค่าจาก `INITIAL_ADMIN_USERNAME`/`INITIAL_ADMIN_PASSWORD` ใน `.env` จากนั้นสร้าง Knowledge Base, อัปโหลดเอกสาร และใช้ Query Playground ได้ทันที
 
-See [deployment](docs/DEPLOYMENT.md), [API](docs/API.md), [MCP](docs/MCP.md), [security](docs/SECURITY.md), [architecture](docs/ARCHITECTURE.md), and the [high-level data flow](docs/DATA_FLOW.md).
+> ระบบจะสร้างผู้ดูแลเริ่มต้นเฉพาะตอนยังไม่มีบัญชีเท่านั้น การเปลี่ยนค่าใน `.env` ภายหลังจะไม่รีเซ็ตรหัสผ่านเดิมโดยอัตโนมัติ
 
-## Data flow
-
-The platform separates document ingestion from query serving. Upload requests are acknowledged quickly, while the worker performs extraction and indexing asynchronously. Queries are scope-filtered before any answer is generated.
+## ภาพรวมการทำงาน
 
 ```mermaid
 flowchart LR
-  Admin[Admin UI]
-  Client[MCP client\nClaude Code or agent]
-  API[FastAPI\nREST + MCP]
-  Queue[(Redis\njob queue)]
-  Worker[Async worker\nextract and index]
-  Files[(File storage\noriginal files)]
-  DB[(PostgreSQL\nmetadata, chunks, pgvector, FTS)]
-  Graph[(Neo4j\nentities and relationships)]
-  RAG[LightRAG\nretrieval adapter]
-  Router[OpenRouter\nLLM and embeddings]
-  Auth[Session/MCP authorization\nscopes and limits]
-
-  Admin -->|login, create KB, upload| API
-  API -->|validate MIME, size, checksum| API
-  API -->|save original| Files
-  API -->|document metadata + queued job| DB
-  API -->|enqueue job| Queue
-  Queue --> Worker
-  Worker -->|read| Files
-  Worker -->|MarkItDown Markdown → normalize → chunk| Worker
-  Worker -->|embed| Router
-  Worker -->|entities and relationships| Router
-  Worker -->|chunks, vectors, provenance| DB
-  Worker -->|graph projection| Graph
-  Worker -->|index/sync| RAG
-  Worker -->|completed, failed, OCR_REQUIRED| DB
-  API -->|status/progress| Admin
-
-  Client -->|HTTPS /mcp + Bearer token| API
-  API -->|verify hash, expiry, KB/tool scope, rate limits| Auth
-  Auth -->|authorized request| API
-  API -->|vector + full-text retrieval| DB
-  API -->|graph/entity retrieval| Graph
-  API -->|semantic/graph evidence| RAG
-  DB -->|scope-filtered excerpts| API
-  Graph -->|scope-filtered paths| API
-  RAG -->|retrieval evidence| API
-  API -->|fusion, rerank, citation mapping| API
-  API -->|answer from authorized evidence only| Router
-  Router -->|cited answer draft| API
-  API -->|summary + structured result + citations + request_id| Client
+  User[ผู้ดูแล / MCP client] --> Web[Web UI หรือ /mcp]
+  Web --> API[FastAPI REST + MCP]
+  API --> Auth[Session / token scope]
+  API --> PG[(PostgreSQL<br/>metadata + chunks + vectors + FTS)]
+  API --> Redis[(Redis queue)]
+  Redis --> Worker[Worker: extract, chunk, embed, graph]
+  Worker --> Files[(File storage)]
+  Worker --> PG
+  Worker --> Neo4j[(Neo4j graph)]
+  Worker --> RAG[LightRAG adapter]
+  API --> Planner[Rule-first retrieval planner]
+  Planner --> Executor[Parallel retrieval + fusion + citations]
+  Executor --> PG
+  Executor --> Neo4j
+  Executor --> RAG
+  Executor --> LLM[OpenRouter: embeddings / answer / optional rerank]
+  LLM --> API
 ```
 
-### Flow stages
+ดูไดอะแกรมและขอบเขตข้อมูลฉบับเต็มที่ [High-level Data Flow](docs/DATA_FLOW.md) และรายละเอียดส่วนประกอบที่ [Architecture](docs/ARCHITECTURE.md)
 
-1. **Upload** — the API authenticates the administrator, validates file type and size, calculates a checksum, rejects duplicates, stores the original file, and creates a queued processing job.
-2. **Asynchronous processing** — Redis hands the job to the worker. Microsoft MarkItDown converts a validated local file into structured Markdown, then the worker normalizes it, chunks it, creates embeddings through OpenRouter, and records provenance. A PDF with no usable text layer is sent to the configured external OCR v3 service and its Markdown result returns to the same pipeline; without configured OCR it remains `OCR_REQUIRED`.
-3. **Indexing** — chunks and vectors are stored in PostgreSQL, full-text search is maintained there, entities and relationships are projected to Neo4j, and the LightRAG adapter is synchronized.
-4. **Processing result** — the document becomes `completed`, `failed`, or `OCR_REQUIRED`. The UI polls while work is active and links directly to document details, Search, and Explore graph when ready.
-5. **MCP query** — an MCP client sends a bearer token to `/mcp`. The API verifies the token hash, expiry, revocation state, Knowledge Base scope, allowed tool, rate limit, concurrency, and timeout.
-6. **Retrieval and answer** — the planner runs permitted vector, full-text, graph, and LightRAG retrieval in parallel. Results are fused and mapped to citations; OpenRouter receives only scope-filtered evidence and generates the final answer.
-7. **Response** — MCP returns a text summary, structured result, citations, and a request ID for tracing and audit.
+## การนำเข้าเอกสาร
 
-Agent-facing MCP contracts are bounded and typed: `tools/list` exposes JSON schemas, token scope is authoritative (client KB arguments cannot broaden it), and legal agents can use `resolve_legal_context`, `get_legal_instrument`, and `get_provision_history`. These tools are read-only, return provenance/review status and safe retrieval traces, and never promote unresolved legal relations to verified facts.
+Web/API รองรับ PDF, DOCX, PPTX, XLSX/XLS, TXT, Markdown, HTML, CSV และ JSON ตามขนาด `MAX_FILE_SIZE_MB` ค่าเริ่มต้น 100 MB
 
-Observability uses normalized `trace_runs` and `trace_spans` as the hot Trace Explorer index while retaining redacted `AuditLog` records for compatibility and compliance. Trace APIs support cursor pagination and time filters; the worker prunes high-volume request/retrieval/MCP events according to the configured retention windows.
+1. API ตรวจสิทธิ์, MIME/type, ขนาด และ SHA-256 กันไฟล์ซ้ำ แล้วเก็บไฟล์ต้นฉบับนอก web root
+2. Worker แปลงเป็น Markdown ด้วย MarkItDown, normalize, แบ่ง chunk และสร้าง embedding
+3. เก็บ metadata, chunk, vector, full-text และ provenance ใน PostgreSQL พร้อมฉาย graph ไป Neo4j และ sync ดัชนี LightRAG
+4. PDF สแกนที่ไม่มี text layer จะเป็น `OCR_REQUIRED` หากไม่ได้ตั้งค่า OCR ภายนอก
 
-Each Knowledge Base exposes a versioned retrieval policy at `PATCH /api/v1/knowledge-bases/{id}/retrieval-config`. Rule-first planning selects an intent and only an ambiguous query uses the constrained OpenRouter planner fallback. The response metadata and MCP activity view expose the selected plan and actual channel trace; planner logs never contain bearer tokens or request headers.
+เอกสารสามารถระบุ `published_at` (`YYYY-MM-DD`) ตอนอัปโหลดหรือแก้ไขภายหลังได้ วันที่นี้ใช้กรองข่าวตามเดือน/ปี และเอกสารที่ไม่มีวันที่จะไม่ผ่าน query ที่มี date filter
 
-### MarkItDown extraction
+## Auto Retrieval Strategy
 
-The ingestion pipeline accepts PDF, DOCX, PPTX, XLSX/XLS, TXT, Markdown, HTML, CSV, and JSON (up to the configured upload limit). MarkItDown runs only against the stored local file with built-in converters and plugins, OCR, LLM, URLs, ZIPs, and cloud integrations disabled. Its Markdown output is the canonical extracted content used by search, citations, graph extraction, and legal metadata; the original file remains unchanged as the source record. Existing local parsers are used only as a compatibility fallback for previously supported file types.
+Planner ใช้กฎ deterministic ก่อนเสมอ และใช้ LLM fallback เฉพาะคำถามที่ไม่เข้ากฎ โดยส่งแผนและ trace กลับใน `metadata`
 
-For scanned PDFs, set `EXT_OCR_KEY` to enable the Softnix external OCR v3 adapter. The worker submits only the stored PDF over TLS, requests Markdown-only output (`disable_structure=true`), records progress under `external_ocr_*`, and continues normal indexing from `combined_markdown`. The adapter does not request provider-side structured extraction, webhook callbacks, plugins, or model listing. `EXT_OCR_VERIFY_SSL=false` is provided for the current IP/self-signed endpoint and should be changed to `true` after a valid certificate is deployed.
+| รูปแบบคำถาม | แผนหลัก |
+|---|---|
+| ขั้นตอน / how-to / VPN | Vector + Full-text |
+| entity เช่น `APP-01` และถามความสัมพันธ์ | Entity + Graph local (1 hop) |
+| ผลกระทบเมื่อ entity ล่ม | Graph traversal (สูงสุด 3 hops) + Vector |
+| ปัจจัย / สาเหตุ / ความล่าช้า | Graph global + Vector |
+| ข่าว + เดือน/ปี | Full-text + Vector + ช่วง `published_from/to` |
+| เลขเอกสาร เช่น `SNX-2026-001` | Exact document + Full-text |
+| ภาพรวมความสัมพันธ์ | Graph global + Vector |
 
-### Data boundaries
+Executor รองรับ Exact, Vector, Full-text, Graph และ LightRAG; รวมผล, optional rerank ตาม policy, กรองสิทธิ์/วันที่ และผูก citation ก่อนสร้างคำตอบ การปิด `RERANKER_ENABLED` จะไม่เรียก reranker
 
-- Original documents never go to the query client; they remain in the configured file-storage volume.
-- PostgreSQL is the source of truth for document metadata, chunks, vectors, jobs, tokens, query results, and audit records.
-- Neo4j stores graph entities and relationships used for graph and impact analysis.
-- MCP tokens are stored hash-only. Raw token values are shown once at creation time.
-- OpenRouter is an external processing dependency. Prompts are bounded by authorized evidence and document content is treated as untrusted input.
+คำถามเชิง inventory เช่น “มีกฎหมายทั้งหมดกี่ฉบับ” หรือ “แบ่งเอกสารเป็นประเภทใดบ้าง” ใช้ `document_inventory_summary` ซึ่งนับและจัดกลุ่มจาก document/legal registry โดยตรง หาก Agent ใช้ `search_knowledge` ระบบจะตรวจจับรูปแบบนี้และใช้ deterministic fallback แทนการนับจาก chunks
 
-## Legal document extraction
+## กฎหมายและกราฟ
 
-For a completed document, an administrator can request structured legal metadata from the document details panel or API:
+เอกสารประเภท `legal`, `regulation` และ `contract` รองรับ legal metadata, การแบ่ง chunk ตาม มาตรา/ข้อ/หมวด, legal graph และ legal registry ที่จัดกลุ่มฉบับ/วันที่มีผล/สถานะ (`in_force`, `amended`, `superseded`, `repealed` ฯลฯ) ความสัมพันธ์ที่ AI เสนอจะไม่มีผลต่อ retrieval จนกว่าจะผ่านการ review
 
-```http
-POST /api/v1/documents/{document_id}/legal-extract
+เอกสารฉบับรวมหนึ่งไฟล์ที่มีหลายส่วนย่อย (เช่น พ.ร.บ.ให้ใช้ฯ + ตัวประมวลกฎหมาย + หมายเหตุท้ายฉบับแก้ไข) จะถูกแยกส่วนก่อนตอบ เพื่อไม่ให้เลขมาตราที่ชนกันข้ามส่วนย่อยทำให้อ้างอิงผิดฉบับ และการหาฉบับแก้ไขล่าสุดของมาตราหนึ่งจะจำกัดขอบเขตไว้ในกฎหมายตระกูล (family) เดียวกันเสมอ
+
+## เชื่อมต่อ Agent
+
+หน้า **Access & MCP** สร้าง MCP token แบบจำกัดสิทธิ์ (Knowledge Base + เครื่องมือ + rate limit) และปุ่ม "Copy SKILL" ที่สร้างไฟล์ `SKILL.md` ตามมาตรฐานเปิด [agentskills.io](https://agentskills.io) เพื่อสั่งให้ agent ตอบจาก Knowledge Base นี้เท่านั้น ไม่ผสมคำตอบจาก web search หรือ training data ของตัวเอง — ดูรายละเอียดที่ [MCP](docs/MCP.md)
+
+หน้า **Logging → Trace Explorer** แสดง MCP tool call ทั้งที่สำเร็จและถูกปฏิเสธ/ล้มเหลว (rate limit, timeout, tool ไม่ได้รับอนุญาต) พร้อม retrieval plan และ channel trace ในที่เดียว
+
+## ลิงก์สำคัญ
+
+- [Deployment](docs/DEPLOYMENT.md) — ตั้งค่า, migration, production และ reindex
+- [API](docs/API.md) — endpoint และรูปแบบ query/filter
+- [MCP](docs/MCP.md) — เชื่อม Claude Code หรือ agent ด้วย token, และสร้าง Agent Skill (SKILL.md)
+- [Architecture](docs/ARCHITECTURE.md) — บทบาทของแต่ละ service และแหล่งข้อมูลหลัก
+- [High-level Data Flow](docs/DATA_FLOW.md) — ลำดับการไหลของ upload/query/answer
+- [Security](docs/SECURITY.md) — การป้องกันข้อมูลและ secret
+- [Acceptance walkthrough](docs/ACCEPTANCE.md) — ขั้นตอนทดสอบตั้งแต่ upload ถึง MCP
+- [Backup & restore](docs/BACKUP_RESTORE.md) — สิ่งที่ต้องสำรองและตรวจหลัง restore
+
+## ทดสอบ
+
+```bash
+cd apps/api
+pytest -q
+ruff check app tests
 ```
 
-The request creates an asynchronous `EXTRACT_LEGAL_METADATA` job. Legal Graph Schema v2 stores a `LegalInstrument`, document-scoped `provisions`, parties, obligations, rights, prohibitions, penalties, definitions, amendments, and explicit cross-document `references`. Every projected fact has an evidence quote and document provenance. The legacy `articles` field remains readable for compatibility while new extraction writes `provisions`.
-
-Administrators can review and maintain the metadata from the document details panel or API. `PUT /api/v1/documents/{document_id}/legal-metadata` replaces the structured object, `PATCH /api/v1/documents/{document_id}/legal-metadata` merges top-level fields (useful for adding an article or amendment), and `DELETE /api/v1/documents/{document_id}/legal-metadata` clears it. All changes are recorded in the audit log.
-
-The upload form includes a **Document type** choice. Select **Legal document**, **Regulation / policy**, or **Contract** to preserve that classification and automatically queue legal-schema extraction after the document has been extracted, chunked, embedded, and indexed. The document stays searchable if legal extraction later fails; the extraction job records the error for review. **General document** keeps the standard knowledge-processing flow.
-
-### Legal Graph review
-
-Explore Graph opens **Verified legal structure** by default. It separates deterministic document structure from **Suggested relationships** such as `ISSUED_UNDER` and `IMPLEMENTS`. Suggestions are created only from explicit evidence, remain unavailable to impact analysis until an administrator approves them, and retain their excerpt, source document, confidence, reviewer, and audit trail. Use `POST /api/v1/knowledge-bases/{kb_id}/legal-graph/rebuild` to queue an idempotent rebuild; it replaces only system-generated legal graph data and preserves manual graph work.
-
-It is an information-extraction aid, not legal advice; reviewers must verify every extracted item against the source document. Scanned PDFs still require OCR before legal extraction can run.
-
-A legal document's chunks are split on มาตรา/ข้อ/หมวด headings rather than fixed character windows, so each chunk carries its own section identity (`section_kind`, `section_number`, `section_label`); a cross-reference such as "ให้เป็นไปตามมาตรา 15" mid-sentence never starts a spurious new section.
-
-### Legal registry: temporal and authority-aware retrieval
-
-Beyond the graph, every legal/regulation/contract document gets a **legal registry** entry: a rule-based kind (พระราชบัญญัติ, กฎกระทรวง, ประกาศ, ระเบียบ, ...) with an authority level, a family grouping it with its amendments, effective_from/effective_to, and a status (`in_force`, `amended`, `superseded`, `repealed`, `not_yet_effective`, `unknown`). The status is resolved deterministically — no LLM call — from reviewed AMENDS/REPEALS/SUPERSEDES relationships; an administrator's manual override at `PATCH /api/v1/legal-instruments/{id}` always wins and is never recomputed.
-
-Queries against a Knowledge Base with a legal registry get:
-
-- **Version resolution** — `filters.as_of_date` (default today) selects the instrument version that was in force at that date; `filters.include_historical` disables exclusion to compare every version.
-- **Weighted ranking** — fused evidence is boosted by authority level, legal status, and recency, tunable per Knowledge Base via `PATCH /knowledge-bases/{id}/retrieval-config` (`authority_weight`, `status_weight`, `recency_weight`, `legal_awareness`, `exclude_invalid`).
-- **Conflict detection** — duplicate provisions across versions collapse to the current one, and citations returned to the client and the LLM carry the resolved status, authority level, version label, and effective dates so an answer never silently mixes a repealed provision with its replacement.
-
-A Knowledge Base with no legal documents is completely unaffected: the resolver finds nothing to match and every weight multiplies against an empty registry.
+การทดสอบ integration ของ PostgreSQL/pgvector ใช้ `docker-compose.pgvector-test.yml` และจะ skip หากไม่ได้ตั้ง `TEST_POSTGRES_DATABASE_URL`

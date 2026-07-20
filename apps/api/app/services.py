@@ -13,8 +13,8 @@ from docx import Document as WordDocument
 import httpx
 from markitdown import MarkItDown
 from pypdf import PdfReader
-from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy import Text, and_, cast, func, or_
+from sqlalchemy.orm import Session, aliased
 
 from .config import get_settings
 from .db import SessionLocal
@@ -23,7 +23,8 @@ from .graph_store import Neo4jGraphStore
 from .legal_registry import AUTHORITY_LEVELS, classify_kind, normalize_family_key, parse_provision_refs, parse_thai_date, provision_number_matches, resolve_instrument_statuses
 from .legal_resolver import resolve_legal_context
 from .legal_corpus import parse_legal_corpus_metadata
-from .models import Document, DocumentChunk, Entity, EntitySource, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
+from .document_templates import metadata_search_text, normalize_field_definitions
+from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .openrouter import OpenRouterClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
@@ -116,6 +117,121 @@ def create_relationship(db: Session, knowledge_base_id: str, payload) -> Relatio
     db.commit()
     db.refresh(relationship)
     return relationship
+
+
+def _remove_metadata_graph_projection(db: Session, document: Document) -> None:
+    """Remove only graph facts generated from the document's metadata fields."""
+    relationship_ids = [row[0] for row in db.query(Relationship.id).join(RelationshipSource).filter(
+        RelationshipSource.document_id == document.id, Relationship.origin == "metadata"
+    ).all()]
+    for relationship_id in relationship_ids:
+        db.query(RelationshipSource).filter_by(relationship_id=relationship_id, document_id=document.id).delete(synchronize_session=False)
+        relationship = db.get(Relationship, relationship_id)
+        if relationship:
+            relationship.source_count = db.query(func.count(RelationshipSource.id)).filter_by(relationship_id=relationship_id).scalar() or 0
+            if relationship.source_count == 0:
+                relationship.deleted_at = datetime.utcnow()
+    entity_ids = [row[0] for row in db.query(Entity.id).join(EntitySource).filter(
+        EntitySource.document_id == document.id, Entity.origin == "metadata"
+    ).all()]
+    for entity_id in entity_ids:
+        db.query(EntitySource).filter_by(entity_id=entity_id, document_id=document.id).delete(synchronize_session=False)
+        entity = db.get(Entity, entity_id)
+        if entity:
+            entity.source_count = db.query(func.count(EntitySource.id)).filter_by(entity_id=entity_id).scalar() or 0
+            if entity.source_count == 0:
+                entity.deleted_at = datetime.utcnow()
+    db.flush()
+
+
+def sync_document_metadata_values(db: Session, document: Document) -> None:
+    """Maintain the indexed projection used by exact metadata filters."""
+    db.query(DocumentMetadataValue).filter(DocumentMetadataValue.document_id == document.id).delete(synchronize_session=False)
+    fields = normalize_field_definitions(document.metadata_template_fields)
+    values = document.document_metadata or {}
+    for field in fields:
+        key = field.get("key")
+        value = values.get(key) if key else None
+        if not field.get("filterable") or value in (None, ""):
+            continue
+        db.add(DocumentMetadataValue(
+            knowledge_base_id=document.knowledge_base_id,
+            document_id=document.id,
+            field_key=key,
+            value_text=str(value)[:10000],
+        ))
+    db.flush()
+
+
+def sync_document_metadata_graph(db: Session, document: Document) -> dict[str, int]:
+    """Promote only explicitly mapped metadata fields into the local graph.
+
+    The document and mapped values retain a source excerpt, so graph evidence
+    remains traceable to the user-supplied metadata rather than becoming an
+    unproven global fact.
+    """
+    _remove_metadata_graph_projection(db, document)
+    fields = normalize_field_definitions(document.metadata_template_fields)
+    mapped = [field for field in fields if field.get("graph_relationship") and field.get("graph_entity_type")
+              and document.document_metadata.get(field.get("key")) not in (None, "")]
+    if not mapped:
+        return {"entities": 0, "relationships": 0}
+    anchor_key = f"metadata:document:{document.id}"
+    anchor = db.query(Entity).filter_by(knowledge_base_id=document.knowledge_base_id, identity_key=anchor_key, entity_type="Document").first()
+    created_anchor = False
+    if not anchor:
+        anchor = Entity(knowledge_base_id=document.knowledge_base_id,
+                        name=document.title or document.original_filename,
+                        canonical_name=canonical_entity_name(document.title or document.original_filename),
+                        identity_key=anchor_key, entity_type="Document", confidence=1.0,
+                        origin="metadata", review_status="verified", is_legal=False,
+                        attributes={"document_id": document.id})
+        db.add(anchor); db.flush(); created_anchor = True
+        db.add(GraphProjectionEvent(event_type="entity", entity_id=anchor.id))
+    else:
+        anchor.deleted_at = None
+    anchor_excerpt = f"Document: {document.title or document.original_filename}"[:5000]
+    if not db.query(EntitySource).filter_by(entity_id=anchor.id, document_id=document.id, excerpt=anchor_excerpt).first():
+        db.add(EntitySource(entity_id=anchor.id, document_id=document.id, excerpt=anchor_excerpt)); anchor.source_count += 1
+    entity_count, relationship_count = int(created_anchor), 0
+    for field in mapped:
+        raw_value = document.document_metadata.get(field["key"])
+        value = str(raw_value).strip()[:500]
+        entity_type = str(field["graph_entity_type"]).strip()[:100]
+        relationship_type = str(field["graph_relationship"]).strip().upper()
+        identity_key = f"metadata:{entity_type.casefold()}:{canonical_entity_name(value)}"
+        target = db.query(Entity).filter_by(knowledge_base_id=document.knowledge_base_id,
+                                             identity_key=identity_key, entity_type=entity_type).first()
+        if not target:
+            target = Entity(knowledge_base_id=document.knowledge_base_id, name=value,
+                            canonical_name=canonical_entity_name(value), identity_key=identity_key,
+                            entity_type=entity_type, confidence=1.0, origin="metadata",
+                            review_status="verified", is_legal=False,
+                            attributes={"metadata_field": field["key"]})
+            db.add(target); db.flush()
+            db.add(GraphProjectionEvent(event_type="entity", entity_id=target.id))
+            entity_count += 1
+        else:
+            target.deleted_at = None
+        excerpt = f"{field.get('label') or field['key']}: {value}"[:5000]
+        if not db.query(EntitySource).filter_by(entity_id=target.id, document_id=document.id, excerpt=excerpt).first():
+            db.add(EntitySource(entity_id=target.id, document_id=document.id, excerpt=excerpt)); target.source_count += 1
+        edge = db.query(Relationship).filter_by(knowledge_base_id=document.knowledge_base_id,
+                                                source_entity_id=anchor.id, target_entity_id=target.id,
+                                                relationship_type=relationship_type).first()
+        if not edge:
+            edge = Relationship(knowledge_base_id=document.knowledge_base_id, source_entity_id=anchor.id,
+                                target_entity_id=target.id, relationship_type=relationship_type,
+                                description=excerpt, confidence=1.0, origin="metadata",
+                                review_status="verified", is_legal=False)
+            db.add(edge); db.flush(); relationship_count += 1
+            db.add(GraphProjectionEvent(event_type="relationship", relationship_id=edge.id))
+        else:
+            edge.deleted_at, edge.description, edge.origin, edge.review_status = None, excerpt, "metadata", "verified"
+        if not db.query(RelationshipSource).filter_by(relationship_id=edge.id, document_id=document.id, excerpt=excerpt).first():
+            db.add(RelationshipSource(relationship_id=edge.id, document_id=document.id, excerpt=excerpt)); edge.source_count += 1
+    db.flush()
+    return {"entities": entity_count, "relationships": relationship_count}
 
 
 def sync_lightrag_document_graph(db: Session, document: Document, max_labels: int = 200) -> dict[str, int]:
@@ -497,6 +613,7 @@ def upsert_legal_instrument(db: Session, document: Document) -> LegalInstrument 
         row.enacted_year = enacted_year
         row.legal_work_key = legal_work_key
         row.document_class = _legal_value(instrument_meta, "document_class") or None
+        row.version_role = _legal_value(instrument_meta, "version_role") or row.document_class or None
         row.version_date = parse_thai_date(instrument_meta.get("version_date")) or document.published_at
         row.effective_from = parse_thai_date(instrument_meta.get("effective_date")) or parse_thai_date(instrument_meta.get("version_date")) or document.published_at
         row.effective_to = parse_thai_date(instrument_meta.get("effective_to"))
@@ -518,8 +635,12 @@ def _sync_deterministic_change_events(db: Session, knowledge_base_id: str) -> in
     """
     instruments = db.query(LegalInstrument).filter_by(knowledge_base_id=knowledge_base_id).all()
     docs = {doc.id: doc for doc in db.query(Document).filter(Document.id.in_([row.document_id for row in instruments])).all()}
-    by_id = {row.id: row for row in instruments}
     changed = 0
+    # Two clauses in one act can normalize to the same edge (e.g. a "replace" and
+    # an "insert" that both touch มาตรา 105 both map to AMENDS→105). The find-or-
+    # create query cannot see a sibling added earlier in this same run, so guard
+    # the unique key in-memory to avoid a duplicate-key flush failure.
+    batch_seen: set[tuple[str, str, str, str | None]] = set()
     for source in instruments:
         if source.document_class != "amendment":
             continue
@@ -537,6 +658,10 @@ def _sync_deterministic_change_events(db: Session, knowledge_base_id: str) -> in
             action = str(event.get("action") or "replace").casefold()
             relation_type = "REPEALS" if action == "repeal" else "AMENDS"
             target_provision = str(event.get("target_provision") or event.get("provision_number") or "")[:120] or None
+            batch_key = (source.id, relation_type, target.id, target_provision)
+            if batch_key in batch_seen:
+                continue
+            batch_seen.add(batch_key)
             row = db.query(LegalInstrumentRelation).filter_by(
                 source_instrument_id=source.id, relation=relation_type,
                 target_instrument_id=target.id, target_provision=target_provision,
@@ -637,7 +762,7 @@ def _target_instrument(db: Session, document: Document, reference: dict) -> Docu
     return max(matches, key=lambda item: (item[0], item[1]))[2] if matches else None
 
 
-def build_legal_cross_document_suggestions(db: Session, knowledge_base_id: str) -> int:
+def build_legal_cross_document_suggestions(db: Session, knowledge_base_id: str, *, allow_model: bool = True) -> int:
     """Create reviewable, evidenced cross-instrument links from extracted references."""
     count = 0
     documents = db.query(Document).filter(
@@ -648,7 +773,7 @@ def build_legal_cross_document_suggestions(db: Session, knowledge_base_id: str) 
         source = legal_instrument_entity(db, document)
         metadata = legal_metadata_v2(document)
         references = metadata.get("references", []) if isinstance(metadata.get("references"), list) else []
-        if not references and document.extracted_text:
+        if allow_model and not references and document.extracted_text:
             candidates = []
             for candidate in documents:
                 if candidate.id == document.id:
@@ -695,7 +820,11 @@ def rebuild_legal_graph(db: Session, knowledge_base_id: str) -> dict[str, int]:
         upsert_legal_instrument(db, document)
         link_provisions_to_chunks(db, document)
     totals["deterministic_relations"] = _sync_deterministic_change_events(db, knowledge_base_id)
-    totals["suggestions"] = build_legal_cross_document_suggestions(db, knowledge_base_id)
+    # Registry rebuild is a deterministic maintenance operation.  It must not
+    # fan out into one model call per document; curated/previously-extracted
+    # references are still materialized, while optional AI suggestions can be
+    # generated explicitly through the existing helper when desired.
+    totals["suggestions"] = build_legal_cross_document_suggestions(db, knowledge_base_id, allow_model=False)
     totals["status_changes"] = resolve_instrument_statuses(db, knowledge_base_id)["changed"]
     db.commit()
     return totals
@@ -731,11 +860,32 @@ def relationship_sources(db: Session, relationships: list[Relationship], plan: R
         rows = rows.filter(Document.published_at >= plan.published_from)
     if plan and plan.published_to:
         rows = rows.filter(Document.published_at < plan.published_to)
+    rows = _apply_metadata_filter(rows, plan)
     rows = rows.all()
     return [{"citation_id": f"S{index}", "document_id": document.id, "title": document.title,
              "chunk_id": source.id, "excerpt": source.excerpt, "relevance": 1.0 / index,
              "_relationship_id": source.relationship_id}
             for index, (source, document) in enumerate(rows, 1)]
+
+
+def _relationship_filter_active(plan: RetrievalPlan | None) -> bool:
+    return bool(plan and (plan.published_from or plan.published_to or plan.metadata_document_ids is not None))
+
+
+def _filter_relationships_by_plan(db: Session, relationships: list[Relationship], plan: RetrievalPlan | None) -> list[Relationship]:
+    """Keep only edges with at least one source document in the hard-filter scope."""
+    if not relationships or not _relationship_filter_active(plan):
+        return relationships
+    query = db.query(RelationshipSource.relationship_id).join(
+        Document, Document.id == RelationshipSource.document_id,
+    ).filter(
+        RelationshipSource.relationship_id.in_([relationship.id for relationship in relationships]),
+        Document.status == "completed", Document.deleted_at.is_(None),
+    )
+    query = _apply_published_filter(query, plan)
+    query = _apply_metadata_filter(query, plan)
+    allowed = {row[0] for row in query.distinct().all()}
+    return [relationship for relationship in relationships if relationship.id in allowed]
 
 
 def entity_graph(db: Session, entity: Entity, depth: int = 1) -> dict:
@@ -836,8 +986,839 @@ def store_upload(upload, knowledge_base_id: str) -> tuple[str, str, int, str, st
 DOCUMENT_TYPES = {"general", "legal", "regulation", "contract"}
 LEGAL_DOCUMENT_TYPES = {"legal", "regulation", "contract"}
 
+DOCUMENT_TYPE_LABELS = {
+    "general": "General document",
+    "legal": "Legal document",
+    "regulation": "Regulation / policy",
+    "contract": "Contract",
+}
+LEGAL_KIND_LABELS = {
+    "constitution": "รัฐธรรมนูญ",
+    "act": "พระราชบัญญัติ",
+    "royal_decree": "พระราชกฤษฎีกา",
+    "ministerial_regulation": "กฎกระทรวง",
+    "notification": "ประกาศ",
+    "rule": "ระเบียบ/ข้อบังคับ",
+    "circular": "หนังสือเวียน",
+    "guideline": "แนวปฏิบัติ/คู่มือ",
+    "resolution": "มติ",
+    "other": "อื่น ๆ",
+}
+DOCUMENT_CLASS_LABELS = {
+    "main": "กฎหมายหลัก",
+    "consolidated": "ฉบับรวม/ฉบับปรับปรุง",
+    "amendment": "ฉบับแก้ไขเพิ่มเติม",
+}
 
-def create_document_job(db: Session, knowledge_base_id: str, upload, title: str | None = None, document_type: str = "general", published_at=None) -> tuple[Document, ProcessingJob]:
+VERSION_ROLE_LABELS = {
+    "main": "กฎหมายหลัก",
+    "amendment": "ฉบับแก้ไขเพิ่มเติม",
+    "consolidated": "ฉบับรวม/ฉบับปรับปรุง",
+    "latest_consolidated": "ฉบับปรับปรุงล่าสุด",
+    "unknown": "ไม่ระบุชั้นฉบับ",
+}
+
+_INVENTORY_COUNT_TERMS = ("กี่ฉบับ", "กี่เอกสาร", "จำนวน", "รายการ", "รายชื่อ", "แสดงรายการ", "มีอะไรบ้าง", "how many", "count", "list", "show", "what documents")
+_INVENTORY_TYPE_TERMS = ("ประเภท", "แบ่งกลุ่ม", "แบ่งเป็น", "category", "categories", "grouped")
+_INVENTORY_SUBJECT_TERMS = ("เอกสาร", "กฎหมาย", "knowledge base", "document", "law")
+_INVENTORY_CURRENT_TERMS = ("ปัจจุบัน", "ล่าสุด", "มีผลบังคับใช้", "ยังมีผล", "current", "latest", "in force")
+_INVENTORY_ACTION_TERMS = ("ลบ", "แก้ไข", "อัปโหลด", "อัพโหลด", "ดาวน์โหลด", "ย้าย", "เก็บ", "archive", "delete", "remove", "upload", "download", "move", "process", "reindex", "how do i", "อย่างไร", "ทำอย่างไร", "วิธี")
+_LEGAL_METADATA_LOOKUP_TERMS = ("วันที่ในผัง", "ฉบับล่าสุดในชุด", "เอกสารใด", "ต้องคืนเอกสาร", "ข้อความจากกฎหมายฉบับ")
+_LEGAL_PROVENANCE_TERMS = ("แก้ไขโดย", "แก้ไขเพิ่มเติมโดย", "ถูกเพิ่มโดย", "เพิ่มโดย", "ยกเลิกโดย", "ฉบับใด")
+_THAI_DIGIT_TRANSLATION = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+
+
+def is_document_inventory_query(query: str) -> bool:
+    """Recognize count/list/type questions before the LLM planner runs."""
+    value = (query or "").strip().casefold()
+    if not value or not any(term in value for term in _INVENTORY_SUBJECT_TERMS):
+        return False
+    count_signal = any(term in value for term in _INVENTORY_COUNT_TERMS)
+    type_signal = any(term in value for term in _INVENTORY_TYPE_TERMS)
+    if any(term in value for term in _INVENTORY_ACTION_TERMS) and not any(term in value for term in ("กี่", "จำนวน", "how many", "count")):
+        return False
+    return count_signal or (type_signal and "แบ่ง" in value)
+
+
+def document_inventory_scope(query: str, query_filters=None) -> str:
+    if bool(getattr(query_filters, "include_historical", False)):
+        return "all"
+    value = (query or "").casefold()
+    return "current" if any(term in value for term in _INVENTORY_CURRENT_TERMS) else "all"
+
+
+def _requested_amendment_number(query: str) -> str | None:
+    match = re.search(r"ฉบับ(?:แก้ไข)?\s*(?:ครั้ง)?\s*ที่\s*([0-9๐-๙]+)", query or "", re.IGNORECASE)
+    return match.group(1).translate(_THAI_DIGIT_TRANSLATION) if match else None
+
+
+def is_legal_metadata_lookup(query: str) -> bool:
+    """Recognize document/version questions that must not use chunk similarity.
+
+    This is intentionally based on reusable legal metadata language, not a
+    corpus name or a document filename.  Questions asking how an amendment
+    changes a provision continue through the provision/provenance path.
+    """
+    value = (query or "").casefold()
+    asks_latest = "ฉบับล่าสุด" in value and any(term in value for term in ("เอกสาร", "ชุดข้อมูล", "วันที่ในผัง", "ฉบับใด"))
+    asks_exact = bool(_requested_amendment_number(query)) and any(term in value for term in _LEGAL_METADATA_LOOKUP_TERMS)
+    return asks_latest or asks_exact
+
+
+def _legal_metadata_source(document: Document, instrument: LegalInstrument) -> dict:
+    title = document.title or document.original_filename
+    return {
+        "citation_id": "S1", "document_id": document.id, "title": title,
+        "excerpt": f"{instrument.official_title or title}; วันที่ในผัง {instrument.version_date.isoformat() if instrument.version_date else 'ไม่ระบุ'}",
+        "relevance": 1.0, "document_status": instrument.status,
+        "document_class": instrument.document_class, "version_role": instrument.version_role,
+        "version_label": instrument.version_label, "version_date": instrument.version_date.isoformat() if instrument.version_date else None,
+        "source_uri": instrument.source_uri, "source_reference": instrument.source_reference,
+        "legal_label": instrument.official_title or title,
+    }
+
+
+def _trace_preview_fields(query: str, answer: str, sources: list[dict]) -> dict:
+    """Populate the same observability fields the generic retrieval path and the
+    document-inventory shortcut record (query_preview/answer_preview/etc.).
+
+    Every deterministic legal-registry shortcut builds its own result dict
+    rather than going through the generic composer, so without this they show
+    "Query preview unavailable" / "No answer preview" in the Trace Explorer even
+    though the query was answered successfully.
+    """
+    settings = get_settings()
+    query = query or ""
+    return {
+        "query_preview": query[:500] if settings.log_query_text else None,
+        "query_length": len(query),
+        "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        "answer_preview": (answer or "")[:800] if settings.log_query_text else None,
+        "citation_ids": [source.get("citation_id") for source in sources],
+        "filter_summary": {},
+    }
+
+
+def build_legal_metadata_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
+    """Resolve publisher/version metadata directly from the legal registry."""
+    rows = db.query(Document, LegalInstrument).join(LegalInstrument, LegalInstrument.document_id == Document.id).filter(
+        Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None), Document.status == "completed"
+    )
+    requested = _requested_amendment_number(query)
+    if requested:
+        rows = rows.filter(LegalInstrument.version_role == "amendment", LegalInstrument.official_number == requested)
+    else:
+        rows = rows.filter(LegalInstrument.version_role == "latest_consolidated")
+    matches = rows.order_by(LegalInstrument.version_date.desc(), Document.created_at.desc()).all()
+    sources = [_legal_metadata_source(document, instrument) for document, instrument in matches[:1]]
+    if sources:
+        source = sources[0]
+        document, instrument = matches[0]
+        date_text = instrument.version_date.isoformat() if instrument.version_date else "ไม่ระบุวันที่ในผัง"
+        if requested:
+            answer = f"เอกสารที่ตรงกับฉบับแก้ไขครั้งที่ {requested} คือ {document.title or document.original_filename} — {instrument.official_title or ''} — วันที่ในผัง {date_text} [S1]"
+        else:
+            answer = f"ฉบับล่าสุดในชุดข้อมูลคือ {document.title or document.original_filename} — {instrument.official_title or ''} — วันที่ในผัง {date_text} [S1]"
+        answer += "\n\nรายละเอียดแหล่งอ้างอิง:\n" + _render_citation_details(sources)
+    else:
+        answer = "ไม่พบเอกสารกฎหมายที่มี metadata ตรงกับฉบับที่ร้องขอในขอบเขตของ MCP key"
+    result = {
+        "status": "success", "result_id": "", "answer": answer, "insufficient_evidence": not bool(sources),
+        "sources": sources, "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": "legal_metadata_registry",
+        "retrieval_plan": {"version": 1, "intent": "legal_metadata_lookup", "planner_source": "rules", "channels": ["legal_registry"]},
+        "retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": len(sources), "duration_ms": 0, "detail": "publisher metadata lookup"}],
+        **_trace_preview_fields(query, answer, sources)},
+    }
+    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
+    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
+    return result
+
+
+def is_legal_provenance_lookup(query: str) -> bool:
+    """Detect amendment/repeal questions answerable from verified registry edges."""
+    return bool(parse_provision_refs(query)) and any(term in (query or "").casefold() for term in _LEGAL_PROVENANCE_TERMS)
+
+
+def is_legal_effective_rule_lookup(query: str) -> bool:
+    value = (query or "").casefold()
+    return bool(_requested_amendment_number(query)) and any(term in value for term in ("มีผลใช้บังคับ", "เริ่มใช้บังคับ", "กำหนดเวลา", "วันถัดจากวันประกาศ", "วันประกาศ"))
+
+
+def build_legal_effective_rule_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
+    """Return the operative commencement/change clauses of a named amendment.
+
+    This retrieves the statute's own sections 2--3 instead of treating the
+    publisher's version date as a legal effective date.
+    """
+    requested = _requested_amendment_number(query)
+    rows = db.query(Document, LegalInstrument).join(LegalInstrument, LegalInstrument.document_id == Document.id).filter(
+        Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None), Document.status == "completed",
+        LegalInstrument.version_role == "amendment", LegalInstrument.official_number == requested,
+    ).order_by(LegalInstrument.version_date.desc()).all()
+    sources: list[dict] = []
+    if rows:
+        document, instrument = rows[0]
+        chunks = db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == document.id, DocumentChunk.section_number.in_(("2", "3")),
+        ).order_by(DocumentChunk.chunk_index).all()
+        for chunk in chunks:
+            sources.append({
+                "citation_id": f"S{len(sources) + 1}", "document_id": document.id, "chunk_id": chunk.id,
+                "title": document.title or document.original_filename, "section_label": chunk.section_label,
+                "excerpt": chunk.content, "relevance": 1.0, "document_status": instrument.status,
+                "document_class": instrument.document_class, "version_role": instrument.version_role,
+                "source_uri": instrument.source_uri, "source_reference": instrument.source_reference,
+                "legal_label": instrument.official_title or document.title or document.original_filename,
+            })
+    if sources:
+        answer = "\n\n".join(f"{source['excerpt']}\n[{source['citation_id']}]" for source in sources)
+        answer += "\n\nรายละเอียดแหล่งอ้างอิง:\n" + _render_citation_details(sources)
+    else:
+        answer = "ไม่พบข้อบทว่าด้วยวันเริ่มใช้บังคับของฉบับแก้ไขที่ระบุในคลังข้อมูลที่เลือก"
+    result = {
+        "status": "success", "result_id": "", "answer": answer, "insufficient_evidence": not bool(sources), "sources": sources,
+        "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": "legal_effective_rule_registry",
+        "retrieval_plan": {"version": 1, "intent": "legal_effective_date_rule", "planner_source": "rules", "channels": ["legal_registry", "document_chunks"]},
+        "retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": len(sources), "duration_ms": 0, "detail": "named amendment commencement clauses"}],
+        **_trace_preview_fields(query, answer, sources)},
+    }
+    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
+    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
+    return result
+
+
+def _verified_amendment_relations(db: Session, kb_ids: list[str], family_id: str | None) -> list[tuple[LegalInstrumentRelation, LegalInstrument, Document]]:
+    """Fetch every verified AMENDS relation once, scoped to one legal family.
+
+    Scoping by the amended (target) instrument's family_id keeps amendment
+    attribution from being answered by a different, unrelated law that
+    happens to share the same bare section number (e.g. two unrelated codes
+    both loaded into one Knowledge Base each having their own "มาตรา 104").
+    Fetching once per caller instead of once per provision also avoids
+    repeating this full-table scan when a result names several sections.
+    """
+    query = db.query(LegalInstrumentRelation, LegalInstrument, Document).join(
+        LegalInstrument, LegalInstrument.id == LegalInstrumentRelation.source_instrument_id
+    ).join(Document, Document.id == LegalInstrument.document_id).filter(
+        LegalInstrumentRelation.knowledge_base_id.in_(kb_ids),
+        LegalInstrumentRelation.review_status == "verified",
+        LegalInstrumentRelation.relation == "AMENDS",
+        Document.deleted_at.is_(None), Document.status == "completed",
+    )
+    if family_id:
+        target_instrument = aliased(LegalInstrument)
+        query = query.join(target_instrument, target_instrument.id == LegalInstrumentRelation.target_instrument_id).filter(
+            target_instrument.family_id == family_id
+        )
+    return query.order_by(LegalInstrument.version_date.desc(), Document.created_at.desc()).all()
+
+
+def _latest_amendment_for_provision(rows: list[tuple[LegalInstrumentRelation, LegalInstrument, Document]], number: str) -> tuple[LegalInstrument, Document] | None:
+    """Pick the most recent verified act, from an already-fetched and
+    family-scoped relation list, that amended a given section number.
+
+    Lets an answer served from the consolidated latest version state which
+    amending act produced a provision's current wording (e.g. มาตรา 104's text
+    comes from พ.ร.บ.แก้ไขฯ ฉบับที่ 15), which the instrument-level status alone
+    does not convey.
+    """
+    for relation, instrument, document in rows:
+        if provision_number_matches(relation.target_provision, number):
+            return instrument, document
+    return None
+
+
+def _persist_legal_clause_result(db: Session, *, query: str, kb_ids: list[str], token_id: str | None, intent: str,
+                                 detail: str, rows: list[tuple[DocumentChunk, Document, LegalInstrument]],
+                                 attribute_amendments: bool = False) -> dict:
+    # Defense-in-depth: drop verbatim-duplicate clauses (a consolidated file
+    # repeats identical commencement text) and cap the result, without collapsing
+    # a long provision whose distinct chunks legitimately share a section number.
+    deduped: list[tuple[DocumentChunk, Document, LegalInstrument]] = []
+    seen_excerpts: set[str] = set()
+    for chunk, document, instrument in rows:
+        key = (chunk.content or "").strip()
+        if key in seen_excerpts:
+            continue
+        seen_excerpts.add(key)
+        deduped.append((chunk, document, instrument))
+    rows = deduped[:6]
+    sources = [{
+        "citation_id": f"S{index}", "document_id": document.id, "chunk_id": chunk.id,
+        "title": document.title or document.original_filename, "section_label": chunk.section_label,
+        "excerpt": chunk.content, "relevance": 1.0 / index, "document_status": instrument.status,
+        "document_class": instrument.document_class, "version_role": instrument.version_role,
+        "source_uri": instrument.source_uri, "source_reference": instrument.source_reference,
+        "legal_label": instrument.official_title or document.title or document.original_filename,
+    } for index, (chunk, document, instrument) in enumerate(rows, 1)]
+    # The raw clause is a factual legal claim. Keep its citation adjacent to
+    # the text so callers do not need to infer which trailing source applies.
+    answer = "\n\n".join(f"{source['excerpt']}\n[{source['citation_id']}]" for source in sources)
+    attribution_lines: list[str] = []
+    if attribute_amendments and sources:
+        family_id = rows[0][2].family_id if rows else None
+        amendment_rows = _verified_amendment_relations(db, kb_ids, family_id)
+        for number in dict.fromkeys(chunk.section_number for chunk, _, _ in rows if chunk.section_number):
+            found = _latest_amendment_for_provision(amendment_rows, number)
+            if not found:
+                continue
+            amending_instrument, amending_document = found
+            citation_id = f"S{len(sources) + 1}"
+            amend_title = amending_instrument.official_title or amending_document.title or amending_document.original_filename
+            sources.append({
+                "citation_id": citation_id, "document_id": amending_document.id,
+                "title": amending_document.title or amending_document.original_filename,
+                "section_label": f"มาตรา {number}", "excerpt": f"มาตรา {number} แก้ไขเพิ่มเติมโดย {amend_title}",
+                "relevance": 0.6, "document_status": amending_instrument.status,
+                "document_class": amending_instrument.document_class, "version_role": amending_instrument.version_role,
+                "version_date": amending_instrument.version_date.isoformat() if amending_instrument.version_date else None,
+                "source_uri": amending_instrument.source_uri, "source_reference": amending_instrument.source_reference,
+                "legal_label": amend_title,
+            })
+            attribution_lines.append(f"ข้อความปัจจุบันของมาตรา {number} แก้ไขเพิ่มเติมโดย {amend_title} [{citation_id}]")
+    if sources:
+        answer = "คำตอบนี้อ้างอิงฉบับปรับปรุงล่าสุดที่มีผลบังคับใช้ในคลังข้อมูล\n" + answer
+        if attribution_lines:
+            answer += "\n\n" + "\n".join(attribution_lines)
+        answer += "\n\nรายละเอียดแหล่งอ้างอิง:\n" + _render_citation_details(sources)
+    else:
+        answer = "ไม่พบข้อบทที่ตรงกับเงื่อนไขในคลังข้อมูลที่เลือก"
+    result = {"status": "success", "result_id": "", "answer": answer, "insufficient_evidence": not bool(sources), "sources": sources,
+              "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": "legal_clause_registry",
+              "retrieval_plan": {"version": 1, "intent": intent, "planner_source": "rules", "channels": ["legal_registry", "document_chunks"]},
+              "retrieval_trace": [{"channel": "document_chunks", "system": "PostgreSQL legal sections", "status": "used", "result_count": len(sources), "duration_ms": 0, "detail": detail}],
+              **_trace_preview_fields(query, answer, sources)}}
+    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
+    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
+    return result
+
+
+def _sole_latest_legal_instrument(db: Session, kb_ids: list[str]) -> tuple[Document, LegalInstrument] | None:
+    rows = db.query(Document, LegalInstrument).join(LegalInstrument, LegalInstrument.document_id == Document.id).filter(
+        Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None), Document.status == "completed",
+        LegalInstrument.version_role == "latest_consolidated",
+    ).all()
+    return rows[0] if len(rows) == 1 else None
+
+
+# A consolidated Thai code file concatenates several sub-works and repeats
+# section numbers across them: the enabling act (พระราชบัญญัติให้ใช้…), the code
+# proper, and the trailing commencement/หมายเหตุ clauses of every amendment act.
+# ``ในประมวลกฎหมายนี้`` opens the code's own definitional section 1; the amendment
+# footers each carry the explanatory ``หมายเหตุ :- เหตุผลในการประกาศ`` line.
+_CODE_BODY_START_MARKER = "ในประมวลกฎหมายนี้"
+_AMENDMENT_NOTE_MARKER = "หมายเหตุ :- เหตุผลในการประกาศ"
+# Reusable legal concepts that occur verbatim in questions; used to rank clauses
+# lexically when a bare section number collides across sub-works.
+_LEGAL_CONCEPT_TERMS = ("ค่าธรรมเนียม", "จดทะเบียน", "นิติกรรม", "โอน", "กรรมสิทธิ์", "สิทธิครอบครอง",
+                        "ราคาประเมิน", "ทุนทรัพย์", "ใบอนุญาต", "ค่าตอบแทน", "ที่ดินของรัฐ", "หวงห้าม",
+                        "องค์การบริหารส่วนจังหวัด", "องค์กรปกครองส่วนท้องถิ่น", "รายได้")
+
+
+def segment_document_subworks(chunks: list[DocumentChunk]) -> dict[str, str]:
+    """Classify each chunk of a consolidated legal document into a sub-work:
+    ``enabling_act`` (the พระราชบัญญัติให้ใช้… preamble act), ``code_body`` (the
+    code proper), or ``amendment_note`` (the commencement/หมายเหตุ clauses that a
+    consolidation appends verbatim for every amending act).
+
+    One consolidated file repeats section numbers across these parts (two
+    ``มาตรา 9``, dozens of ``มาตรา 2``), so builders that filter by section number
+    alone need this to keep an enabling-act or amendment-note section out of an
+    answer about the code proper. Detection is deterministic, ordered by
+    ``chunk_index``, and fails safe: a document with no recognizable code-body
+    boundary returns every chunk as ``unknown`` so callers keep prior behavior.
+    """
+    ordered = sorted(chunks, key=lambda chunk: chunk.chunk_index)
+    stage = "enabling_act"
+    code_started = False
+    result: dict[str, str] = {}
+    for chunk in ordered:
+        text = chunk.content or ""
+        # Amendment notes only ever follow the code body itself, never the
+        # enabling act; requiring code_body to have already started rules out
+        # an incidental match of the marker phrase while still in the
+        # enabling act (e.g. a cross-reference in its preamble text) from
+        # short-circuiting classification for the rest of the document.
+        if stage == "code_body" and _AMENDMENT_NOTE_MARKER in text:
+            stage = "amendment_note"
+        # ในประมวลกฎหมายนี้ is definitionally the opening of a Thai code's
+        # มาตรา 1; requiring the section number match too rules out an
+        # incidental mention of the phrase elsewhere in the enabling act.
+        elif not code_started and _CODE_BODY_START_MARKER in text and chunk.section_number == "1":
+            stage = "code_body"
+            code_started = True
+        result[chunk.id] = stage
+    if not code_started:
+        return {chunk.id: "unknown" for chunk in ordered}
+    return result
+
+
+def _rank_chunks_by_query(query: str, chunks: list[DocumentChunk]) -> list[tuple[DocumentChunk, int]]:
+    """Order chunks by lexical overlap with the question, stable on chunk order.
+
+    Thai has no word spaces, so we match the salient phrases the user did
+    separate plus a reusable legal-concept list; a section number that collides
+    across sub-works then resolves to the clause the question is really about.
+    Returns (chunk, score) pairs, highest first, so a caller that must fail
+    closed on no match can filter out zero-score chunks itself.
+    """
+    value = (query or "").casefold()
+    phrases = {phrase for phrase in re.split(r"[\s?,.()ฯ]+", value) if len(phrase) >= 3}
+    terms = {term for term in (phrases | set(_LEGAL_CONCEPT_TERMS)) if term and term in value}
+
+    def score(chunk: DocumentChunk) -> int:
+        text = (chunk.content or "").casefold()
+        return sum(1 for term in terms if term in text)
+
+    scored = [(chunk, score(chunk)) for chunk in chunks]
+    scored.sort(key=lambda item: (-item[1], item[0].chunk_index))
+    return scored
+
+
+def is_legal_commencement_lookup(query: str) -> bool:
+    value = (query or "").casefold()
+    return "เริ่มใช้บังคับ" in value and not _requested_amendment_number(query)
+
+
+def build_legal_commencement_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
+    current = _sole_latest_legal_instrument(db, kb_ids)
+    rows: list[tuple[DocumentChunk, Document, LegalInstrument]] = []
+    if current:
+        document, instrument = current
+        all_chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == document.id).order_by(DocumentChunk.chunk_index).all()
+        sub_works = segment_document_subworks(all_chunks)
+        # Section 2/3 collide across dozens of amendment footers; keep only the
+        # real commencement sections and prefer the clause stating when the code
+        # itself came into force over the enabling act's own commencement.
+        candidates = [chunk for chunk in all_chunks
+                      if chunk.section_number in ("2", "3") and sub_works.get(chunk.id) != "amendment_note"]
+        focused = [chunk for chunk in candidates
+                   if "ประมวลกฎหมายที่ดิน" in (chunk.content or "") and "ให้ใช้บังคับ" in (chunk.content or "")]
+        rows = [(chunk, document, instrument) for chunk in (focused or candidates)[:2]]
+    return _persist_legal_clause_result(db, query=query, kb_ids=kb_ids, token_id=token_id, intent="legal_commencement_rule",
+                                        detail="current legal commencement clauses", rows=rows)
+
+
+def is_legal_document_copy_lookup(query: str) -> bool:
+    value = (query or "").casefold()
+    return ("โฉนดที่ดิน" in value or "หนังสือรับรองการทำประโยชน์" in value) and any(
+        term in value for term in ("กี่ฉบับ", "ใครเก็บ", "ต้นฉบับ", "จัดเก็บ")
+    )
+
+
+def build_legal_document_copy_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
+    current = _sole_latest_legal_instrument(db, kb_ids)
+    rows: list[tuple[DocumentChunk, Document, LegalInstrument]] = []
+    if current:
+        document, instrument = current
+        chunks = db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == document.id,
+            DocumentChunk.content.ilike("%คู่ฉบับ%"),
+            DocumentChunk.content.ilike("%โฉนดที่ดิน%"),
+            DocumentChunk.content.ilike("%หนังสือรับรองการทำประโยชน์%"),
+        ).order_by(DocumentChunk.chunk_index).all()
+        rows = [(chunk, document, instrument) for chunk in chunks[:2]]
+    return _persist_legal_clause_result(db, query=query, kb_ids=kb_ids, token_id=token_id, intent="legal_document_copy_rule",
+                                        detail="complete document-copy clause", rows=rows)
+
+
+def build_default_current_provision_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
+    """Serve a cited complete section from the sole current consolidation.
+
+    Semantic retrieval remains the normal path for multi-instrument scopes;
+    this deterministic path is safe only where the registry identifies exactly
+    one current consolidated expression.
+    """
+    current = _sole_latest_legal_instrument(db, kb_ids)
+    refs = parse_provision_refs(query)
+    rows: list[tuple[DocumentChunk, Document, LegalInstrument]] = []
+    if current and refs:
+        document, instrument = current
+        chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == document.id).order_by(DocumentChunk.chunk_index).all()
+        sub_works = segment_document_subworks(chunks)
+        matching = [chunk for chunk in chunks if any(provision_number_matches(ref["number"], chunk.section_number) for ref in refs)]
+        # A bare number matches มาตรา and หมวด alike; when the question names
+        # มาตรา, keep those and drop a same-numbered chapter heading.
+        requested_kinds = {ref["kind"] for ref in refs}
+        matching = [chunk for chunk in matching if chunk.section_kind in requested_kinds] or matching
+        # The same section number appears in the enabling act and in amendment
+        # footers; keep the code proper so e.g. "มาตรา 9" resolves to the code's
+        # provision, not the enabling act's. Rank collisions by the question.
+        matching = [chunk for chunk in matching if sub_works.get(chunk.id) != "amendment_note"] or matching
+        code_body = [chunk for chunk in matching if sub_works.get(chunk.id) == "code_body"]
+        pool = code_body or matching
+        # Pick the provisions the question is really about, then include every
+        # chunk of those sections in reading order so a provision split across
+        # chunks (e.g. มาตรา 9/1) is answered in full, not truncated.
+        top_numbers = {chunk.section_number for chunk, _ in _rank_chunks_by_query(query, pool)[:2]}
+        selected = [chunk for chunk in sorted(pool, key=lambda chunk: chunk.chunk_index)
+                    if chunk.section_number in top_numbers]
+        rows = [(chunk, document, instrument) for chunk in selected[:4]]
+    return _persist_legal_clause_result(db, query=query, kb_ids=kb_ids, token_id=token_id, intent="legal_current_provision",
+                                        detail="default-current complete provision", rows=rows, attribute_amendments=True)
+
+
+def is_default_current_legal_lookup(query: str) -> bool:
+    value = (query or "").casefold()
+    return any(term in value for term in ("ปัจจุบัน", "ล่าสุด")) and any(
+        term in value for term in ("กฎหมาย", "หลักเกณฑ์", "ค่าธรรมเนียม", "สิทธิ", "หน้าที่")
+    )
+
+
+def build_default_current_legal_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
+    """Lexically locate the best clause in a sole current legal expression.
+
+    Used only for default-current questions that do not name a provision.  It
+    prevents an old amendment from winning vector similarity while remaining
+    reusable for any legal work with a designated latest consolidation.
+    """
+    current = _sole_latest_legal_instrument(db, kb_ids)
+    rows: list[tuple[DocumentChunk, Document, LegalInstrument]] = []
+    if current:
+        document, instrument = current
+        chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == document.id).all()
+        ranked = _rank_chunks_by_query(query, chunks)
+        # Fail closed to an empty answer when nothing in the document actually
+        # matches the question, rather than citing two arbitrary chunks.
+        rows = [(chunk, document, instrument) for chunk, score in ranked[:2] if score > 0]
+    return _persist_legal_clause_result(db, query=query, kb_ids=kb_ids, token_id=token_id, intent="legal_default_current",
+                                        detail="sole current legal expression lexical clause", rows=rows, attribute_amendments=True)
+
+
+_PROVENANCE_ACTION_LABELS = {"REPEALS": "ยกเลิก", "SUPERSEDES": "แทนที่", "AMENDS": "แก้ไขเพิ่มเติม"}
+_TERMINAL_PROVENANCE_RELATIONS = {"REPEALS", "SUPERSEDES"}
+
+
+def build_legal_provenance_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
+    """Return verified amendment provenance without relying on semantic ranking.
+
+    Relations are created only from explicit change clauses during legal extraction,
+    so this path deliberately fails closed if the registry has no matching edge.
+    """
+    refs = parse_provision_refs(query)
+    relation_rows = db.query(LegalInstrumentRelation, LegalInstrument, Document).join(
+        LegalInstrument, LegalInstrument.id == LegalInstrumentRelation.source_instrument_id
+    ).join(Document, Document.id == LegalInstrument.document_id).filter(
+        LegalInstrumentRelation.knowledge_base_id.in_(kb_ids),
+        LegalInstrumentRelation.review_status == "verified",
+        LegalInstrumentRelation.relation.in_(("AMENDS", "REPEALS", "SUPERSEDES")),
+        Document.deleted_at.is_(None), Document.status == "completed",
+    ).order_by(LegalInstrument.version_date.desc(), Document.created_at.desc()).all()
+    target_ids = {row[0].target_instrument_id for row in relation_rows if row[0].target_instrument_id}
+    target_rows = db.query(LegalInstrument, Document).join(Document, Document.id == LegalInstrument.document_id).filter(
+        LegalInstrument.id.in_(target_ids), Document.deleted_at.is_(None), Document.status == "completed",
+    ).all() if target_ids else []
+    targets = {instrument.id: (instrument, document) for instrument, document in target_rows}
+    sources, statements = [], []
+    chunks_by_document: dict[str, list[DocumentChunk]] = {}
+
+    def emit_relation(relation: LegalInstrumentRelation, instrument: LegalInstrument, document: Document, provision: str) -> None:
+        citation_id = f"S{len(sources) + 1}"
+        title = document.title or document.original_filename
+        action = _PROVENANCE_ACTION_LABELS.get(relation.relation, "แก้ไขเพิ่มเติม")
+        statement_citations = [citation_id]
+        sources.append({
+            "citation_id": citation_id, "document_id": document.id, "title": title,
+            "section_label": f"มาตรา {provision}", "excerpt": relation.evidence_quote or f"{action} {provision}",
+            "relevance": 1.0, "document_status": instrument.status, "document_class": instrument.document_class,
+            "version_role": instrument.version_role, "version_date": instrument.version_date.isoformat() if instrument.version_date else None,
+            "source_uri": instrument.source_uri, "source_reference": instrument.source_reference,
+            "legal_label": instrument.official_title or title,
+        })
+        target = targets.get(relation.target_instrument_id)
+        if target:
+            target_instrument, target_document = target
+            # Several relations (a compound question naming multiple
+            # provisions, or several repeal/amend rows on the same act) can
+            # point at the same target document; fetch its chunks once.
+            if target_document.id not in chunks_by_document:
+                chunks_by_document[target_document.id] = db.query(DocumentChunk).filter(
+                    DocumentChunk.document_id == target_document.id,
+                ).order_by(DocumentChunk.chunk_index).all()
+            target_chunks = chunks_by_document[target_document.id]
+            target_chunk = next((chunk for chunk in target_chunks if provision_number_matches(provision, chunk.section_number)), None)
+            target_citation_id = f"S{len(sources) + 1}"
+            sources.append({
+                "citation_id": target_citation_id, "document_id": target_document.id,
+                "chunk_id": target_chunk.id if target_chunk else None,
+                "title": target_document.title or target_document.original_filename,
+                "section_label": target_chunk.section_label if target_chunk else f"มาตรา {provision}",
+                "excerpt": (target_chunk.content if target_chunk else f"ข้อบทปลายทาง {provision}"),
+                "relevance": 0.95, "document_status": target_instrument.status,
+                "document_class": target_instrument.document_class, "version_role": target_instrument.version_role,
+                "version_date": target_instrument.version_date.isoformat() if target_instrument.version_date else None,
+                "source_uri": target_instrument.source_uri, "source_reference": target_instrument.source_reference,
+                "legal_label": target_instrument.official_title or target_document.title or target_document.original_filename,
+            })
+            statement_citations.append(target_citation_id)
+        statements.append(f"มาตรา {provision} {action}โดย {instrument.official_title or title} {' '.join(f'[{item}]' for item in statement_citations)}")
+
+    # Answer each provision the user asked about, so a compound question like
+    # "มาตรา 96 ทวิ และมาตรา 96 ตรี" reports on both instead of only the first.
+    for ref in refs:
+        ref_rows = [row for row in relation_rows if provision_number_matches(row[0].target_provision, ref["number"])]
+        deduped: list[tuple[LegalInstrumentRelation, LegalInstrument, Document]] = []
+        seen: set[tuple[str, str]] = set()
+        for relation, instrument, document in ref_rows:
+            dedupe_key = (instrument.document_id, relation.target_provision or ref["number"])
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            deduped.append((relation, instrument, document))
+        if not deduped:
+            statements.append(f"ไม่พบความสัมพันธ์การแก้ไขหรือยกเลิกที่ตรวจสอบแล้วสำหรับมาตรา {ref['number']} ในคลังข้อมูลที่เลือก")
+            continue
+        # A repeal or supersession is terminal for a provision, matching how
+        # validate_legal_evidence treats REPEALS and SUPERSEDES identically as
+        # overriding relations (see legal_registry.py's resolve_instrument_statuses,
+        # which names that function the single owner of this precedence rule).
+        # Once มาตรา N of the code is repealed/superseded, an "amend" of มาตรา N
+        # belongs to a same-numbered provision in another work (e.g. the
+        # พ.ร.บ.ให้ใช้ฯ), not the terminated section. Lead with the terminal
+        # relation and flag any amend separately instead of emitting a
+        # contradictory line.
+        terminal = [row for row in deduped if row[0].relation in _TERMINAL_PROVENANCE_RELATIONS]
+        amends = [row for row in deduped if row[0].relation == "AMENDS"]
+        if terminal:
+            for relation, instrument, document in terminal:
+                emit_relation(relation, instrument, document, relation.target_provision or ref["number"])
+            if amends:
+                other_acts = ", ".join(dict.fromkeys(
+                    instrument.official_title or (document.title or document.original_filename)
+                    for _, instrument, document in amends))
+                statements.append(
+                    f"หมายเหตุ: พบความสัมพันธ์ 'แก้ไขเพิ่มเติม' มาตรา {ref['number']} โดย {other_acts} "
+                    f"ซึ่งอ้างถึงมาตรา {ref['number']} ในกฎหมายคนละฉบับ ไม่ใช่บทที่ถูกยกเลิกหรือถูกแทนที่ข้างต้น")
+        else:
+            for relation, instrument, document in amends:
+                emit_relation(relation, instrument, document, relation.target_provision or ref["number"])
+    if statements:
+        answer = "\n".join(statements) + "\n\nรายละเอียดแหล่งอ้างอิง:\n" + _render_citation_details(sources)
+    else:
+        answer = "ไม่พบความสัมพันธ์การแก้ไขหรือยกเลิกที่ตรวจสอบแล้วสำหรับมาตราที่ระบุในคลังข้อมูลที่เลือก"
+    result = {
+        "status": "success", "result_id": "", "answer": answer, "insufficient_evidence": not bool(sources),
+        "sources": sources, "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": "legal_provenance_registry",
+        "retrieval_plan": {"version": 1, "intent": "legal_provenance_lookup", "planner_source": "rules", "channels": ["legal_registry"]},
+        "retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": len(sources), "duration_ms": 0, "detail": "verified amendment provenance lookup"}],
+        **_trace_preview_fields(query, answer, sources)},
+    }
+    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
+    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
+    return result
+
+
+def legal_scope_gap_response(query: str) -> str:
+    """Make legal no-evidence responses actionable while preserving fail-closed behavior."""
+    value = (query or "").casefold()
+    if "คำพิพากษา" in value or "ฎีกา" in value:
+        required = "คำพิพากษาศาลหรือฐานข้อมูลคำพิพากษาที่มีเลขคดีและข้อความเต็ม"
+    elif "ประกาศ" in value or "ระเบียบ" in value:
+        required = "ประกาศหรือระเบียบของหน่วยงานที่เกี่ยวข้อง"
+    else:
+        required = "เอกสารกฎหมายหรือเอกสารทางการที่ครอบคลุมประเด็นนี้"
+    return f"ไม่พบหลักฐานยืนยันคำตอบในขอบเขตของคลังความรู้ที่เลือก จึงไม่ควรสรุปข้อเท็จจริงเพิ่มเติม ต้องเพิ่ม {required} ก่อนจึงจะตอบได้อย่างตรวจสอบย้อนกลับได้"
+
+
+def _persist_scope_gap_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
+    answer = legal_scope_gap_response(query)
+    result = {
+        "status": "success", "result_id": "", "answer": answer, "insufficient_evidence": True,
+        "sources": [], "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": "legal_scope_control",
+        "retrieval_plan": {"version": 1, "intent": "legal_out_of_scope", "planner_source": "rules", "channels": ["legal_registry"]},
+        "retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": 0, "duration_ms": 0, "detail": "out-of-scope document-type check"}],
+        **_trace_preview_fields(query, answer, [])},
+    }
+    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
+    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
+    return result
+
+
+def has_court_decision_evidence(db: Session, kb_ids: list[str]) -> bool:
+    """Detect court-decision material from document type, template, and indexed metadata."""
+    if not kb_ids:
+        return False
+    marker = "%คำพิพากษา%"
+    row = db.query(Document.id).filter(
+        Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None), Document.status == "completed",
+        or_(
+            Document.document_type.ilike("%judgment%"),
+            Document.metadata_template_name.ilike(marker),
+            Document.metadata_search_text.ilike(marker),
+            cast(Document.document_metadata, Text).ilike(marker),
+            Document.title.ilike(marker),
+        ),
+    ).first()
+    return row is not None
+
+
+def has_active_query_filters(query_filters=None) -> bool:
+    return bool(query_filters and (
+        getattr(query_filters, "published_from", None)
+        or getattr(query_filters, "published_to", None)
+        or getattr(query_filters, "as_of_date", None)
+        or getattr(query_filters, "include_historical", False)
+        or getattr(query_filters, "metadata", None)
+    ))
+
+
+def allows_direct_registry_path(query_filters=None) -> bool:
+    """Registry shortcuts cannot silently bypass caller-supplied retrieval filters."""
+    return not has_active_query_filters(query_filters)
+
+
+def allows_default_current_direct_path(query: str, query_filters=None) -> bool:
+    """Current-only shortcuts must never override an explicit historical request."""
+    if not allows_direct_registry_path(query_filters):
+        return False
+    value = (query or "").casefold()
+    return not bool(_requested_amendment_number(query) or re.search(r"พ\.ศ\.?\s*[0-9๐-๙]{4}", value))
+
+
+def summarize_document_inventory(db: Session, kb_ids: list[str], *, scope: str = "all",
+                                 include_documents: bool = True, max_documents: int = 500) -> dict:
+    """Return an authoritative, non-LLM document and legal-registry summary.
+
+    ``scope=all`` means every non-deleted document in the token's active KB
+    scope. ``scope=current`` excludes legal instruments marked superseded,
+    repealed, or not-yet-effective; it never includes deleted documents.
+    """
+    current_statuses = {"in_force", "amended", "unknown"}
+    base_query = db.query(Document, LegalInstrument).outerjoin(
+        LegalInstrument, LegalInstrument.document_id == Document.id
+    ).filter(Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None))
+    if scope == "current":
+        base_query = base_query.filter(or_(Document.document_type.notin_(LEGAL_DOCUMENT_TYPES), LegalInstrument.status.in_(current_statuses)))
+
+    total_documents = base_query.with_entities(func.count(Document.id)).scalar() or 0
+    type_rows = base_query.with_entities(Document.document_type, func.count(Document.id)).group_by(Document.document_type).all()
+    kind_rows = base_query.filter(LegalInstrument.id.is_not(None)).with_entities(LegalInstrument.kind, func.count(Document.id)).group_by(LegalInstrument.kind).all()
+    class_rows = base_query.filter(LegalInstrument.document_class.is_not(None)).with_entities(LegalInstrument.document_class, func.count(Document.id)).group_by(LegalInstrument.document_class).all()
+    role_rows = base_query.filter(LegalInstrument.version_role.is_not(None)).with_entities(LegalInstrument.version_role, func.count(Document.id)).group_by(LegalInstrument.version_role).all()
+    rows = base_query.order_by(Document.title, Document.original_filename, Document.id).limit(max_documents if include_documents else 0).all() if include_documents else []
+
+    type_counts = {key: count for key, count in type_rows}
+    kind_counts = {key: count for key, count in kind_rows}
+    class_counts = {key: count for key, count in class_rows}
+    role_counts = {key: count for key, count in role_rows}
+    documents: list[dict] = []
+    for document, instrument in rows:
+        if include_documents and len(documents) < max_documents:
+            documents.append({
+                "citation_id": f"D{len(documents) + 1}",
+                "document_id": document.id,
+                "title": document.title or document.original_filename,
+                "original_filename": document.original_filename,
+                "document_type": document.document_type,
+                "document_type_label": DOCUMENT_TYPE_LABELS.get(document.document_type, document.document_type),
+                "status": document.status,
+                "published_at": document.published_at.isoformat() if document.published_at else None,
+                "legal_kind": instrument.kind if instrument else None,
+                "legal_kind_label": LEGAL_KIND_LABELS.get(instrument.kind, instrument.kind) if instrument else None,
+                "document_class": instrument.document_class if instrument else None,
+                "document_class_label": DOCUMENT_CLASS_LABELS.get(instrument.document_class, instrument.document_class) if instrument and instrument.document_class else None,
+                "version_role": instrument.version_role if instrument else None,
+                "version_role_label": VERSION_ROLE_LABELS.get(instrument.version_role, instrument.version_role) if instrument and instrument.version_role else None,
+                "legal_status": instrument.status if instrument else None,
+                "official_number": instrument.official_number if instrument else None,
+            })
+
+    groups: list[dict] = []
+    for key, count in sorted(type_counts.items()):
+        groups.append({"dimension": "document_type", "key": key, "label": DOCUMENT_TYPE_LABELS.get(key, key), "count": count})
+    for key, count in sorted(kind_counts.items()):
+        groups.append({"dimension": "legal_kind", "key": key, "label": LEGAL_KIND_LABELS.get(key, key), "count": count})
+    for key, count in sorted(class_counts.items()):
+        groups.append({"dimension": "document_class", "key": key, "label": DOCUMENT_CLASS_LABELS.get(key, key), "count": count})
+    for key, count in sorted(role_counts.items()):
+        groups.append({"dimension": "version_role", "key": key, "label": VERSION_ROLE_LABELS.get(key, key), "count": count})
+    return {
+        "total_documents": total_documents,
+        "total_legal_instruments": sum(count for _, count in kind_rows),
+        "scope": scope,
+        "groups": groups,
+        "documents": documents,
+        "documents_truncated": include_documents and total_documents > len(documents),
+        "source_of_truth": "PostgreSQL document and legal registry",
+    }
+
+
+def _inventory_sources(inventory: dict) -> list[dict]:
+    """Create compact, citation-friendly evidence for an inventory summary."""
+    grouped = [group for group in inventory["groups"] if group["dimension"] in {"version_role", "document_type"}]
+    sources = []
+    for index, group in enumerate(grouped, 1):
+        sources.append({
+            "citation_id": f"I{index}",
+            "document_id": None,
+            "title": group["label"],
+            "excerpt": f"{group['label']}: {group['count']} รายการ ({group['dimension']})",
+            "relevance": 1.0 / index,
+            "inventory_dimension": group["dimension"],
+            "inventory_key": group["key"],
+            "inventory_count": group["count"],
+            "document_ids": [item["document_id"] for item in inventory["documents"]
+                             if (group["dimension"] == "document_type" and item["document_type"] == group["key"])
+                             or (group["dimension"] == "version_role" and item["version_role"] == group["key"])],
+        })
+    if not sources and inventory["total_documents"]:
+        sources.append({"citation_id": "I1", "document_id": None, "title": "Document inventory",
+                        "excerpt": f"พบเอกสารทั้งหมด {inventory['total_documents']} รายการ",
+                        "relevance": 1.0, "inventory_count": inventory["total_documents"]})
+    return sources
+
+
+def _inventory_answer(inventory: dict, sources: list[dict]) -> str:
+    if not inventory["total_documents"]:
+        return "ไม่พบเอกสารใน Knowledge Base ที่อยู่ในขอบเขตของ MCP key [I1]" if sources else "ไม่พบเอกสารใน Knowledge Base ที่อยู่ในขอบเขตของ MCP key"
+    lines = [f"พบเอกสารทั้งหมด {inventory['total_documents']} รายการ (ขอบเขต: {inventory['scope']})"]
+    for dimension in ("version_role",):
+        groups = [group for group in inventory["groups"] if group["dimension"] == dimension]
+        if groups:
+            label = "ประเภท/ชั้นของเอกสารกฎหมาย"
+            lines.append(f"{label}: " + ", ".join(f"{group['label']} {group['count']} รายการ [I{sources.index(next(source for source in sources if source.get('inventory_key') == group['key'] and source.get('inventory_dimension') == dimension)) + 1}]" for group in groups))
+    return "\n".join(lines)
+
+
+def build_document_inventory_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None,
+                                    query_filters=None, *, scope: str | None = None,
+                                    include_documents: bool = True, max_documents: int = 500) -> dict:
+    """Build a saved, deterministic result for REST/MCP inventory queries."""
+    resolved_scope = scope or document_inventory_scope(query, query_filters)
+    inventory = summarize_document_inventory(db, kb_ids, scope=resolved_scope,
+                                             include_documents=include_documents, max_documents=max_documents)
+    sources = _inventory_sources(inventory)
+    answer = _inventory_answer(inventory, sources)
+    plan = {"version": 1, "intent": "document_inventory", "planner_source": "rules",
+            "rationale": "deterministic document/legal registry aggregation", "channels": ["document_registry"],
+            "max_sources": len(sources), "graph_depth": 0, "graph_scope": "none", "entity_subjects": [],
+            "document_identifiers": [], "published_from": None, "published_to": None, "as_of_date": None,
+            "include_historical": resolved_scope == "all", "rerank_enabled": False}
+    trace = [{"channel": "document_registry", "system": "PostgreSQL document and legal registry",
+              "status": "used", "result_count": inventory["total_documents"], "duration_ms": 0,
+              "detail": f"scope={resolved_scope}; deterministic count and grouping"}]
+    result = {"status": "success", "result_id": "", "answer": answer,
+              "insufficient_evidence": not bool(inventory["total_documents"]), "sources": sources,
+              "documents": inventory["documents"], "total_documents": inventory["total_documents"],
+              "total_legal_instruments": inventory["total_legal_instruments"], "groups": inventory["groups"],
+              "scope": resolved_scope, "documents_truncated": inventory["documents_truncated"],
+              "metadata": {"knowledge_base_ids": kb_ids, "retrieval_strategy": "document_inventory",
+                           "retrieval_plan": plan, "retrieval_trace": trace, "source_of_truth": inventory["source_of_truth"],
+                           "query_preview": query[:500] if get_settings().log_query_text else None,
+                           "query_length": len(query), "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                           "answer_preview": answer[:800] if get_settings().log_query_text else None,
+                           "citation_ids": [source["citation_id"] for source in sources],
+                           "filter_summary": query_filters.model_dump(mode="json") if query_filters else {},
+                           "response_summary": {"status": "success", "insufficient_evidence": not bool(inventory["total_documents"]),
+                                                "source_count": len(sources), "entity_count": 0, "relationship_count": 0,
+                                                "total_documents": inventory["total_documents"]}}}
+    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
+    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
+    return result
+
+
+def create_document_job(db: Session, knowledge_base_id: str, upload, title: str | None = None, document_type: str = "general", published_at=None,
+                        metadata_template: dict | None = None, document_metadata: dict | None = None) -> tuple[Document, ProcessingJob]:
     if document_type not in DOCUMENT_TYPES:
         raise ValueError("DOCUMENT_TYPE_INVALID")
     path, stored, size, checksum, mime = store_upload(upload, knowledge_base_id)
@@ -845,10 +1826,18 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
     if duplicate:
         Path(path).unlink(missing_ok=True)
         raise ValueError("FILE_DUPLICATE")
+    fields = normalize_field_definitions((metadata_template or {}).get("fields") or [])
+    values = document_metadata or {}
     doc = Document(knowledge_base_id=knowledge_base_id, original_filename=upload.filename or stored,
                    stored_filename=stored, storage_path=path, file_size=size, checksum_sha256=checksum,
                    mime_type=mime, title=title or Path(upload.filename or stored).stem,
-                   document_type=document_type, published_at=published_at, status="queued")
+                   document_type=document_type, published_at=published_at, status="queued",
+                   metadata_template_id=(metadata_template or {}).get("id"),
+                   metadata_template_name=(metadata_template or {}).get("name"),
+                   metadata_template_version=(metadata_template or {}).get("version"),
+                   metadata_template_fields=fields,
+                   document_metadata=values,
+                   metadata_search_text=metadata_search_text(fields, values))
     db.add(doc); db.flush()
     job = ProcessingJob(document_id=doc.id, knowledge_base_id=knowledge_base_id)
     db.add(job); db.commit(); db.refresh(doc); db.refresh(job)
@@ -1122,12 +2111,19 @@ def process_next_job(db: Session) -> bool:
             job.current_stage, job.progress_percent = "legal_extraction", 60
             db.commit()
             deterministic = parse_legal_corpus_metadata(text, doc.title or doc.original_filename)
-            try:
-                extracted = OpenRouterClient().extract_legal_metadata(doc.title or doc.original_filename, text)
-            except Exception:
-                # Header/change clauses are sufficient to preserve a traceable
-                # legal instrument even when the optional LLM is unavailable.
-                extracted = {}
+            # Official corpora with a structured header already carry the
+            # version identity and explicit change clauses needed by the legal
+            # registry.  Avoid an unnecessary model call for those documents;
+            # unknown/unstructured legal documents still retain the existing
+            # LLM extraction path as a general fallback.
+            extracted = {}
+            if deterministic.get("instrument", {}).get("version_role") == "unknown":
+                try:
+                    extracted = OpenRouterClient().extract_legal_metadata(doc.title or doc.original_filename, text)
+                except Exception:
+                    # Header/change clauses are sufficient to preserve a traceable
+                    # legal instrument even when the optional LLM is unavailable.
+                    extracted = {}
             if isinstance(extracted, dict):
                 extracted["schema_version"] = 2
                 extracted["instrument"] = {**(extracted.get("instrument") or {}), **deterministic["instrument"]}
@@ -1154,6 +2150,9 @@ def process_next_job(db: Session) -> bool:
             pass
         else:
             replace_document_chunks(db, doc, text)
+        db.commit()
+        sync_document_metadata_values(db, doc)
+        sync_document_metadata_graph(db, doc)
         db.commit()
         job.current_stage, job.progress_percent = "embedding", 60
         embed_document_chunks(db, doc.id)
@@ -1260,11 +2259,13 @@ def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources
     requested_to = getattr(query_filters, "published_to", None) if query_filters else None
     as_of_date = getattr(query_filters, "as_of_date", None) if query_filters else None
     include_historical = bool(getattr(query_filters, "include_historical", False)) if query_filters else False
+    metadata_filters = dict(getattr(query_filters, "metadata", {}) or {}) if query_filters else {}
     decision.plan = decision.plan.model_copy(update={
         "published_from": requested_from or decision.plan.published_from,
         "published_to": requested_to or decision.plan.published_to,
         "as_of_date": as_of_date or decision.plan.as_of_date,
         "include_historical": include_historical or decision.plan.include_historical,
+        "metadata_filters": metadata_filters,
     })
     if decision.ambiguous and policy.planner_llm_fallback:
         try:
@@ -1309,6 +2310,12 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
                     trace: list[dict] | None = None, plan: RetrievalPlan | None = None,
                     warnings: list[dict] | None = None) -> RetrievalEvidence:
     plan = plan or rule_plan(query, policy_from_config(None), limit).plan
+    if plan.metadata_filters:
+        metadata_document_ids = _metadata_filter_document_ids(db, kb_ids, plan.metadata_filters)
+        plan = plan.model_copy(update={"metadata_document_ids": metadata_document_ids})
+        _append_retrieval_trace(trace, channel="metadata_filter", system="PostgreSQL document metadata", status="used",
+                                started_at=time.monotonic(), result_count=len(metadata_document_ids),
+                                detail=f"exact filter keys: {', '.join(sorted(plan.metadata_filters))}")
     if plan.legal_context and plan.legal_context.ambiguous_context and not plan.include_historical:
         detail = plan.legal_context.ambiguity_reason or "The legal instrument or provision context is ambiguous."
         if warnings is not None:
@@ -1339,13 +2346,13 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
         _append_retrieval_trace(trace, channel="lightrag", system="LightRAG", status="skipped", started_at=time.monotonic(),
                                 detail="not configured" if not engine.enabled else "requires one Knowledge Base")
     else:
-        db_channels[RetrievalChannel.LIGHTRAG] = lambda _: _query_lightrag(engine, query, kb_ids, limit, trace)
+        db_channels[RetrievalChannel.LIGHTRAG] = lambda session: _query_lightrag(session, engine, query, kb_ids, limit, trace, plan)
     futures = {}
     channel_results = {}
     with ThreadPoolExecutor(max_workers=max(1, len(db_channels))) as executor:
         for channel, callback in db_channels.items():
             if channel in plan.channels:
-                futures[executor.submit(_run_retrieval_channel, callback, channel != RetrievalChannel.LIGHTRAG)] = channel
+                futures[executor.submit(_run_retrieval_channel, callback, True)] = channel
         for future in as_completed(futures):
             try:
                 value = future.result()
@@ -1410,6 +2417,7 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
                  for doc_id, row in instruments_by_document.items()}
     fused = fuse_evidence(*channels, limit=limit, legal_meta=legal_meta, legal_context=plan.legal_context,
                           authority_weight=plan.authority_weight, status_weight=plan.status_weight, recency_weight=plan.recency_weight)
+    fused = _expand_requested_legal_sections(db, fused, plan, trace)
     evidence = rerank_evidence(query, fused, limit, trace, plan.rerank_enabled)
     if evidence.sources is not fused.sources:
         # The cross-encoder reranker has no legal awareness and can drop the
@@ -1444,6 +2452,52 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
     return evidence
 
 
+def _expand_requested_legal_sections(db: Session, evidence: RetrievalEvidence, plan: RetrievalPlan,
+                                     trace: list[dict] | None = None) -> RetrievalEvidence:
+    """Replace a matching legal chunk with the complete, bounded provision.
+
+    Legal lists and exceptions commonly cross chunk boundaries.  Passing only
+    the top-ranked fragment to answer generation makes the model omit items;
+    this deterministic expansion preserves one citation per provision while
+    giving the generator every chunk that belongs to it.
+    """
+    if plan.intent != "legal_provision" or not evidence.sources:
+        return evidence
+    refs = parse_provision_refs(" ".join(plan.legal_context.provision_refs)) if plan.legal_context else []
+    if not refs:
+        return evidence
+    rebuilt, expanded = [], 0
+    seen: set[tuple[str, str, str]] = set()
+    for source in evidence.sources:
+        document_id, kind, number = source.get("document_id"), source.get("section_kind"), source.get("section_number")
+        if not document_id or not kind or not number or not any(
+            provision_number_matches(ref["number"], number) and ref["kind"] == kind for ref in refs
+        ):
+            rebuilt.append(source)
+            continue
+        key = (document_id, kind, number)
+        if key in seen:
+            continue
+        seen.add(key)
+        chunks = db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == document_id, DocumentChunk.section_kind == kind,
+            DocumentChunk.section_number == number,
+        ).order_by(DocumentChunk.chunk_index).all()
+        if not chunks:
+            rebuilt.append(source)
+            continue
+        excerpt = "\n\n".join(chunk.content for chunk in chunks)
+        rebuilt.append({**source, "chunk_id": chunks[0].id, "chunk_index": chunks[0].chunk_index,
+                        "chunk_ids": [chunk.id for chunk in chunks], "excerpt": excerpt[:12000]})
+        expanded += max(0, len(chunks) - 1)
+    if expanded:
+        _append_retrieval_trace(trace, channel="legal_section_expansion", system="PostgreSQL document chunks", status="used",
+                                started_at=time.monotonic(), result_count=expanded,
+                                detail="expanded requested provision to all section chunks")
+    return RetrievalEvidence([{**source, "citation_id": f"S{index}"} for index, source in enumerate(rebuilt, 1)],
+                             evidence.entities, evidence.relationships, evidence.paths, evidence.answer)
+
+
 def _run_retrieval_channel(callback, needs_db: bool):
     session = SessionLocal() if needs_db else None
     try:
@@ -1453,11 +2507,23 @@ def _run_retrieval_channel(callback, needs_db: bool):
             session.close()
 
 
-def _query_lightrag(engine: LightRAGRetrievalEngine, query: str, kb_ids: list[str], limit: int,
-                    trace: list[dict] | None = None) -> RetrievalEvidence:
+def _query_lightrag(db: Session, engine: LightRAGRetrievalEngine, query: str, kb_ids: list[str], limit: int,
+                    trace: list[dict] | None = None, plan: RetrievalPlan | None = None) -> RetrievalEvidence:
     started_at = time.monotonic()
     try:
         value = engine.query(query, kb_ids, limit)
+        if plan and _relationship_filter_active(plan):
+            source_ids = {source.get("document_id") for source in value.sources if source.get("document_id")}
+            allowed = db.query(Document.id).filter(
+                Document.id.in_(source_ids), Document.status == "completed", Document.deleted_at.is_(None),
+            ) if source_ids else db.query(Document.id).filter(False)
+            allowed = _apply_published_filter(allowed, plan)
+            allowed = _apply_metadata_filter(allowed, plan)
+            allowed_ids = {row[0] for row in allowed.all()}
+            value = RetrievalEvidence(
+                [source for source in value.sources if source.get("document_id") in allowed_ids],
+                value.entities, value.relationships, value.paths, value.answer,
+            )
         _append_retrieval_trace(trace, channel="lightrag", system="LightRAG", status="used",
                                 started_at=started_at, result_count=len(value.sources), detail="mix retrieval")
         return value
@@ -1475,6 +2541,31 @@ def _apply_published_filter(rows, plan: RetrievalPlan | None):
     if plan.published_to:
         rows = rows.filter(Document.published_at < plan.published_to)
     return rows
+
+
+def _metadata_filter_document_ids(db: Session, knowledge_base_ids: list[str], filters: dict[str, str]) -> list[str]:
+    """Resolve exact filters through the indexed, filterable metadata projection."""
+    if not filters:
+        return []
+    rows = db.query(Document.id).join(
+        DocumentMetadataValue, DocumentMetadataValue.document_id == Document.id,
+    ).filter(Document.deleted_at.is_(None))
+    if knowledge_base_ids:
+        rows = rows.filter(Document.knowledge_base_id.in_(knowledge_base_ids))
+    rows = rows.filter(or_(*[
+        and_(DocumentMetadataValue.field_key == key, DocumentMetadataValue.value_text == str(value))
+        for key, value in filters.items()
+    ]))
+    # A document must match every requested field. The indexed table has one
+    # row per document/field, so grouping avoids returning partial matches.
+    rows = rows.group_by(Document.id).having(func.count(func.distinct(DocumentMetadataValue.field_key)) == len(filters))
+    return [row[0] for row in rows.all()]
+
+
+def _apply_metadata_filter(rows, plan: RetrievalPlan | None):
+    if plan is None or plan.metadata_document_ids is None:
+        return rows
+    return rows.filter(Document.id.in_(plan.metadata_document_ids))
 
 
 def _apply_legal_filter(rows, plan: RetrievalPlan | None):
@@ -1594,6 +2685,7 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
     if kb_ids:
         rows = rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
     rows = _apply_published_filter(rows, plan)
+    rows = _apply_metadata_filter(rows, plan)
     rows = _apply_legal_filter(rows, plan)
     rows = _apply_provision_filter(rows, plan)
     records = rows.order_by(distance).limit(limit).all()
@@ -1616,21 +2708,26 @@ def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int
     if kb_ids:
         base_rows = base_rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
     base_rows = _apply_published_filter(base_rows, plan)
+    base_rows = _apply_metadata_filter(base_rows, plan)
     base_rows = _apply_legal_filter(base_rows, plan)
     base_rows = _apply_provision_filter(base_rows, plan)
     rows = base_rows
+    metadata_text = cast(Document.metadata_search_text, Text)
+    legacy_metadata_text = cast(Document.document_metadata, Text)
+    def searchable_metadata_predicate(pattern: str):
+        return or_(metadata_text.ilike(pattern), and_(Document.metadata_search_text.is_(None), legacy_metadata_text.ilike(pattern)))
     if words:
         if db.get_bind().dialect.name == "postgresql":
             vector = func.to_tsvector("simple", DocumentChunk.content)
             tsquery = func.websearch_to_tsquery("simple", query)
-            rows = rows.filter(vector.op("@@")(tsquery)).order_by(func.ts_rank_cd(vector, tsquery).desc())
+            rows = rows.filter(or_(vector.op("@@")(tsquery), searchable_metadata_predicate(f"%{query}%"))).order_by(func.ts_rank_cd(vector, tsquery).desc())
         else:
-            rows = rows.filter(or_(*[DocumentChunk.content.ilike(f"%{word}%") for word in words[:8]]))
+            rows = rows.filter(or_(*[DocumentChunk.content.ilike(f"%{word}%") for word in words[:8]], searchable_metadata_predicate(f"%{query}%")))
     records = rows.limit(limit).all()
     if not records and words and db.get_bind().dialect.name == "postgresql":
         # PostgreSQL simple FTS does not segment Thai. Retain FTS as the first
         # choice, then use an explicit phrase/token fallback in the same scope.
-        records = base_rows.filter(or_(*[DocumentChunk.content.ilike(f"%{word}%") for word in words[:8]])).limit(limit).all()
+        records = base_rows.filter(or_(*[DocumentChunk.content.ilike(f"%{word}%") for word in words[:8]], *[searchable_metadata_predicate(f"%{word}%") for word in words[:8]])).limit(limit).all()
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
                 "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": 1.0 / i,
                 "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}
@@ -1655,12 +2752,16 @@ def query_exact_documents(db: Session, plan: RetrievalPlan, kb_ids: list[str], l
     if kb_ids:
         rows = rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
     rows = _apply_published_filter(rows, plan)
+    rows = _apply_metadata_filter(rows, plan)
     rows = _apply_legal_filter(rows, plan)
     rows = _apply_provision_filter(rows, plan)
     predicates = []
+    metadata_text = cast(Document.metadata_search_text, Text)
+    legacy_metadata_text = cast(Document.document_metadata, Text)
     for identifier in identifiers:
         pattern = f"%{identifier}%"
-        predicates.extend((Document.title.ilike(pattern), Document.original_filename.ilike(pattern), DocumentChunk.content.ilike(pattern)))
+        predicates.extend((Document.title.ilike(pattern), Document.original_filename.ilike(pattern), DocumentChunk.content.ilike(pattern),
+                           metadata_text.ilike(pattern), and_(Document.metadata_search_text.is_(None), legacy_metadata_text.ilike(pattern))))
     records = rows.filter(or_(*predicates)).order_by(DocumentChunk.chunk_index).limit(limit).all()
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
                 "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": 1.0 / i,
@@ -1683,7 +2784,16 @@ def _verified_relationships(db: Session, kb_ids: list[str]):
 
 def _global_graph_evidence(db: Session, kb_ids: list[str], limit: int, plan: RetrievalPlan) -> RetrievalEvidence:
     """Return representative cited edges from several connected components."""
-    relationships = _verified_relationships(db, kb_ids).order_by(Relationship.source_count.desc(), Relationship.created_at.desc()).limit(max(limit * 10, 50)).all()
+    relationship_query = _verified_relationships(db, kb_ids)
+    if _relationship_filter_active(plan):
+        relationship_query = relationship_query.join(
+            RelationshipSource, RelationshipSource.relationship_id == Relationship.id,
+        ).join(Document, Document.id == RelationshipSource.document_id).filter(
+            Document.status == "completed", Document.deleted_at.is_(None),
+        )
+        relationship_query = _apply_published_filter(relationship_query, plan)
+        relationship_query = _apply_metadata_filter(relationship_query, plan).distinct()
+    relationships = relationship_query.order_by(Relationship.source_count.desc(), Relationship.created_at.desc()).limit(max(limit * 10, 50)).all()
     if not relationships:
         return RetrievalEvidence([], [], [], [])
     parent: dict[str, str] = {}
@@ -1754,6 +2864,13 @@ def query_database_graph(db: Session, query: str, kb_ids: list[str], limit: int,
     else:
         graph = entity_graph(db, entity, plan.graph_depth)
         relationships = _verified_relationships(db, [entity.knowledge_base_id]).filter(Relationship.id.in_([edge["id"] for edge in graph["edges"]])).all()
+    relationships = _filter_relationships_by_plan(db, relationships, plan)
+    node_ids = {item.source_entity_id for item in relationships} | {item.target_entity_id for item in relationships}
+    node_rows = db.query(Entity).filter(Entity.id.in_(node_ids), Entity.deleted_at.is_(None)).all() if node_ids else []
+    graph = {
+        "nodes": [{"id": row.id, "name": row.name, "type": row.entity_type} for row in node_rows],
+        "edges": [{"id": row.id, "source": row.source_entity_id, "target": row.target_entity_id, "type": row.relationship_type} for row in relationships],
+    }
     sources = relationship_sources(db, relationships, plan)[:limit]
     for source in sources:
         source.pop("_relationship_id", None)
@@ -2001,6 +3118,7 @@ def _decorate_sources_with_legal_metadata(sources: list[dict], instruments_by_do
         source["version_date"] = instrument.version_date.isoformat() if instrument.version_date else None
         source["legal_work_key"] = instrument.legal_work_key
         source["document_class"] = instrument.document_class
+        source["version_role"] = instrument.version_role
         source["source_uri"] = instrument.source_uri
         source["source_reference"] = instrument.source_reference
         source["provenance"] = {"origin": "legal_registry", "review_status": instrument.review_status,
@@ -2055,29 +3173,71 @@ def _validate_answer_citations(evidence: RetrievalEvidence, warnings: list[dict]
     evidence.sources = [available[citation_id] for citation_id in sorted(valid_ids, key=lambda value: int(value[1:]))]
 
 
+def _render_citation_details(sources: list[dict]) -> str:
+    lines = []
+    for source in sources:
+        label = source.get("title") or "เอกสาร"
+        if source.get("section_label"):
+            label = f"{label}, {source['section_label']}"
+        uri = source.get("source_uri")
+        detail = f"[{source.get('citation_id')}] {label}"
+        if uri:
+            detail += f" — {uri}"
+        lines.append(detail)
+    return "\n".join(lines)
+
+
 def compose_cited_answer(evidence: RetrievalEvidence, warnings: list[dict] | None = None) -> str:
     if warnings and any(item.get("code") == "AMBIGUOUS_LEGAL_CONTEXT" for item in warnings):
         return "ยังไม่สามารถตอบได้อย่างปลอดภัย เนื่องจากพบหลายฉบับที่อาจตรงกับมาตราที่ระบุ โปรดระบุชื่อฉบับกฎหมายหรือวันที่มีผลบังคับใช้ให้ชัดเจน"
     if warnings and any(item.get("code") in {"ANSWER_CITATIONS_MISSING", "ANSWER_CITATION_ID_INVALID"} for item in warnings):
         return "ยังไม่สามารถสร้างคำตอบที่มีหลักฐานอ้างอิงที่ตรวจสอบได้จากคำขอนี้"
     if not evidence.sources:
-        return "Insufficient evidence was found in the selected knowledge bases."
+        return "ไม่พบหลักฐานที่เพียงพอในคลังความรู้ที่เลือก จึงไม่ควรสรุปข้อเท็จจริงเพิ่มเติมจากคำขอนี้"
     citations = " ".join(f"[{source['citation_id']}]" for source in evidence.sources)
     answer = (evidence.answer or "").strip()
+    details = _render_citation_details(evidence.sources)
+    latest_assumption = any(source.get("version_role") == "latest_consolidated" for source in evidence.sources)
+    prefix = "คำตอบนี้อ้างอิงฉบับปรับปรุงล่าสุดที่มีผลบังคับใช้ในคลังข้อมูล\n" if latest_assumption else ""
     if not answer:
-        return f"Supporting knowledge was found: {citations}"
+        return f"{prefix}พบหลักฐานที่เกี่ยวข้อง {citations}\n\nแหล่งอ้างอิง:\n{details}"
     if not re.search(r"\[S\d+\]", answer):
-        return f"{answer}\n\nSources: {citations}"
-    return answer
+        answer = f"{answer}\n\nแหล่งอ้างอิง: {citations}"
+    return f"{prefix}{answer}\n\nรายละเอียดแหล่งอ้างอิง:\n{details}"
 
 
 def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: int, token_id: str | None = None, query_filters=None) -> dict:
+    current_shortcut_allowed = allows_default_current_direct_path(query, query_filters)
+    registry_shortcut_allowed = allows_direct_registry_path(query_filters)
+    if is_document_inventory_query(query):
+        return build_document_inventory_result(db, query, kb_ids, token_id=token_id, query_filters=query_filters,
+                                               include_documents=True, max_documents=500)
+    if current_shortcut_allowed and is_legal_metadata_lookup(query):
+        return build_legal_metadata_result(db, query, kb_ids, token_id=token_id)
+    if registry_shortcut_allowed and ("คำพิพากษา" in (query or "").casefold() or "ฎีกา" in (query or "").casefold()) and not has_court_decision_evidence(db, kb_ids):
+        return _persist_scope_gap_result(db, query, kb_ids, token_id=token_id)
+    if current_shortcut_allowed and is_legal_commencement_lookup(query):
+        return build_legal_commencement_result(db, query, kb_ids, token_id=token_id)
+    if current_shortcut_allowed and is_legal_document_copy_lookup(query):
+        return build_legal_document_copy_result(db, query, kb_ids, token_id=token_id)
+    if registry_shortcut_allowed and is_legal_effective_rule_lookup(query):
+        return build_legal_effective_rule_result(db, query, kb_ids, token_id=token_id)
+    if registry_shortcut_allowed and is_legal_provenance_lookup(query):
+        return build_legal_provenance_result(db, query, kb_ids, token_id=token_id)
+    if current_shortcut_allowed and parse_provision_refs(query) and not _requested_amendment_number(query):
+        current = _sole_latest_legal_instrument(db, kb_ids)
+        if current:
+            return build_default_current_provision_result(db, query, kb_ids, token_id=token_id)
+    if current_shortcut_allowed and is_default_current_legal_lookup(query):
+        return build_default_current_legal_result(db, query, kb_ids, token_id=token_id)
     retrieval_trace: list[dict] = []
     legal_warnings: list[dict] = []
     decision = build_retrieval_plan(db, query, kb_ids, max_sources, query_filters, retrieval_trace)
     evidence = query_documents(db, query, kb_ids, decision.plan.max_sources, retrieval_trace, decision.plan, legal_warnings)
     intent = decision.plan.intent
     answer = compose_cited_answer(evidence, legal_warnings)
+    if not evidence.sources and decision.plan.legal_context is not None:
+        answer = legal_scope_gap_response(query)
     legal_context = decision.plan.legal_context.model_dump(mode="json") if decision.plan.legal_context else None
     legal_status = "not_applicable"
     if legal_context is not None:

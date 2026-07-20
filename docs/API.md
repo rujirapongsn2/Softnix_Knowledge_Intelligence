@@ -1,34 +1,48 @@
 # REST API
 
-Base path: `/api/v1`. Admin APIs use secure HTTP-only login cookies.
+Base path คือ `/api/v1` และ endpoint ของผู้ดูแลใช้ secure HTTP-only session cookie
 
-- `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`
-- `GET|POST /knowledge-bases`, `POST /knowledge-bases/{id}/activate`, `PATCH /knowledge-bases/{id}/retrieval-config`
-- `POST /knowledge-bases` accepts `name` and an optional `code`; when omitted, the API derives a collision-safe code (including for Thai/non-Latin names) and adds a suffix when a prior or soft-deleted code exists.
-- `POST /knowledge-bases/{id}/documents` accepts optional `published_at` (`YYYY-MM-DD`), `PATCH /documents/{id}/metadata` updates it, `GET /documents/{id}/text`
-- `GET /jobs/{id}`
-- `POST /query`, `GET /query/results/{id}/sources`
-- `GET|POST /knowledge-bases/{id}/documents`, `GET /documents/{id}/text|jobs`, `POST /documents/{id}/reprocess`
-- `GET|POST /knowledge-bases/{id}/entities`, `GET /entities/{id}/sources|graph`
-- `GET|POST /knowledge-bases/{id}/relationships`, `POST /query/impact`
-- `GET /knowledge-bases/{id}/legal-graph?view=verified|suggested|manual|all`
-- `POST|GET /knowledge-bases/{id}/legal-graph/rebuild`, `PATCH /relationships/{id}/legal-review`
-- `GET /knowledge-bases/{id}/legal-registry?status=&kind=&family_id=&document_id=` lists legal instruments with kind, authority level, status, and effective dates
-- `GET /knowledge-bases/{id}/legal-registry/worklist` lists missing provenance/effective dates, unreviewed instruments, unresolved relation targets, and missing evidence for curator review
-- `GET /legal-instruments/{id}` returns the instrument, its family/version chain, and incoming/outgoing cross-instrument relations
-- `PATCH /legal-instruments/{id}` accepts an admin override plus `source_uri` and `source_reference`; it marks the instrument as manually verified and always wins over the automatic resolver
-- `POST /knowledge-bases/{id}/legal-registry/resolve` re-runs the deterministic in_force/amended/superseded/repealed status resolver
-- Legal registry responses also expose `legal_work_key`, `document_class`, and `version_date`; official corpus source URL/reference and amendment evidence are retained in provenance.
-- `GET|POST /tokens`, `POST /tokens/{id}/enable|disable|revoke`
-- `GET /mcp/activity` returns redacted MCP tool calls with the planner decision and actual retrieval route.
-- `GET /traces`, `GET /traces/{trace_id}` return safe RetrievalExecutor root/span traces for the Trace Explorer. The trace includes a bounded request preview, query length/hash, filter summary, answer preview, citation IDs, planner rationale/policy version, and per-span input/output summaries. Each span contains its channel, status, result count, reason code, duration, and relative timing offset. Tokens, headers, full prompts, provider payloads, and document bodies are excluded.
-- Trace list APIs support `cursor`, `from_ts`, `to_ts`, `transport`, `status`, `tool`, and `paginate=true`. The paginated response is `{items,next_cursor,has_more,limit}`; the default response remains a list for backwards compatibility.
-- `POST /system/observability/cleanup` runs bounded retention for trace/request/MCP observability records. Automatic worker cleanup uses `OBSERVABILITY_RETENTION_DAYS` (default 30) and `AUDIT_RETENTION_DAYS` (default 180).
+## Login และระบบ
 
-Query responses include `metadata.retrieval_plan` and `metadata.retrieval_trace`. The plan is rule-first; it records graph scope, extracted entity/document identifiers, publication-date bounds, and whether reranking is permitted. OpenRouter is called only for ambiguous queries and its JSON output is constrained by the Knowledge Base policy. A trace marks each channel as `used`, `skipped`, or `unavailable` and includes result count and duration.
+- `POST /auth/login`, `POST /auth/logout`, `POST /auth/refresh`, `GET /auth/me`
+- `GET /system/status`, `POST /system/test-openrouter`, `GET /system/graph-projection`
+- `GET /traces`, `GET /traces/{trace_id}`, `GET /mcp/activity`
+- `POST /system/observability/cleanup`
 
-`filters` accepts `published_from` and `published_to` (`YYYY-MM-DD`). A month/year stated in a news query populates the same bounds. Documents without `published_at` are excluded when a publication-date filter is active.
+## Knowledge Base และเอกสาร
 
-`filters` also accepts `as_of_date` (`YYYY-MM-DD`, defaults to today) and `include_historical` (defaults to `false`) for Knowledge Bases with a legal registry. The planner resolves which instrument version was in force at that date, excludes documents it knows are repealed or superseded, and boosts fused ranking by authority level, legal status, and recency; `include_historical: true` disables the exclusion and keeps every version for comparison. A KB with no legal instruments is unaffected by these fields. Query responses may include `warnings` (e.g. `SUPERSEDED_VERSION_REMOVED`, `PROVISION_REPEALED`, `PROVISION_AMENDED`, `UNVERIFIED_VALIDITY`) and each source may carry `document_status`, `authority_level`, `kind`, `version_label`, `effective_from`, `effective_to`, and a combined `legal_label` used in the citation header sent to the LLM.
+- `GET|POST /knowledge-bases`, `DELETE /knowledge-bases/{id}`
+- `POST /knowledge-bases/{id}/activate|disable`
+- `PATCH /knowledge-bases/{id}/retrieval-config`
+- `POST /knowledge-bases/{id}/documents` และ `/documents/batch`
+- `GET|POST /knowledge-bases/{id}/document-templates` และ `PATCH|DELETE /document-templates/{id}` — Document Type เป็นฟอร์ม metadata ที่สืบทอด field พื้นฐานจาก Processing Profile และกำหนดความสามารถราย field ได้ (`searchable`, `filterable`, `graph_entity_type`, `graph_relationship`)
+- `GET /knowledge-bases/{id}/documents` (legacy list), `GET /knowledge-bases/{id}/documents/page` (bounded UI page with `limit`, `offset`, `search`, `status`, `document_type`, plus global processing/completed/legal flags), `POST /knowledge-bases/{id}/documents/reindex`
+- `GET /documents/{id}/text|jobs`, `POST /documents/{id}/reprocess`, `DELETE /documents/{id}`, `POST /documents/{id}/restore`
+- `PATCH /documents/{id}/metadata` รองรับ `published_at: YYYY-MM-DD` และแก้ค่าฟิลด์ metadata ตาม snapshot ของเอกสาร
 
-Errors have `{status:"error", error:{code,message,retryable}}` and never expose stack traces.
+## Query และ graph
+
+- `POST /query` — query ปกติ; ผลมี `metadata.retrieval_plan` และ `metadata.retrieval_trace`
+- `GET /query/results/{id}/sources`, `POST /query/results/{id}/feedback`
+- `POST /query/impact`
+- `GET|POST /knowledge-bases/{id}/entities`, `PATCH|DELETE /entities/{id}`
+- `GET /entities/{id}/sources|graph|inspector`
+- `GET|POST /knowledge-bases/{id}/relationships`, `PATCH|DELETE /relationships/{id}`
+
+## Legal registry
+
+- `POST /documents/{id}/legal-extract`
+- `PUT|PATCH|DELETE /documents/{id}/legal-metadata`
+- `GET /knowledge-bases/{id}/legal-graph|legal-map`
+- `POST|GET /knowledge-bases/{id}/legal-graph/rebuild`
+- `GET /knowledge-bases/{id}/legal-registry`, `/legal-registry/worklist`
+- `GET|PATCH /legal-instruments/{id}`
+- `POST /knowledge-bases/{id}/legal-registry/resolve`
+
+## Filters และ retrieval trace
+
+`QueryRequest.filters` รองรับ `published_from`, `published_to`, `as_of_date`, `include_historical` และ `metadata` แบบ key/value เฉพาะฟิลด์ที่ประกาศ `filterable=true` เอกสารที่ไม่มี `published_at` จะไม่ถูกคืนเมื่อใช้ publication date filter ฟิลด์ที่ประกาศ `searchable=false` จะไม่ถูกนำไปค้นแบบ full-text และฟิลด์ที่ map graph เท่านั้นจึงจะสร้าง node/edge ที่มี provenance ลง graph
+
+Plan ระบุ intent, channels, graph scope/depth, entity/document identifiers, date range และสิทธิ์ rerank ส่วน trace ระบุ channel ว่า `used`, `skipped` หรือ `unavailable`, จำนวนผล, เหตุผล และเวลา โดยไม่เปิดเผย token, header, prompt เต็ม หรือเนื้อหาเอกสาร
+
+ข้อผิดพลาดใช้รูปแบบ `{status:"error", error:{code,message,retryable}}` และไม่ส่ง stack trace

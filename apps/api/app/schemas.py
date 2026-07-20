@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .legal_registry import VALID_KINDS
 from .planner import RetrievalPolicy
@@ -66,6 +66,11 @@ class DocumentOut(ORMModel):
     original_filename: str
     title: str | None
     document_type: str
+    metadata_template_id: str | None = None
+    metadata_template_name: str | None = None
+    metadata_template_version: int | None = None
+    metadata_template_fields: list[dict[str, Any]] = Field(default_factory=list)
+    document_metadata: dict[str, Any] = Field(default_factory=dict)
     published_at: date | None
     mime_type: str
     file_size: int
@@ -80,6 +85,17 @@ class DocumentOut(ORMModel):
     processing_job_status: str | None = None
     processing_job_type: str | None = None
     processing_job_stage: str | None = None
+    processing_job_progress_percent: int | None = None
+
+
+class DocumentPageOut(BaseModel):
+    items: list[DocumentOut]
+    total: int
+    limit: int
+    offset: int
+    has_legal_documents: bool
+    has_completed_documents: bool
+    processing_count: int
 
 
 class LegalMetadataUpdate(BaseModel):
@@ -88,6 +104,98 @@ class LegalMetadataUpdate(BaseModel):
 
 class DocumentMetadataUpdate(BaseModel):
     published_at: date | None = None
+    values: dict[str, Any] | None = None
+
+
+class MetadataFieldDefinition(BaseModel):
+    key: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
+    label: str = Field(min_length=1, max_length=160)
+    field_type: Literal["text", "textarea", "date", "number", "select", "boolean"] = "text"
+    required: bool = False
+    help_text: str | None = Field(default=None, max_length=300)
+    options: list[str] = Field(default_factory=list, max_length=30)
+    # Capabilities keep a metadata field useful without making every field a
+    # graph node or a query filter by default.
+    searchable: bool = True
+    filterable: bool = False
+    graph_entity_type: str | None = Field(default=None, max_length=100)
+    graph_relationship: str | None = Field(default=None, max_length=100, pattern=r"^[A-Z][A-Z0-9_]{1,99}$")
+
+    @model_validator(mode="after")
+    def validate_options(self):
+        self.options = [option.strip() for option in self.options if option.strip()]
+        if self.field_type == "select" and not self.options:
+            raise ValueError("Select fields must define at least one option.")
+        if len(set(self.options)) != len(self.options):
+            raise ValueError("Select field options must be unique.")
+        if self.graph_relationship and not self.graph_entity_type:
+            raise ValueError("graph_entity_type is required when graph_relationship is set.")
+        return self
+
+
+class DocumentMetadataTemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    code: str | None = Field(default=None, max_length=120, pattern=r"^[a-z0-9][a-z0-9-]{0,118}[a-z0-9]$")
+    description: str | None = Field(default=None, max_length=1000)
+    base_document_type: Literal["general", "legal", "regulation", "contract"] = "general"
+    fields: list[MetadataFieldDefinition] = Field(default_factory=list, max_length=30)
+
+    @field_validator("fields")
+    @classmethod
+    def unique_field_keys(cls, value: list[MetadataFieldDefinition]) -> list[MetadataFieldDefinition]:
+        keys = [field.key for field in value]
+        if len(set(keys)) != len(keys):
+            raise ValueError("Document metadata field keys must be unique.")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Document type name cannot be blank.")
+        return value
+
+
+class DocumentMetadataTemplateUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=1000)
+    base_document_type: Literal["general", "legal", "regulation", "contract"] | None = None
+    fields: list[MetadataFieldDefinition] | None = Field(default=None, max_length=30)
+
+    @field_validator("fields")
+    @classmethod
+    def unique_field_keys(cls, value: list[MetadataFieldDefinition] | None) -> list[MetadataFieldDefinition] | None:
+        if value is None:
+            return None
+        keys = [field.key for field in value]
+        if len(set(keys)) != len(keys):
+            raise ValueError("Document metadata field keys must be unique.")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("Document type name cannot be blank.")
+        return value
+
+
+class DocumentMetadataTemplateOut(ORMModel):
+    id: str
+    code: str
+    name: str
+    description: str | None
+    base_document_type: str
+    fields: list[dict[str, Any]] = Field(default_factory=list)
+    version: int
+    is_active: bool
+    is_system: bool = False
+    usage_count: int = 0
 
 
 class QueryFilters(BaseModel):
@@ -95,6 +203,7 @@ class QueryFilters(BaseModel):
     published_to: date | None = None
     as_of_date: date | None = None
     include_historical: bool = False
+    metadata: dict[str, str] = Field(default_factory=dict, max_length=20)
 
 
 class LegalInstrumentOut(ORMModel):
@@ -120,6 +229,7 @@ class LegalInstrumentOut(ORMModel):
     source_reference: str | None
     legal_work_key: str | None
     document_class: str | None
+    version_role: str | None
     version_date: date | None
     reviewed_at: datetime | None
     reviewed_by: str | None
@@ -172,6 +282,14 @@ class QueryRequest(BaseModel):
     response_mode: Literal["evidence", "answer", "both"] = "both"
     max_sources: int = Field(default=10, ge=1, le=20)
     language: str = "auto"
+
+
+class DocumentInventoryRequest(BaseModel):
+    """Deterministic document-registry summary request for MCP clients."""
+    query: str | None = Field(default=None, min_length=1, max_length=10_000)
+    scope: Literal["all", "current"] = "all"
+    include_documents: bool = True
+    max_documents: int = Field(default=500, ge=1, le=500)
 
 
 class ImpactRequest(BaseModel):

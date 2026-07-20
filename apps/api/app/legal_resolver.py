@@ -98,16 +98,18 @@ def resolve_legal_context(db: Session, query: str, kb_ids: list[str], plan: Retr
         for family_id in matched_family_ids:
             candidates = sorted(
                 consolidated_by_family.get(family_id, []),
-                key=lambda row: (row.effective_from or date.min, row.version_date or date.min),
+                key=lambda row: (row.version_role == "latest_consolidated", row.effective_from or date.min, row.version_date or date.min),
                 reverse=True,
             )
-            if len(candidates) == 1:
-                matched_instruments.add(candidates[0].id)
-                preferred_document_ids.append(candidates[0].document_id)
+            latest_candidates = [row for row in candidates if row.version_role == "latest_consolidated"]
+            selected = latest_candidates if latest_candidates else candidates
+            if len(selected) == 1:
+                matched_instruments.add(selected[0].id)
+                preferred_document_ids.append(selected[0].document_id)
                 notes.append("Selected the current consolidated legal instrument for the named family.")
-            elif len(candidates) > 1:
+            elif len(selected) > 1:
                 ambiguous_context = True
-                candidate_instrument_ids.extend(row.id for row in candidates)
+                candidate_instrument_ids.extend(row.id for row in selected)
                 ambiguity_reason = "Multiple current consolidated instruments match the legal family."
         # If a family has no consolidated expression, fall through to the
         # existing family/relation logic below.
@@ -149,15 +151,45 @@ def resolve_legal_context(db: Session, query: str, kb_ids: list[str], plan: Retr
                 row for row in instruments
                 if row.family_id in matched_family_ids and row.document_class == "consolidated" and _is_valid(row, as_of)
             ]
-            if len(family_candidates) == 1:
-                matched_instruments = {family_candidates[0].id}
-                preferred_document_ids = [family_candidates[0].document_id]
+            latest_candidates = [row for row in family_candidates if row.version_role == "latest_consolidated"]
+            selected_candidates = latest_candidates or family_candidates
+            if len(selected_candidates) == 1:
+                matched_instruments = {selected_candidates[0].id}
+                preferred_document_ids = [selected_candidates[0].document_id]
                 notes.append("Selected the current consolidated legal instrument for the provision query.")
-            elif len(family_candidates) > 1:
+            elif len(selected_candidates) > 1:
                 ambiguous_context = True
-                candidate_instrument_ids = [row.id for row in family_candidates]
+                candidate_instrument_ids = [row.id for row in selected_candidates]
                 ambiguity_reason = "The provision number matches multiple current consolidated instruments."
                 matched_instruments = set()
+
+    # A KB can contain amendments from many families.  Only use the default
+    # current expression when the registry has exactly one publisher-designated
+    # latest consolidation, which keeps this a safe general fallback.
+    if not matched_instruments and provision_refs and not ambiguous_context:
+        latest_candidates = [
+            row for row in instruments
+            if row.version_role == "latest_consolidated" and _is_valid(row, as_of)
+        ]
+        if len(latest_candidates) == 1:
+            matched_instruments = {latest_candidates[0].id}
+            preferred_document_ids = [latest_candidates[0].document_id]
+            notes.append("Selected the sole latest consolidated instrument for the provision query.")
+
+    # Provision entities are intentionally version-scoped, so a bare section
+    # lookup may initially match the same article in every historical version.
+    # With the default-current policy, collapse that set to the sole latest
+    # consolidation unless a caller explicitly requested a version or an
+    # historical as-of date.
+    if not matched_instruments and provision_refs and not explicit_version_mention and plan.as_of_date is None and not plan.include_historical and not ambiguous_context:
+        latest_candidates = [
+            row for row in instruments
+            if row.version_role == "latest_consolidated" and _is_valid(row, as_of)
+        ]
+        if len(latest_candidates) == 1:
+            matched_instruments = {latest_candidates[0].id}
+            preferred_document_ids = [latest_candidates[0].document_id]
+            notes.append("Applied the default-current policy to the provision query.")
 
     current_version_ids: set[str] = set()
     amending_instrument_ids: set[str] = set()

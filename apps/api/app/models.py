@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 from pgvector.sqlalchemy import Vector
@@ -41,6 +41,29 @@ class KnowledgeBase(Timestamped, Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class DocumentMetadataTemplate(Timestamped, Base):
+    """A knowledge-base scoped, versioned form used to describe a document.
+
+    ``base_document_type`` deliberately stays within the small set of processing
+    profiles.  A curator may create a type called "ประกาศ" without creating an
+    unreviewed processing path or changing the legal pipeline.
+    """
+    __tablename__ = "document_metadata_templates"
+    __table_args__ = (UniqueConstraint("knowledge_base_id", "code", name="uq_document_metadata_template_code"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+    code: Mapped[str] = mapped_column(String(120), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    base_document_type: Mapped[str] = mapped_column(String(40), default="general", index=True)
+    fields: Mapped[list] = mapped_column(JSON, default=list)
+    # Nullable preserves rows created before profile inheritance was explicit.
+    # New rows store only administrator-defined fields here.
+    custom_fields: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
 class Document(Timestamped, Base):
     __tablename__ = "documents"
     __table_args__ = (UniqueConstraint("knowledge_base_id", "checksum_sha256", name="uq_document_checksum"),)
@@ -56,6 +79,14 @@ class Document(Timestamped, Base):
     # This is an authoring choice, not a MIME-type inference.  It controls
     # post-processing such as the legal metadata extraction workflow.
     document_type: Mapped[str] = mapped_column(String(40), default="general", index=True)
+    # The selected form is snapshotted on the document so changing a template
+    # later never makes historical metadata ambiguous.
+    metadata_template_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    metadata_template_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    metadata_template_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metadata_template_fields: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    document_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    metadata_search_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     published_at: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     tags: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(30), default="queued")
@@ -66,6 +97,21 @@ class Document(Timestamped, Base):
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     external_engine_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class DocumentMetadataValue(Base):
+    """Indexed, filterable metadata projection for query-time exact filters."""
+    __tablename__ = "document_metadata_values"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    field_key: Mapped[str] = mapped_column(String(80), index=True)
+    value_text: Mapped[str] = mapped_column(String(10000))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("document_id", "field_key", name="uq_document_metadata_value"),
+        Index("ix_document_metadata_filter", "knowledge_base_id", "field_key", "value_text"),
+    )
 
 
 class DocumentChunk(Timestamped, Base):
@@ -126,6 +172,10 @@ class LegalInstrument(Timestamped, Base):
     # expressions.  These fields are populated from the official corpus header.
     legal_work_key: Mapped[str | None] = mapped_column(String(700), nullable=True, index=True)
     document_class: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    # ``latest_consolidated`` is deliberately a role rather than a status: a
+    # publisher can designate a latest compilation while its legal status is
+    # still resolved independently from dates and amendment relations.
+    version_role: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
     version_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)

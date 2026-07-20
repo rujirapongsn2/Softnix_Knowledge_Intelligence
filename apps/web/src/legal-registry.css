@@ -59,6 +59,9 @@
 .legal-timeline-item-primary em{color:var(--timeline-accent)}
 @media(max-width:700px){.legal-timeline-track-primary{min-height:330px}.legal-timeline-item-primary{flex-basis:190px;min-height:132px}.legal-timeline-item-primary:before{top:calc(100% + 21px)}.legal-timeline-item-primary.is-bottom:before{bottom:calc(100% + 21px)}}
 
+.legal-review-guide{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.8rem 1rem;border:1px solid #dce8ea;border-radius:14px;background:#fbfefe;color:#355d66}.legal-review-guide>div:first-child{display:grid;gap:.15rem}.legal-review-guide b{font-size:.82rem}.legal-review-guide span{font-size:.74rem;color:#6a8187}.legal-review-legend{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap}.legal-review-legend span{display:inline-flex;align-items:center;gap:.3rem;white-space:nowrap}.legal-review-legend .verified{color:#16763b}.legal-review-legend .suggested{color:#9b6400}.legal-review-legend .manual{color:#65439a}.legal-review-legend b{color:#274e57}.legal-review-legend i{margin-right:.05rem}@media(max-width:700px){.legal-review-guide{align-items:flex-start;flex-direction:column}.legal-review-legend{align-items:flex-start;flex-direction:column;gap:.4rem}}
+.legal-review-scope{color:#52717a!important;font-size:.7rem!important;border-left:1px solid #d8e5e7;padding-left:.8rem}
+
 /* Keep the axis continuous across the complete horizontally-scrollable history. */
 .legal-timeline-track-primary:before{display:none}
 .legal-timeline-axis{--timeline-step:236px;position:absolute;top:50%;left:.6rem;width:max(calc(100% - 1.2rem),calc(var(--timeline-count) * var(--timeline-step)));height:40px;transform:translateY(-50%);background:#d4d5d7;clip-path:polygon(0 0,calc(100% - 24px) 0,100% 50%,calc(100% - 24px) 100%,0 100%);pointer-events:none;z-index:1}

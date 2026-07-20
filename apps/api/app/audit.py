@@ -18,6 +18,39 @@ def _safe_trace_detail(value) -> str | None:
     return text[:240]
 
 
+def record_mcp_error_trace(db, request_id: str | None, *, transport: str, tool: str | None,
+                           error_code: str, message: str, duration_ms: int,
+                           query_preview: str | None = None) -> None:
+    """Record a minimal Trace Explorer entry for a rejected/failed MCP call.
+
+    record_retrieval_execution only writes a TraceRun when a retrieval plan or
+    trace exists, which is only ever produced on the success path, so a
+    rate-limited, disallowed, invalid, or timed-out MCP call never reaches it
+    -- without this, those errors are recorded in the audit log but invisible
+    in Trace Explorer.
+    """
+    correlation_id = str(request_id or "").strip()[:36] or None
+    if not correlation_id:
+        return
+    run = db.get(TraceRun, correlation_id)
+    if run is None:
+        run = TraceRun(id=correlation_id, request_id=correlation_id)
+        db.add(run)
+    run.transport = transport
+    run.tool = tool
+    run.trace_status = "error"
+    run.source_count = 0
+    run.duration_ms = max(0, duration_ms)
+    run.knowledge_base_ids = []
+    run.retrieval_plan = None
+    run.request_summary = {"query_preview": _safe_trace_detail(query_preview), "query_length": len(query_preview or ""),
+                           "query_sha256": None, "filter_summary": {}}
+    run.response_summary = {"answer_preview": _safe_trace_detail(f"{error_code}: {message}"), "citation_ids": [],
+                            "status": "error", "error_code": error_code}
+    db.flush()
+    db.query(TraceSpan).filter(TraceSpan.trace_id == correlation_id).delete(synchronize_session=False)
+
+
 def record_retrieval_execution(db, request_id: str | None, result: dict, *, actor_id: str | None = None,
                                transport: str = "api", tool: str | None = None, rpc_request_id: str | None = None) -> None:
     """Write a transaction-correlated, secret-free RetrievalExecutor trace."""
@@ -53,7 +86,7 @@ def record_retrieval_execution(db, request_id: str | None, result: dict, *, acto
             item["reason_code"] = "not_selected_by_plan" if "not selected" in (item.get("detail") or "") else "channel_unavailable"
         safe_trace.append(item)
     correlation_id = str(request_id or "").strip()[:36] or None
-    safe_plan = {key: plan[key] for key in ("version", "intent", "planner_source", "rationale", "channels", "graph_depth", "graph_scope", "entity_subjects", "document_identifiers", "published_from", "published_to", "as_of_date", "include_historical", "legal_context", "rerank_enabled", "max_sources", "fallback_reason") if key in plan} if isinstance(plan, dict) else None
+    safe_plan = {key: plan[key] for key in ("version", "intent", "planner_source", "rationale", "channels", "graph_depth", "graph_scope", "entity_subjects", "document_identifiers", "published_from", "published_to", "as_of_date", "include_historical", "metadata_filters", "legal_context", "rerank_enabled", "max_sources", "fallback_reason") if key in plan} if isinstance(plan, dict) else None
     if safe_plan is not None and metadata.get("planner_policy_version") is not None:
         safe_plan["policy_version"] = metadata.get("planner_policy_version")
     if safe_plan and safe_plan.get("fallback_reason"):

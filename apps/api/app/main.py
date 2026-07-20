@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 import hashlib
+import json
 import re
 import time
 import unicodedata
@@ -11,24 +12,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 import redis
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .audit import record_audit, record_retrieval_execution
+from .audit import record_audit, record_mcp_error_trace, record_retrieval_execution
 from .db import Base, engine, get_db, SessionLocal
 from .external_ocr import ExternalOcrClient
 from .graph_store import Neo4jGraphStore
 from .legal_registry import provision_number_matches, resolve_instrument_statuses
-from .models import AuditLog, Document, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, TokenKey, TraceRun, TraceSpan, User
+from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, TokenKey, TraceRun, TraceSpan, User
+from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, custom_template_fields, list_templates, merge_profile_fields, metadata_search_text, resolve_template, template_code, validate_metadata_values
 from .observability import metrics, now
 from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
-from .schemas import DocumentMetadataUpdate, DocumentOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
+from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
 from .security import authorize, bearer_token, create_session_token, create_token_secret, current_admin, password_hash, refresh_admin, token_digest, verify_password
-from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
+from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8080", "http://localhost:8081"], allow_credentials=True,
@@ -264,22 +266,116 @@ def delete_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Dep
     return {"status": "deleted", "knowledge_base_id": kb.id}
 
 
+@app.get("/api/v1/knowledge-bases/{kb_id}/document-templates", response_model=list[DocumentMetadataTemplateOut])
+def get_document_templates(kb_id: str, include_inactive: bool = False, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+    return list_templates(db, kb_id, include_inactive=include_inactive)
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/document-templates", response_model=DocumentMetadataTemplateOut)
+def create_document_template(kb_id: str, payload: DocumentMetadataTemplateCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+    code = payload.code or template_code(payload.name)
+    if code.casefold() in SYSTEM_TEMPLATE_CODES or db.query(DocumentMetadataTemplate.id).filter(
+        DocumentMetadataTemplate.knowledge_base_id == kb_id,
+        func.lower(DocumentMetadataTemplate.code) == code.casefold(),
+    ).first():
+        raise HTTPException(409, {"code": "DOCUMENT_TEMPLATE_CODE_EXISTS", "message": "A document type with this code already exists.", "retryable": False})
+    if payload.name.casefold() in SYSTEM_TEMPLATE_NAMES or any(row.name.casefold() == payload.name.casefold() for row in db.query(DocumentMetadataTemplate).filter_by(knowledge_base_id=kb_id).all()):
+        raise HTTPException(409, {"code": "DOCUMENT_TEMPLATE_NAME_EXISTS", "message": "A document type with this name already exists.", "retryable": False})
+    custom_fields = [item.model_dump() for item in payload.fields]
+    row = DocumentMetadataTemplate(knowledge_base_id=kb_id, code=code, name=payload.name, description=payload.description,
+                                   base_document_type=payload.base_document_type, custom_fields=custom_fields,
+                                   fields=merge_profile_fields(payload.base_document_type, custom_fields))
+    db.add(row)
+    record_audit(db, "document_template.create", user.id, "document_template", row.id, {"knowledge_base_id": kb_id, "code": code, "base_document_type": row.base_document_type})
+    db.commit(); db.refresh(row)
+    usage_count = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.deleted_at.is_(None)).scalar() or 0
+    return {"id": row.id, "code": row.code, "name": row.name, "description": row.description, "base_document_type": row.base_document_type,
+            "fields": merge_profile_fields(row.base_document_type, custom_template_fields(row)), "version": row.version, "is_active": row.is_active, "is_system": False, "usage_count": usage_count}
+
+
+@app.patch("/api/v1/document-templates/{template_id}", response_model=DocumentMetadataTemplateOut)
+def update_document_template(template_id: str, payload: DocumentMetadataTemplateUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    row = db.get(DocumentMetadataTemplate, template_id)
+    if not row:
+        raise HTTPException(404, "Document template not found")
+    values = payload.model_dump(exclude_unset=True)
+    if "name" in values and (values["name"].casefold() in SYSTEM_TEMPLATE_NAMES or any(
+        other.id != row.id and other.name.casefold() == values["name"].casefold()
+        for other in db.query(DocumentMetadataTemplate).filter_by(knowledge_base_id=row.knowledge_base_id).all()
+    )):
+        raise HTTPException(409, {"code": "DOCUMENT_TEMPLATE_NAME_EXISTS", "message": "A document type with this name already exists.", "retryable": False})
+    if "fields" in values:
+        raw_fields = [item.model_dump() for item in values["fields"]]
+        values["custom_fields"] = raw_fields
+        values["fields"] = merge_profile_fields(values.get("base_document_type", row.base_document_type), raw_fields)
+    elif "base_document_type" in values:
+        raw_fields = custom_template_fields(row)
+        values["custom_fields"] = raw_fields
+        values["fields"] = merge_profile_fields(values["base_document_type"], raw_fields)
+    for key, value in values.items():
+        setattr(row, key, value)
+    if "fields" in values or "base_document_type" in values:
+        row.version += 1
+    record_audit(db, "document_template.update", user.id, "document_template", row.id, {"fields": sorted(values), "version": row.version})
+    db.commit(); db.refresh(row)
+    usage_count = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.deleted_at.is_(None)).scalar() or 0
+    return {"id": row.id, "code": row.code, "name": row.name, "description": row.description, "base_document_type": row.base_document_type,
+            "fields": merge_profile_fields(row.base_document_type, custom_template_fields(row)), "version": row.version, "is_active": row.is_active, "is_system": False, "usage_count": usage_count}
+
+
+@app.delete("/api/v1/document-templates/{template_id}")
+def deactivate_document_template(template_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    row = db.get(DocumentMetadataTemplate, template_id)
+    if not row:
+        raise HTTPException(404, "Document template not found")
+    row.is_active = False
+    record_audit(db, "document_template.deactivate", user.id, "document_template", row.id)
+    db.commit()
+    return {"status": "inactive", "template_id": row.id}
+
+
+@app.post("/api/v1/document-templates/{template_id}/activate")
+def activate_document_template(template_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    row = db.get(DocumentMetadataTemplate, template_id)
+    if not row:
+        raise HTTPException(404, "Document template not found")
+    row.is_active = True
+    record_audit(db, "document_template.activate", user.id, "document_template", row.id)
+    db.commit()
+    return {"status": "active", "template_id": row.id}
+
+
+def _upload_metadata(template_id: str | None, document_type: str, metadata_json: str | None, db: Session, kb_id: str) -> tuple[dict, str, dict]:
+    try:
+        values = json.loads(metadata_json) if metadata_json else {}
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("DOCUMENT_METADATA_INVALID") from exc
+    template = resolve_template(db, kb_id, template_id, document_type)
+    return template, template["base_document_type"], validate_metadata_values(template.get("fields") or [], values)
+
+
 @app.post("/api/v1/knowledge-bases/{kb_id}/documents")
-def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None), document_type: str = Form("general"), published_at: date | None = Form(None), user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None), document_type: str = Form("general"), template_id: str | None = Form(None), metadata_json: str | None = Form(None), published_at: date | None = Form(None), user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at: raise HTTPException(404, "Knowledge base not found")
     if kb.status == "disabled":
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_DISABLED", "message": "Activate this Knowledge Base before uploading documents.", "retryable": False})
-    try: doc, job = create_document_job(db, kb_id, file, title, document_type, published_at)
+    try:
+        template, profile, metadata = _upload_metadata(template_id, document_type, metadata_json, db, kb_id)
+        doc, job = create_document_job(db, kb_id, file, title, profile, published_at, template, metadata)
     except ValueError as exc:
         status_code = 413 if str(exc) == "FILE_TOO_LARGE" else 400
         raise HTTPException(status_code, {"code": str(exc), "message": "Upload rejected", "retryable": False})
     record_audit(db, "document.upload", user.id, "document", doc.id, {"knowledge_base_id": kb_id, "filename": doc.original_filename, "document_type": doc.document_type}); db.commit()
-    return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type, "legal_extraction_automatic": doc.document_type in {"legal", "regulation", "contract"}}
+    return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type, "template_id": doc.metadata_template_id, "legal_extraction_automatic": doc.document_type in {"legal", "regulation", "contract"}}
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/documents/batch")
-def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), title: str | None = Form(None), document_type: str = Form("general"), user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), title: str | None = Form(None), document_type: str = Form("general"), template_id: str | None = Form(None), metadata_json: str | None = Form(None), user: User = Depends(current_admin), db: Session = Depends(get_db)):
     """Queue a bounded batch while keeping each file an independent job.
 
     A validation, duplicate, or storage failure is isolated to its file so a
@@ -296,18 +392,20 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
         raise HTTPException(400, {"code": "BATCH_FILES_REQUIRED", "message": "Select at least one file.", "retryable": False})
     if len(files) > 20:
         raise HTTPException(400, {"code": "BATCH_TOO_MANY_FILES", "message": "A batch can contain at most 20 files.", "retryable": False})
-    if document_type not in {"general", "legal", "regulation", "contract"}:
-        raise HTTPException(400, {"code": "DOCUMENT_TYPE_INVALID", "message": "Document type is invalid.", "retryable": False})
+    try:
+        template, profile, metadata = _upload_metadata(template_id, document_type, metadata_json, db, kb_id)
+    except ValueError as exc:
+        raise HTTPException(400, {"code": str(exc), "message": "Document metadata is invalid.", "retryable": False})
 
     results = []
     for upload in files:
         filename = upload.filename or "unnamed-file"
-        result = {"filename": filename, "status": "failed", "document_type": document_type}
+        result = {"filename": filename, "status": "failed", "document_type": profile, "template_id": template.get("id")}
         try:
-            doc, job = create_document_job(db, kb_id, upload, title if len(files) == 1 else None, document_type)
+            doc, job = create_document_job(db, kb_id, upload, title if len(files) == 1 else None, profile, None, template, metadata)
             record_audit(db, "document.upload", user.id, "document", doc.id, {"knowledge_base_id": kb_id, "filename": doc.original_filename, "document_type": doc.document_type, "batch": True})
             db.commit()
-            result.update({"status": "queued", "document_id": doc.id, "job_id": job.id, "legal_extraction_automatic": document_type in {"legal", "regulation", "contract"}})
+            result.update({"status": "queued", "document_id": doc.id, "job_id": job.id, "legal_extraction_automatic": profile in {"legal", "regulation", "contract"}})
         except ValueError as exc:
             result.update({"error_code": str(exc), "message": "Upload rejected"})
         except Exception:
@@ -317,8 +415,80 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
 
     queued_count = sum(item["status"] == "queued" for item in results)
     failed_count = len(results) - queued_count
-    return {"status": "queued" if failed_count == 0 else "partial", "document_type": document_type,
+    return {"status": "queued" if failed_count == 0 else "partial", "document_type": profile, "template_id": template.get("id"),
             "total": len(results), "queued_count": queued_count, "failed_count": failed_count, "results": results}
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/documents/page", response_model=DocumentPageOut)
+def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, offset: int = 0,
+                   search: str | None = None, status: str | None = None, document_type: str | None = None,
+                   template_id: str | None = None,
+                   _: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Return a bounded Documents-page slice without changing the legacy list contract."""
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+    if limit < 1 or limit > 100 or offset < 0:
+        raise HTTPException(400, {"code": "DOCUMENT_PAGE_INVALID", "message": "limit must be 1-100 and offset must be non-negative.", "retryable": False})
+    rows = db.query(Document).filter(Document.knowledge_base_id == kb_id)
+    if not include_deleted:
+        rows = rows.filter(Document.deleted_at.is_(None))
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        rows = rows.filter(or_(Document.title.ilike(term), Document.original_filename.ilike(term)))
+    if status:
+        rows = rows.filter(Document.status == status)
+    if document_type:
+        rows = rows.filter(Document.document_type == document_type)
+    if template_id:
+        if template_id.startswith("system:"):
+            profile = template_id.removeprefix("system:")
+            if profile not in {"general", "legal", "regulation", "contract"}:
+                raise HTTPException(400, {"code": "DOCUMENT_TEMPLATE_INVALID", "message": "Document type is invalid.", "retryable": False})
+            rows = rows.filter(or_(Document.metadata_template_id == template_id,
+                                   (Document.metadata_template_id.is_(None)) & (Document.document_type == profile)))
+        else:
+            template = db.get(DocumentMetadataTemplate, template_id)
+            if not template or template.knowledge_base_id != kb_id:
+                raise HTTPException(400, {"code": "DOCUMENT_TEMPLATE_INVALID", "message": "Document type is invalid.", "retryable": False})
+            rows = rows.filter(Document.metadata_template_id == template_id)
+    total = rows.count()
+    documents = rows.order_by(Document.created_at.desc()).offset(offset).limit(limit).all()
+    has_legal_documents = db.query(Document.id).filter(
+        Document.knowledge_base_id == kb_id,
+        Document.document_type.in_(["legal", "regulation", "contract"]),
+        Document.deleted_at.is_(None),
+    ).first() is not None
+    has_completed_documents = db.query(Document.id).filter(
+        Document.knowledge_base_id == kb_id,
+        Document.status == "completed",
+        Document.deleted_at.is_(None),
+    ).first() is not None
+    processing_count = db.query(ProcessingJob.document_id).join(
+        Document, Document.id == ProcessingJob.document_id
+    ).filter(
+        Document.knowledge_base_id == kb_id,
+        Document.deleted_at.is_(None),
+        ProcessingJob.status.in_(["queued", "running"]),
+    ).distinct().count()
+    document_ids = [document.id for document in documents]
+    latest_jobs = {}
+    if document_ids:
+        jobs = db.query(ProcessingJob).filter(ProcessingJob.document_id.in_(document_ids)).order_by(ProcessingJob.created_at.desc()).all()
+        for job in jobs:
+            if job.document_id and job.document_id not in latest_jobs:
+                latest_jobs[job.document_id] = job
+    items = []
+    for document in documents:
+        item = DocumentOut.model_validate(document).model_dump()
+        job = latest_jobs.get(document.id)
+        if job:
+            item.update(processing_job_status=job.status, processing_job_type=job.job_type,
+                        processing_job_stage=job.current_stage, processing_job_progress_percent=job.progress_percent)
+        items.append(item)
+    return {"items": items, "total": total, "limit": limit, "offset": offset,
+            "has_legal_documents": has_legal_documents,
+            "has_completed_documents": has_completed_documents,
+            "processing_count": processing_count}
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/documents", response_model=list[DocumentOut])
@@ -340,7 +510,8 @@ def list_documents(kb_id: str, include_deleted: bool = False, _: User = Depends(
         item = DocumentOut.model_validate(document).model_dump()
         job = latest_jobs.get(document.id)
         if job:
-            item.update(processing_job_status=job.status, processing_job_type=job.job_type, processing_job_stage=job.current_stage)
+            item.update(processing_job_status=job.status, processing_job_type=job.job_type,
+                        processing_job_stage=job.current_stage, processing_job_progress_percent=job.progress_percent)
         result.append(item)
     return result
 
@@ -358,7 +529,10 @@ def reindex_embeddings(kb_id: str, force: bool = False, user: User = Depends(cur
 def document_text(document_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
     if not doc: raise HTTPException(404, "Document not found")
-    return {"document_id": doc.id, "status": doc.status, "document_type": doc.document_type, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata}
+    return {"document_id": doc.id, "status": doc.status, "document_type": doc.document_type, "metadata_template_id": doc.metadata_template_id,
+            "metadata_template_name": doc.metadata_template_name, "metadata_template_version": doc.metadata_template_version,
+            "metadata_template_fields": doc.metadata_template_fields or [],
+            "document_metadata": doc.document_metadata or {}, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata}
 
 
 @app.get("/api/v1/documents/{document_id}/jobs")
@@ -405,10 +579,28 @@ def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, 
     doc = db.get(Document, document_id)
     if not doc or doc.deleted_at:
         raise HTTPException(404, "Document not found")
-    doc.published_at = payload.published_at
-    record_audit(db, "document.metadata.update", user.id, "document", doc.id, {"published_at": str(payload.published_at) if payload.published_at else None})
+    if "published_at" in payload.model_fields_set:
+        doc.published_at = payload.published_at
+    if payload.values is not None:
+        try:
+            # Keep existing documents editable even after an administrator retires
+            # their custom template. The field snapshot is part of the document's
+            # provenance; resolving the live template is only needed for legacy
+            # documents created before snapshots were introduced.
+            fields = doc.metadata_template_fields or []
+            if not fields and doc.metadata_template_name is None:
+                template = resolve_template(db, doc.knowledge_base_id, doc.metadata_template_id, doc.document_type)
+                fields = template.get("fields") or []
+            doc.document_metadata = validate_metadata_values(fields, payload.values)
+            doc.metadata_search_text = metadata_search_text(fields, doc.document_metadata)
+            sync_document_metadata_values(db, doc)
+            sync_document_metadata_graph(db, doc)
+        except ValueError as exc:
+            raise HTTPException(400, {"code": str(exc), "message": "Document metadata is invalid.", "retryable": False})
+    record_audit(db, "document.metadata.update", user.id, "document", doc.id, {"published_at": str(doc.published_at) if doc.published_at else None,
+                 "metadata_fields": sorted((doc.document_metadata or {}).keys())})
     db.commit()
-    return {"status": "updated", "document_id": doc.id, "published_at": doc.published_at}
+    return {"status": "updated", "document_id": doc.id, "published_at": doc.published_at, "document_metadata": doc.document_metadata or {}}
 
 
 @app.put("/api/v1/documents/{document_id}/legal-metadata")
@@ -685,10 +877,49 @@ def get_legal_map(kb_id: str, view: str = "verified", instrument_id: str | None 
         "evidence_quote": relation.evidence_quote,
     } for relation in cross_relations.limit(300).all()]
 
+    # The editable relationship table is the canonical source for internal
+    # edges. Cross-document suggestions may also exist only in the legal
+    # registry when the target instrument has not been resolved yet. Count
+    # those registry rows as well, while skipping rows already linked to a
+    # materialized Relationship to avoid double-counting.
+    relationship_rows = db.query(Relationship).filter(
+        Relationship.knowledge_base_id == kb_id,
+        Relationship.deleted_at.is_(None),
+    ).all()
+    legal_relationships = [edge for edge in relationship_rows if edge.is_legal]
+    linked_relationship_ids = {edge.id for edge in legal_relationships}
+    relationship_summary = {
+        "verified": 0,
+        "suggested": 0,
+        "rejected": 0,
+        "manual": 0,
+        "internal": 0,
+        "cross_document": 0,
+    }
+
+    def add_summary(review_status: str | None, origin: str | None, bucket: str) -> None:
+        if review_status in {"verified", "suggested", "rejected"}:
+            relationship_summary[review_status] += 1
+        if origin == "manual":
+            relationship_summary["manual"] += 1
+        relationship_summary[bucket] += 1
+
+    for edge in legal_relationships:
+        add_summary(edge.review_status, edge.origin, "internal")
+    relationship_summary["manual"] += sum(1 for edge in relationship_rows if edge.origin == "manual" and not edge.is_legal)
+
+    registry_relations = db.query(LegalInstrumentRelation).filter(
+        LegalInstrumentRelation.knowledge_base_id == kb_id,
+    ).all()
+    for relation in registry_relations:
+        if relation.relationship_id in linked_relationship_ids:
+            continue
+        add_summary(relation.review_status, relation.origin, "cross_document")
+
     result = {"knowledge_base_id": kb_id, "view": view, "mode": "map", "instruments": summaries,
               "families": [{"id": family_id, "title": next((row["title"] for row in summaries if row["family_id"] == family_id), "Legal family"),
                              "instrument_ids": [row.id for row in rows]} for family_id, rows in family_rows.items()],
-              "cross_document_relations": cross_edges}
+              "cross_document_relations": cross_edges, "relationship_summary": relationship_summary}
     if not instrument_id:
         return result
     selected = next((item for item in instruments if item.id == instrument_id), None)
@@ -698,10 +929,24 @@ def get_legal_map(kb_id: str, view: str = "verified", instrument_id: str | None 
     entities = db.query(Entity).filter(Entity.id.in_(list(ids)), Entity.deleted_at.is_(None)).order_by(Entity.entity_type.asc(), Entity.name.asc()).limit(max_nodes).all() if ids else []
     visible_ids = {entity.id for entity in entities}
     edges = [edge for edge in edge_query(visible_ids) if edge.source_entity_id in visible_ids and edge.target_entity_id in visible_ids]
+    edge_sources: dict[str, list[dict]] = {}
+    if edges:
+        source_rows = db.query(RelationshipSource, Document).join(
+            Document, Document.id == RelationshipSource.document_id
+        ).filter(
+            RelationshipSource.relationship_id.in_([edge.id for edge in edges]),
+            Document.deleted_at.is_(None),
+        ).all()
+        for source, document in source_rows:
+            edge_sources.setdefault(source.relationship_id, []).append({
+                "document_id": document.id,
+                "title": document.title or document.original_filename,
+                "excerpt": source.excerpt,
+            })
     result["mode"] = "instrument"
     result["instrument"] = next(item for item in summaries if item["id"] == selected.id)
     result["nodes"] = [EntityOut.model_validate(entity).model_dump() for entity in entities]
-    result["edges"] = [RelationshipOut.model_validate(edge).model_dump() for edge in edges]
+    result["edges"] = [{**RelationshipOut.model_validate(edge).model_dump(), "sources": edge_sources.get(edge.id, [])} for edge in edges]
     result["warnings"] = (["This instrument view is bounded to the selected document."] if len(ids) > max_nodes else [])
     return result
 
@@ -777,9 +1022,10 @@ def get_legal_instrument(instrument_id: str, _: User = Depends(current_admin), d
         ).order_by(LegalInstrument.effective_from).all()
     outgoing = db.query(LegalInstrumentRelation).filter_by(source_instrument_id=instrument.id).all()
     incoming = db.query(LegalInstrumentRelation).filter_by(target_instrument_id=instrument.id).all()
-    relation_out = lambda row: {"id": row.id, "relation": row.relation, "target_instrument_id": row.target_instrument_id,
-                                "target_text": row.target_text, "target_provision": row.target_provision,
-                                "review_status": row.review_status, "confidence": row.confidence}
+    def relation_out(row):
+        return {"id": row.id, "relation": row.relation, "target_instrument_id": row.target_instrument_id,
+                "target_text": row.target_text, "target_provision": row.target_provision,
+                "review_status": row.review_status, "confidence": row.confidence}
     return {
         "instrument": LegalInstrumentOut.model_validate(instrument).model_dump(),
         "family": [LegalInstrumentOut.model_validate(row).model_dump() for row in family_members],
@@ -1415,6 +1661,7 @@ def list_mcp_activity(limit: int = 50, _: User = Depends(current_admin), db: Ses
 
 MCP_TOOLS = [
     {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning", "inputSchema": QueryRequest.model_json_schema()},
+    {"name": "document_inventory_summary", "description": "Count and group non-deleted documents from the scoped document and legal registries", "inputSchema": DocumentInventoryRequest.model_json_schema()},
     {"name": "find_entities", "description": "Find entities by name or alias", "inputSchema": {"type": "object", "properties": {"search_text": {"type": "string"}}, "required": ["search_text"]}},
     {"name": "analyze_relationships", "description": "Analyze entity relationships", "inputSchema": {"type": "object", "properties": {"subjects": {"type": "array"}, "question": {"type": "string"}}, "required": ["subjects", "question"]}},
     {"name": "analyze_impact", "description": "Analyze direct and indirect impact", "inputSchema": ImpactRequest.model_json_schema()},
@@ -1506,6 +1753,13 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
                 payload = QueryRequest.model_validate(arguments)
                 payload.knowledge_base_ids = effective_kb_ids
                 result = authorized_query(payload, token, db)
+            elif name == "document_inventory_summary":
+                payload = DocumentInventoryRequest.model_validate(arguments)
+                result = build_document_inventory_result(
+                    db, payload.query or "document inventory summary", effective_kb_ids, token_id=token.id,
+                    scope=payload.scope, include_documents=payload.include_documents,
+                    max_documents=payload.max_documents,
+                )
             elif name == "find_entities":
                 kb_ids = effective_kb_ids
                 rows = db.query(Entity).filter(Entity.knowledge_base_id.in_(kb_ids), Entity.deleted_at.is_(None), Entity.name.ilike(f"%{arguments.get('search_text', '')}%")).limit(min(arguments.get("limit", 10), 50)).all()
@@ -1592,21 +1846,39 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {"code": "MCP_REQUEST_INVALID", "message": str(exc.detail)}
+        error_code = detail.get("code", "MCP_REQUEST_INVALID")
         if token is not None and tool_name:
-            record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code=detail.get("code", "MCP_REQUEST_INVALID"))
-        return mcp_error(request_id, detail.get("code", "MCP_REQUEST_INVALID"), detail.get("message", "Request rejected"), retryable=detail.get("retryable", False))
+            record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code=error_code)
+        record_mcp_error_trace(db, request.state.request_id, transport="mcp", tool=tool_name, error_code=error_code,
+                               message=detail.get("message", "Request rejected"), duration_ms=round((time.monotonic() - mcp_started_at) * 1000),
+                               query_preview=mcp_audit_arguments(tool_name, tool_arguments).get("query") if tool_name else None)
+        db.commit()
+        return mcp_error(request_id, error_code, detail.get("message", "Request rejected"), retryable=detail.get("retryable", False))
     except McpLimitExceeded as exc:
         if token is not None and tool_name:
             record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code=exc.code)
+        record_mcp_error_trace(db, request.state.request_id, transport="mcp", tool=tool_name, error_code=exc.code,
+                               message=exc.message, duration_ms=round((time.monotonic() - mcp_started_at) * 1000),
+                               query_preview=mcp_audit_arguments(tool_name, tool_arguments).get("query") if tool_name else None)
+        db.commit()
         return mcp_error(request_id, exc.code, exc.message, retryable=exc.code == "MCP_LIMIT_STORE_UNAVAILABLE")
     except RuntimeError as exc:
         if token is not None and tool_name:
             record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code=str(exc))
+        record_mcp_error_trace(db, request.state.request_id, transport="mcp", tool=tool_name, error_code=str(exc),
+                               message="Token query timeout exceeded" if str(exc) == "MCP_TIMEOUT" else "Tool execution failed",
+                               duration_ms=round((time.monotonic() - mcp_started_at) * 1000),
+                               query_preview=mcp_audit_arguments(tool_name, tool_arguments).get("query") if tool_name else None)
+        db.commit()
         if str(exc) == "MCP_TIMEOUT": return mcp_error(request_id, "MCP_TIMEOUT", "Token query timeout exceeded", retryable=True)
         return mcp_error(request_id, "MCP_EXECUTION_FAILED", "Tool execution failed", retryable=True)
     except Exception:
         if token is not None and tool_name:
             record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code="MCP_REQUEST_INVALID")
+        record_mcp_error_trace(db, request.state.request_id, transport="mcp", tool=tool_name, error_code="MCP_REQUEST_INVALID",
+                               message="Invalid MCP request", duration_ms=round((time.monotonic() - mcp_started_at) * 1000),
+                               query_preview=mcp_audit_arguments(tool_name, tool_arguments).get("query") if tool_name else None)
+        db.commit()
         return mcp_error(request_id, "MCP_REQUEST_INVALID", "Invalid MCP request")
     finally:
         if deadline_token is not None: reset_deadline(deadline_token)

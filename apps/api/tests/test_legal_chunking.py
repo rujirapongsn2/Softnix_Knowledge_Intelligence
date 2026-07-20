@@ -148,3 +148,69 @@ def test_legal_document_upload_is_chunked_by_section_through_the_real_pipeline()
         section_kinds = {chunk.section_kind for chunk in chunks}
         assert "มาตรา" in section_kinds
         assert any(chunk.section_number == "15 ทวิ" for chunk in chunks)
+
+
+# --- sub-work segmentation and query ranking (consolidated Thai code) -------
+
+from types import SimpleNamespace
+
+
+def _seg_chunk(index, content, number=None, kind="มาตรา"):
+    return SimpleNamespace(id=f"c{index}", chunk_index=index, content=content, section_number=number, section_kind=kind)
+
+
+def test_segment_document_subworks_splits_enabling_act_code_and_notes():
+    chunks = [
+        _seg_chunk(0, "พระราชบัญญัติ ให้ใช้ประมวลกฎหมายที่ดิน พ.ศ. ๒๔๙๗", kind="preamble"),
+        _seg_chunk(1, "มาตรา ๓ ประมวลกฎหมายที่ดินตามที่ตราไว้ต่อท้ายพระราชบัญญัตินี้ให้ใช้บังคับตั้งแต่วันที่ ๑ ธันวาคม", "3"),
+        _seg_chunk(2, "มาตรา ๑ ในประมวลกฎหมายนี้ ที่ดิน หมายความว่า พื้นที่ดินทั่วไป", "1"),
+        _seg_chunk(3, "มาตรา ๙ ภายใต้บังคับกฎหมาย ที่ดินของรัฐนั้น ห้ามมิให้บุคคลใดเข้าไปยึดถือครอบครอง", "9"),
+        _seg_chunk(4, "มาตรา ๒ พระราชบัญญัตินี้ให้ใช้บังคับ หมายเหตุ :- เหตุผลในการประกาศใช้พระราชบัญญัติ", "2"),
+        _seg_chunk(5, "มาตรา ๒ พระราชบัญญัตินี้ให้ใช้บังคับตั้งแต่วันถัดจากวันประกาศ", "2"),
+    ]
+    seg = services.segment_document_subworks(chunks)
+    assert seg["c0"] == "enabling_act"
+    assert seg["c1"] == "enabling_act"
+    assert seg["c2"] == "code_body"
+    assert seg["c3"] == "code_body"
+    assert seg["c4"] == "amendment_note"
+    assert seg["c5"] == "amendment_note"
+
+
+def test_segment_document_subworks_fails_safe_without_code_boundary():
+    chunks = [_seg_chunk(0, "มาตรา ๑ ...", "1"), _seg_chunk(1, "มาตรา ๒ ...", "2")]
+    assert set(services.segment_document_subworks(chunks).values()) == {"unknown"}
+
+
+def test_rank_chunks_by_query_prefers_lexical_overlap_over_a_colliding_section():
+    enabling = _seg_chunk(0, "มาตรา ๙ ที่ดินที่ได้รับคำรับรองจากนายอำเภอว่าได้ทำประโยชน์แล้ว ให้โอนกันได้", "9")
+    code = _seg_chunk(1, "มาตรา ๙ ที่ดินของรัฐนั้น ห้ามมิให้บุคคลใดเข้าไปยึดถือครอบครอง หวงห้าม", "9")
+    ranked = services._rank_chunks_by_query("มาตรา 9 ห้ามทำสิ่งใดในที่ดินของรัฐ หวงห้าม", [enabling, code])
+    assert ranked[0][0] is code
+
+
+def test_segment_document_subworks_ignores_amendment_note_marker_before_code_body_starts():
+    # An early chunk incidentally contains the amendment-note marker substring
+    # (e.g. quoting boilerplate) before the code body has started -- this must
+    # not short-circuit classification for the rest of the document.
+    chunks = [
+        _seg_chunk(0, "พระราชบัญญัติ ให้ใช้ประมวลกฎหมายที่ดิน หมายเหตุ :- เหตุผลในการประกาศใช้กฎหมายฉบับเดิม", kind="preamble"),
+        _seg_chunk(1, "มาตรา ๑ ในประมวลกฎหมายนี้ ที่ดิน หมายความว่า พื้นที่ดินทั่วไป", "1"),
+        _seg_chunk(2, "มาตรา ๙ ภายใต้บังคับกฎหมาย ที่ดินของรัฐนั้น ห้ามมิให้บุคคลใดเข้าไปยึดถือครอบครอง", "9"),
+    ]
+    seg = services.segment_document_subworks(chunks)
+    assert seg["c0"] == "enabling_act"
+    assert seg["c1"] == "code_body"
+    assert seg["c2"] == "code_body"
+
+
+def test_segment_document_subworks_requires_section_one_for_code_body_marker():
+    chunks = [
+        _seg_chunk(0, "พระราชบัญญัติ ให้ใช้ประมวลกฎหมายที่ดิน", kind="preamble"),
+        _seg_chunk(1, "มาตรา ๕ ...อ้างถึงข้อความในประมวลกฎหมายนี้...", "5"),
+        _seg_chunk(2, "มาตรา ๑ ในประมวลกฎหมายนี้ ที่ดิน หมายความว่า พื้นที่ดินทั่วไป", "1"),
+    ]
+    seg = services.segment_document_subworks(chunks)
+    assert seg["c0"] == "enabling_act"
+    assert seg["c1"] == "enabling_act"
+    assert seg["c2"] == "code_body"

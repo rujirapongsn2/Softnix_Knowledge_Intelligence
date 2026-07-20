@@ -1,5 +1,7 @@
 FROM node:22-alpine AS build
 WORKDIR /app
+ARG MAX_FILE_SIZE_MB=100
+ENV VITE_MAX_FILE_SIZE_MB=$MAX_FILE_SIZE_MB
 COPY package.json .
 RUN npm install
 COPY . .

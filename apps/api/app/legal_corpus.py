@@ -13,12 +13,25 @@ from .legal_registry import _to_arabic_digits, normalize_family_key, parse_thai_
 
 
 _HEADER_KEYS = ("ชื่อในผัง", "ชื่อกฎหมาย", "รหัสฉบับ", "วันที่ในผัง", "แหล่งข้อมูล")
+_PROVISION_NUMBER = r"[0-9๐-๙]+(?:/[0-9๐-๙]+)?(?:\s*(?:ทวิ|ตรี|จัตวา|เบญจ|ฉ|สัตต|อัฏฐ|นว|ทศ))?"
 _CHANGE_RE = re.compile(
-    r"(?P<clause>(?:มาตรา|ข้อ)\s*[0-9๐-๙]+(?:\s*(?:ทวิ|ตรี|จัตวา|เบญจ))?[^\n]{0,420}?"
+    rf"(?P<clause>(?:มาตรา|ข้อ)\s*{_PROVISION_NUMBER}[^\n]{{0,420}}?"
     r"(?:ให้ยกเลิกความใน|ให้ยกเลิก|ให้เพิ่ม|เพิ่มความใน|ให้ใช้ความต่อไปนี้แทน)[^\n]{0,700})",
     re.IGNORECASE,
 )
-_TARGET_RE = re.compile(r"(?:ใน|เป็น|แทน|ยกเลิก)\s*(?:มาตรา|ข้อ)\s*([0-9๐-๙]+(?:\s*(?:ทวิ|ตรี|จัตวา|เบญจ))?)", re.IGNORECASE)
+_TARGET_RE = re.compile(
+    rf"(?:ใน|เป็น|แทน|ยกเลิก|ของ)\s*(?:(?P<paragraph>วรรค\s*(?:[0-9๐-๙]+|หนึ่ง|สอง|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|สิบ))\s*ของ\s*)?"
+    rf"(?:มาตรา|ข้อ)\s*(?P<number>{_PROVISION_NUMBER})",
+    re.IGNORECASE,
+)
+# A repeal/insertion clause can enumerate any number of provisions after the
+# primary target, either joined by และ/หรือ/comma ("...เป็นมาตรา ๙๖ ทวิ และมาตรา
+# ๙๖ ตรี...") or simply listed back to back with only whitespace between them
+# ("...ยกเลิกมาตรา ๑๐๕ มาตรา ๑๐๕ ทวิ ... และมาตรา ๑๐๕ อัฏฐ..."). This matches one
+# such token; _extract_change_targets chains it forward from the primary
+# target so a distant, unrelated reference elsewhere in the clause is never
+# mistaken for an additional target.
+_CHAIN_TARGET_RE = re.compile(rf"(?:(?:และ|หรือ|,)\s*)?(?:มาตรา|ข้อ)\s*(?P<number>{_PROVISION_NUMBER})", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -29,6 +42,10 @@ class LegalCorpusHeader:
     version_date: str | None = None
     source_uri: str | None = None
     document_class: str = "unknown"
+    # ``document_class`` is retained for compatibility with existing records.
+    # This more specific role lets inventory and temporal retrieval distinguish
+    # a normal consolidation from the publisher's designated latest one.
+    version_role: str = "unknown"
     legal_work_key: str | None = None
     version_label: str | None = None
     official_number: str | None = None
@@ -52,13 +69,15 @@ def parse_header(text: str) -> LegalCorpusHeader:
     title = values.get("ชื่อกฎหมาย") or display
     compact = _clean(display or title).casefold()
     if "ฉบับหลัก" in compact:
-        document_class = "main"
-    elif "ฉบับปรับปรุง" in compact or "รวม" in compact:
-        document_class = "consolidated"
+        document_class, version_role = "main", "main"
+    elif "ฉบับปรับปรุงล่าสุด" in compact or "ฉบับรวมล่าสุด" in compact:
+        document_class, version_role = "consolidated", "latest_consolidated"
+    elif "ฉบับปรับปรุง" in compact or "ฉบับรวม" in compact or "รวม" in compact:
+        document_class, version_role = "consolidated", "consolidated"
     elif "ฉบับแก้ไข" in compact or "แก้ไขเพิ่มเติม" in compact:
-        document_class = "amendment"
+        document_class, version_role = "amendment", "amendment"
     else:
-        document_class = "unknown"
+        document_class, version_role = "unknown", "unknown"
     _, version_label, _ = normalize_family_key(title or "")
     # Keep the base work stable across amendment titles and title typos.
     normalized_title = _clean(title or "")
@@ -79,10 +98,47 @@ def parse_header(text: str) -> LegalCorpusHeader:
         version_date=version_date.isoformat() if version_date else None,
         source_uri=values.get("แหล่งข้อมูล"),
         document_class=document_class,
+        version_role=version_role,
         legal_work_key=work,
         version_label=version_label,
         official_number=number,
     )
+
+
+def _extract_change_targets(quote: str) -> list[str]:
+    """Return every provision a change clause acts on, in order.
+
+    A compound clause names one target with a semantic prefix ("...เป็นมาตรา ๙๖
+    ทวิ...") plus any number of further provisions, either joined by
+    และ/หรือ/comma or simply listed back to back with only whitespace between
+    them (a common Thai legal-drafting convention for long enumerations, e.g.
+    a single repeal clause naming 8 provisions in a row). We chain-match
+    forward from the primary target only as long as the next "มาตรา/ข้อ N"
+    token starts right where the previous one ended (mod whitespace), so a
+    distant, unrelated reference elsewhere in the clause is never mistaken for
+    a target, and there is no arbitrary length limit that can silently drop a
+    provision from a long enumeration.
+    """
+    targets: list[str] = []
+    primary = _TARGET_RE.search(quote)
+    pos = 0
+    if primary:
+        number = _to_arabic_digits(primary.group("number")).strip()
+        paragraph = _clean(primary.group("paragraph"))
+        targets.append(f"{number} {paragraph}" if paragraph else number)
+        pos = primary.end()
+    while True:
+        skip = 0
+        while pos + skip < len(quote) and quote[pos + skip].isspace():
+            skip += 1
+        chained = _CHAIN_TARGET_RE.match(quote, pos + skip)
+        if not chained:
+            break
+        number = _to_arabic_digits(chained.group("number")).strip()
+        if number not in targets:
+            targets.append(number)
+        pos = chained.end()
+    return targets
 
 
 def parse_change_events(text: str) -> list[dict]:
@@ -90,7 +146,7 @@ def parse_change_events(text: str) -> list[dict]:
     seen: set[tuple[str, str, str]] = set()
     for match in _CHANGE_RE.finditer(text or ""):
         quote = _clean(match.group("clause"))[:5000]
-        provision_match = re.match(r"(?:มาตรา|ข้อ)\s*([0-9๐-๙]+(?:\s*(?:ทวิ|ตรี|จัตวา|เบญจ))?)", quote, re.I)
+        provision_match = re.match(rf"(?:มาตรา|ข้อ)\s*({_PROVISION_NUMBER})", quote, re.I)
         if not provision_match:
             continue
         provision = _to_arabic_digits(provision_match.group(1)).strip()
@@ -98,16 +154,15 @@ def parse_change_events(text: str) -> list[dict]:
         action = "repeal" if "ให้ยกเลิก" in lower and "ให้ใช้ความต่อไปนี้แทน" not in lower else "replace"
         if "ให้เพิ่ม" in lower or "เพิ่มความใน" in lower:
             action = "insert"
-        target_match = _TARGET_RE.search(quote)
-        target = _to_arabic_digits(target_match.group(1)).strip() if target_match else provision
-        key = (action, provision, target)
-        if key in seen:
-            continue
-        seen.add(key)
-        events.append({"action": action, "provision_kind": "มาตรา" if "มาตรา" in quote else "ข้อ",
-                       "provision_number": provision, "target_provision": target,
-                       "evidence_quote": quote, "origin": "legal_schema", "review_status": "verified",
-                       "confidence": 1.0})
+        for target in _extract_change_targets(quote) or [provision]:
+            key = (action, provision, target)
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append({"action": action, "provision_kind": "มาตรา" if "มาตรา" in quote else "ข้อ",
+                           "provision_number": provision, "target_provision": target,
+                           "evidence_quote": quote, "origin": "legal_schema", "review_status": "verified",
+                           "confidence": 1.0})
     return events
 
 

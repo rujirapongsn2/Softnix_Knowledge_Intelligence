@@ -84,6 +84,8 @@ class RetrievalPlan(BaseModel):
     published_to: date | None = None
     as_of_date: date | None = None
     include_historical: bool = False
+    metadata_filters: dict[str, str] = Field(default_factory=dict)
+    metadata_document_ids: list[str] | None = Field(default=None, exclude=True, repr=False)
     legal_context: LegalContext | None = None
     authority_weight: float = Field(default=0.30, ge=0, le=1)
     recency_weight: float = Field(default=0.15, ge=0, le=1)
@@ -172,12 +174,12 @@ def _rule_details(query: str) -> tuple[str, bool, list[str], list[str], date | N
         return "semantic_global", False, entity_subjects, document_ids, published_from, published_to
     if entity_subjects and any(word in value for word in ("depend", "relationship", "เชื่อม", "สัมพันธ์", "เกี่ยวข้อง", "connect")):
         return "relationship_local", False, entity_subjects, document_ids, published_from, published_to
-    if entity_subjects:
-        return "entity_lookup", False, entity_subjects, document_ids, published_from, published_to
-    if "vpn" in value or any(word in value for word in ("ขั้นตอน", "วิธี", "how to", "procedure")):
-        return "how_to", False, entity_subjects, document_ids, published_from, published_to
     if re.search(r"(?:มาตรา|ข้อ|article|section|clause)\s*[0-9๐-๙]+", value):
         return "legal_provision", False, entity_subjects, document_ids, published_from, published_to
+    if "vpn" in value or any(word in value for word in ("ขั้นตอน", "วิธี", "ทำอย่างไร", "ต้องทำอย่างไร", "ดำเนินการอย่างไร", "how to", "procedure")):
+        return "how_to", False, entity_subjects, document_ids, published_from, published_to
+    if entity_subjects:
+        return "entity_lookup", False, entity_subjects, document_ids, published_from, published_to
     return "semantic_hybrid", True, entity_subjects, document_ids, published_from, published_to
 
 

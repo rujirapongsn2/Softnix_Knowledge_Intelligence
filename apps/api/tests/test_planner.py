@@ -30,6 +30,27 @@ def test_policy_disabling_all_channels_does_not_reenable_a_store():
     assert decision.plan.channels == []
 
 
+@pytest.mark.parametrize("query", [
+    "การโอนกรรมสิทธิ์หรือสิทธิครอบครองในที่ดินต้องทำอย่างไร?",
+    "ต้องดำเนินการอย่างไรเพื่อขอสิทธิ์ VPN",
+])
+def test_thai_how_to_phrases_use_vector_and_full_text(query):
+    plan = rule_plan(query, RetrievalPolicy(enable_lightrag=False), 10).plan
+    assert plan.intent == "how_to"
+    assert [channel.value for channel in plan.channels] == ["vector", "full_text"]
+
+
+def test_legal_provision_takes_precedence_over_how_to_phrase():
+    plan = rule_plan("มาตรา 7 ต้องทำอย่างไร", RetrievalPolicy(enable_lightrag=False), 10).plan
+    assert plan.intent == "legal_provision"
+
+
+def test_how_to_takes_precedence_over_generic_entity_lookup():
+    plan = rule_plan("APP-01 ต้องทำอย่างไร", RetrievalPolicy(enable_lightrag=False), 10).plan
+    assert plan.intent == "how_to"
+    assert plan.entity_subjects == ["APP-01"]
+
+
 @pytest.mark.parametrize(("query", "intent", "channels", "scope", "depth", "subject", "document_id", "published_from"), [
     ("ขั้นตอนขอสิทธิ์ VPN คืออะไร", "how_to", ["vector", "full_text"], "none", 1, None, None, None),
     ("APP-01 เชื่อมต่อกับระบบใด", "relationship_local", ["graph"], "local", 1, "APP-01", None, None),

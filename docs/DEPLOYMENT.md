@@ -1,23 +1,55 @@
-# Deployment
+# การติดตั้งและ Deploy
 
-1. Create a protected `.env` from `.env.example`; set unique `APP_SECRET_KEY`, `TOKEN_HASH_SECRET`, and `INITIAL_ADMIN_PASSWORD`.
-   Set `OPENROUTER_API_KEY` for the initial development path and keep it outside source control. The bundled LightRAG service uses OpenRouter's OpenAI-compatible endpoint for both extraction/query LLM calls and embeddings. `LIGHTRAG_API_KEY` is a separate internal service credential.
-   `LIGHTRAG_IMAGE` is pinned to the verified LightRAG image digest in the local `.env`. Update it only through a reviewed compatibility test, then record the approved digest.
-   If host port `8000` is already occupied, set `API_PORT=8001` (the default in this Compose file) and use `http://localhost:8001` for the API.
-   `RETRIEVAL_PLANNER_TIMEOUT_SECONDS` bounds the OpenRouter fallback planner (default 4 seconds); rule-based planning remains available when the key or provider is unavailable.
-2. Start with `docker compose -f docker-compose.yml -f docker-compose.production.yml up -d --build` behind a TLS reverse proxy or Cloudflare Tunnel. For a tunnel mapping `https://knowledge.softnix.ai` to `http://localhost:8081`, keep `WEB_PORT=8081`, set `OPENROUTER_APP_URL=https://knowledge.softnix.ai`, and use the production override so `COOKIE_SECURE=true`. The `migrate` service runs `alembic upgrade head`; API startup waits for it to complete successfully.
-3. Ensure PostgreSQL, Redis, Neo4j and uploaded-file volumes are persistent. Do not publish their ports.
-4. Verify `/health` and `/ready`; then sign in and rotate the initial password.
+## Local / development
 
-Run reviewed Alembic migrations before production API upgrades; schema bootstrap is only for a clean local installation.
-# Upload size limit
+```bash
+cp .env.example .env
+docker compose up --build -d
+docker compose ps
+```
 
-Set `MAX_FILE_SIZE_MB` in `.env` to the maximum supported upload size. The same
-value is applied by the web reverse proxy and API; after changing it, run
-`docker compose up --build -d web api`.
+ตั้งค่าอย่างน้อย:
 
-## Reindex existing embeddings
+- `APP_SECRET_KEY`, `TOKEN_HASH_SECRET`, `INITIAL_ADMIN_PASSWORD` เป็นค่าที่สุ่มใหม่และไม่ commit
+- `OPENROUTER_API_KEY` สำหรับ embedding, extraction และ answer generation
+- `LIGHTRAG_API_KEY` เป็น credential ภายในของ LightRAG
+- `WEB_PORT` (ค่าเริ่มต้น 8081), `API_PORT` (ค่าเริ่มต้น 8001)
+- `EXT_OCR_KEY` หากต้องการ OCR PDF สแกน
 
-After enabling pgvector embeddings, select a Knowledge Base in the Admin UI and
-click **Reindex embeddings**. This queues only documents that do not have vectors;
-it does not re-send completed documents to LightRAG.
+บริการหลักคือ `web`, `api`, `worker`, `migrate`, `postgres`, `redis`, `neo4j` และ `lightrag` โดยข้อมูลอยู่ใน named volumes (`files`, `postgres`, `redis`, `neo4j`, `lightrag`)
+
+## Production
+
+ใช้ reverse proxy หรือ Cloudflare Tunnel ที่มี HTTPS:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.production.yml up -d --build
+```
+
+ไฟล์ production จะเปิด `APP_ENV=production`, `COOKIE_SECURE=true`, ปิด query text log และตั้ง restart policy ให้บริการหลัก ห้ามเปิดพอร์ต PostgreSQL, Redis, Neo4j หรือ LightRAG สู่สาธารณะ
+
+## Migration และตรวจสอบ
+
+`migrate` จะรัน `alembic upgrade head` ก่อน API เริ่มทำงาน หากรันแยก:
+
+```bash
+docker compose run --rm migrate
+docker compose up -d --build api worker web
+```
+
+ตรวจสถานะด้วย:
+
+```bash
+curl http://localhost:8001/health
+curl http://localhost:8001/ready
+docker compose ps
+```
+
+`/ready` ต้องเห็น database, Redis, Neo4j, LightRAG และ external OCR เป็น `ready` ตามบริการที่ตั้งค่าไว้
+
+## การเปลี่ยนแปลงที่มักต้องทำเพิ่ม
+
+- เพิ่ม `MAX_FILE_SIZE_MB` แล้ว rebuild `web` และ `api` เพื่อให้ file picker, proxy และ API ใช้ค่าเดียวกัน (ค่าเริ่มต้น 100 MB)
+- เปลี่ยน embedding model/dimension ต้อง reindex embeddings ทั้ง Knowledge Base อย่างควบคุม (ค่าเริ่มต้น dimension 1536)
+- เพิ่ม/แก้ `published_at` ได้ตอน upload หรือผ่าน `PATCH /api/v1/documents/{id}/metadata`; ไม่มีการ backfill อัตโนมัติ
+- หาก deploy API ใหม่แล้ว web ได้ `502` ให้ recreate web เพื่อให้ nginx resolve IP ของ API ใหม่: `docker compose up -d --force-recreate web`

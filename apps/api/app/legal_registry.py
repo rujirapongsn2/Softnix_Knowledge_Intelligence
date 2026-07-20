@@ -135,7 +135,7 @@ def parse_thai_date(value) -> date | None:
 
 
 _PROVISION_PATTERN = re.compile(
-    r"(มาตรา|ข้อ|หมวด|ส่วนที่|section|article|clause)\s*([0-9๐-๙]+(?:/[0-9๐-๙]+)?)\s*(ทวิ|ตรี|จัตวา|เบญจ)?",
+    r"(มาตรา|ข้อ|หมวด|ส่วนที่|section|article|clause)\s*([0-9๐-๙]+(?:/[0-9๐-๙]+)?)\s*(ทวิ|ตรี|จัตวา|เบญจ)?(?:\s*(วรรค\s*(?:[0-9๐-๙]+|หนึ่ง|สอง|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|สิบ)))?",
     re.IGNORECASE,
 )
 _PROVISION_KIND_LABELS = {"section": "มาตรา", "article": "มาตรา", "clause": "ข้อ"}
@@ -145,10 +145,17 @@ def parse_provision_refs(text: str) -> list[dict]:
     """Find มาตรา/ข้อ/หมวด references (Thai or Arabic numerals) in free text."""
     results = []
     for match in _PROVISION_PATTERN.finditer(text or ""):
-        raw_kind, number, suffix = match.group(1), match.group(2), match.group(3)
+        raw_kind, number, suffix, paragraph = match.group(1), match.group(2), match.group(3), match.group(4)
         kind = _PROVISION_KIND_LABELS.get(raw_kind.casefold(), raw_kind)
         normalized_number = _to_arabic_digits(number) + (f" {suffix}" if suffix else "")
-        results.append({"kind": kind, "number": normalized_number.strip(), "raw": match.group(0).strip()})
+        results.append(
+            {
+                "kind": kind,
+                "number": normalized_number.strip(),
+                "paragraph": paragraph or None,
+                "raw": match.group(0).strip(),
+            }
+        )
     return results
 
 
@@ -156,7 +163,20 @@ _PROVISION_PREFIX = re.compile(r"^(มาตรา|ข้อ|section|article|cla
 
 
 def _normalize_provision_number(value: str) -> str:
-    return re.sub(r"\s+", "", _PROVISION_PREFIX.sub("", (value or "").strip())).casefold()
+    value = re.sub(r"\s+", "", _PROVISION_PREFIX.sub("", (value or "").strip())).casefold()
+    # Thai consolidation texts use both ``9 ทวิ`` and ``9/1`` for the same
+    # provision.  Normalize the ordinal suffix only at comparison time so the
+    # registry retains the source wording for citations and auditability.
+    value = re.sub(r"([0-9๐-๙]+)ทวิ$", r"\1/1", value)
+    value = re.sub(r"([0-9๐-๙]+)ตรี$", r"\1/2", value)
+    value = re.sub(r"([0-9๐-๙]+)จัตวา$", r"\1/3", value)
+    value = re.sub(r"([0-9๐-๙]+)เบญจ$", r"\1/4", value)
+    value = re.sub(r"([0-9๐-๙]+)ฉ$", r"\1/5", value)
+    value = re.sub(r"([0-9๐-๙]+)สัตต$", r"\1/6", value)
+    value = re.sub(r"([0-9๐-๙]+)อัฏฐ$", r"\1/7", value)
+    value = re.sub(r"([0-9๐-๙]+)นว$", r"\1/8", value)
+    value = re.sub(r"([0-9๐-๙]+)ทศ$", r"\1/9", value)
+    return value
 
 
 def provision_number_matches(target_provision: str | None, section_number: str | None) -> bool:
@@ -164,7 +184,11 @@ def provision_number_matches(target_provision: str | None, section_number: str |
     normalized section_number (e.g. '5'), ignoring the kind prefix and whitespace."""
     if not target_provision or not section_number:
         return False
-    return _normalize_provision_number(target_provision) == _normalize_provision_number(section_number)
+    target, section = _normalize_provision_number(target_provision), _normalize_provision_number(section_number)
+    # A relation targeting a paragraph still overrides the article body for
+    # version selection; callers needing paragraph-specific text retain the
+    # full target value for provenance display.
+    return target == section or target.startswith(section + "วรรค")
 
 
 _WHOLE_INSTRUMENT_REPEAL_STATUS = {"REPEALS": "repealed", "SUPERSEDES": "superseded"}

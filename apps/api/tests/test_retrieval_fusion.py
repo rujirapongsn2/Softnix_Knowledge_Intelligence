@@ -29,7 +29,10 @@ def test_cited_answer_preserves_engine_response_and_adds_platform_citations():
     )
     answer = compose_cited_answer(evidence)
     assert answer.startswith("DOL Smart Survey is supported")
-    assert answer.endswith("Sources: [S1]")
+    # The engine answer had no [S#]; a citation line plus the citation-detail
+    # block are appended so every claim stays traceable.
+    assert "แหล่งอ้างอิง: [S1]" in answer
+    assert answer.rstrip().endswith("[S1] doc-a")
 
 
 def test_cited_answer_does_not_duplicate_existing_platform_citations():
@@ -37,7 +40,12 @@ def test_cited_answer_does_not_duplicate_existing_platform_citations():
         [{**source("doc-a"), "citation_id": "S1"}], [], [], [],
         "The service runs on APP-01 [S1].",
     )
-    assert compose_cited_answer(evidence) == "The service runs on APP-01 [S1]."
+    answer = compose_cited_answer(evidence)
+    # The answer already cites [S1]; no second inline citation line is added,
+    # only the trailing citation-detail block.
+    assert answer.startswith("The service runs on APP-01 [S1].")
+    assert "แหล่งอ้างอิง: [S1]" not in answer
+    assert "รายละเอียดแหล่งอ้างอิง:" in answer
 
 
 def test_processing_retry_delay_is_bounded_exponential_backoff():

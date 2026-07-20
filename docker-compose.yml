@@ -42,7 +42,10 @@ services:
       DATABASE_URL: postgresql+psycopg://skip:skip@postgres:5432/skip
     depends_on: [postgres]
   web:
-    build: ./apps/web
+    build:
+      context: ./apps/web
+      args:
+        MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
     environment:
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
     depends_on: [api]

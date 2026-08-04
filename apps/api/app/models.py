@@ -357,6 +357,11 @@ class TokenKey(Timestamped, Base):
     token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     allowed_knowledge_base_ids: Mapped[list] = mapped_column(JSON, default=list)
     allowed_tools: Mapped[list] = mapped_column(JSON, default=list)
+    allowed_scopes: Mapped[list] = mapped_column(JSON, default=list)
+    # The Knowledge Base a documents:write token may ingest into. Kept separate
+    # from allowed_knowledge_base_ids (the MCP read axis) so one token's read
+    # scope and write scope never have to match.
+    allowed_ingest_knowledge_base_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     requests_per_minute: Mapped[int] = mapped_column(Integer, default=60)
     max_concurrent_requests: Mapped[int] = mapped_column(Integer, default=5)
     query_timeout_seconds: Mapped[int] = mapped_column(Integer, default=60)

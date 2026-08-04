@@ -6,7 +6,11 @@
 Authorization: Bearer skik_live_...
 ```
 
-สร้าง token จากหน้า **Access & MCP** หรือ `POST /api/v1/tokens` ระบบแสดง secret ครั้งเดียวและเก็บเฉพาะ HMAC-SHA-256 digest
+สร้าง token จากหน้า **MCP Tokens** หรือ `POST /api/v1/tokens` ระบบแสดง secret ครั้งเดียวและเก็บเฉพาะ HMAC-SHA-256 digest
+
+เครื่องมือ MCP ทั้งหมดเป็นแบบอ่านเท่านั้น และ token เรียกได้เฉพาะ tool ที่ระบุไว้ใน `allowed_tools`
+(รายการว่างหมายถึงไม่ได้สิทธิ์ tool ใดเลย) ถ้าต้องการให้ระบบภายนอก**นำเข้า**เอกสาร ให้ใช้
+[Ingestion API](INGEST_API.md) ซึ่งเป็น scope แยก (`documents:write`) และไม่ผ่าน `/mcp`
 
 ## เครื่องมือที่รองรับ
 
@@ -44,6 +48,6 @@ claude mcp add --transport http softnix-knowledge "https://your-softnix-host/mcp
 
 ## Agent Skill (SKILL.md)
 
-หน้า **Access & MCP** มีปุ่ม "Copy SKILL" ที่สร้างไฟล์ `SKILL.md` ตามมาตรฐานเปิด [agentskills.io](https://agentskills.io) — ใช้ได้กับ Claude Code และ agent tool อื่นที่รองรับมาตรฐานเดียวกัน (Cursor, Gemini CLI, VS Code, GitHub Copilot ฯลฯ) เนื้อหาของ Skill สั่งให้ agent ตอบคำถามจาก Knowledge Base ที่ token ผูกไว้เท่านั้น ห้ามใช้ web search, web fetch หรือ training data ของตัวเอง เพื่อป้องกันคำตอบที่ผสมแหล่งข้อมูลอื่นโดยผู้ใช้ไม่ทราบ
+หน้า **MCP Tokens** มีปุ่ม "Copy SKILL" ที่สร้างไฟล์ `SKILL.md` ตามมาตรฐานเปิด [agentskills.io](https://agentskills.io) — ใช้ได้กับ Claude Code และ agent tool อื่นที่รองรับมาตรฐานเดียวกัน (Cursor, Gemini CLI, VS Code, GitHub Copilot ฯลฯ) เนื้อหาของ Skill สั่งให้ agent ตอบคำถามจาก Knowledge Base ที่ token ผูกไว้เท่านั้น ห้ามใช้ web search, web fetch หรือ training data ของตัวเอง เพื่อป้องกันคำตอบที่ผสมแหล่งข้อมูลอื่นโดยผู้ใช้ไม่ทราบ
 
 บันทึกไฟล์ที่ได้ไว้ที่ `SKILL.md` ในโฟลเดอร์ชื่อ `softnix-knowledge` ภายใต้ skills directory ของ agent — สำหรับ Claude Code คือ `.claude/skills/softnix-knowledge/SKILL.md`

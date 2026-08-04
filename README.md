@@ -90,14 +90,23 @@ Executor รองรับ Exact, Vector, Full-text, Graph และ LightRAG; 
 
 ## เชื่อมต่อ Agent
 
-หน้า **Access & MCP** สร้าง MCP token แบบจำกัดสิทธิ์ (Knowledge Base + เครื่องมือ + rate limit) และปุ่ม "Copy SKILL" ที่สร้างไฟล์ `SKILL.md` ตามมาตรฐานเปิด [agentskills.io](https://agentskills.io) เพื่อสั่งให้ agent ตอบจาก Knowledge Base นี้เท่านั้น ไม่ผสมคำตอบจาก web search หรือ training data ของตัวเอง — ดูรายละเอียดที่ [MCP](docs/MCP.md)
+หน้า **MCP Tokens** สร้าง MCP token แบบจำกัดสิทธิ์ (Knowledge Base + เครื่องมือ + rate limit) และปุ่ม "Copy SKILL" ที่สร้างไฟล์ `SKILL.md` ตามมาตรฐานเปิด [agentskills.io](https://agentskills.io) เพื่อสั่งให้ agent ตอบจาก Knowledge Base นี้เท่านั้น ไม่ผสมคำตอบจาก web search หรือ training data ของตัวเอง — ดูรายละเอียดที่ [MCP](docs/MCP.md)
 
 หน้า **Logging → Trace Explorer** แสดง MCP tool call ทั้งที่สำเร็จและถูกปฏิเสธ/ล้มเหลว (rate limit, timeout, tool ไม่ได้รับอนุญาต) พร้อม retrieval plan และ channel trace ในที่เดียว
+
+## นำเข้าเอกสารจากระบบภายนอก
+
+MCP เป็นฝั่งอ่าน ถ้าต้องการให้ระบบภายนอก (DMS, ERP, สคริปต์ sync) **ส่งเอกสารเข้า** Knowledge Base
+ให้สร้าง token (scope `documents:write`) ในหน้า **Ingest API** แล้วเรียก
+`POST /api/v1/ingest/knowledge-bases/{kb_id}/documents` แบบ multipart (ทีละไฟล์หรือ batch ไม่เกิน 20 ไฟล์)
+จากนั้น poll สถานะจนได้ `completed` — ในหน้าเดียวกันมีปุ่มคัดลอกตัวอย่าง curl/Python/Node ที่ใส่ค่าจริงให้แล้ว
+ดูรายละเอียดทั้งหมดที่ [Ingestion API](docs/INGEST_API.md)
 
 ## ลิงก์สำคัญ
 
 - [Deployment](docs/DEPLOYMENT.md) — ตั้งค่า, migration, production และ reindex
 - [API](docs/API.md) — endpoint และรูปแบบ query/filter
+- [Ingestion API](docs/INGEST_API.md) — ให้ระบบภายนอกนำเข้าเอกสารด้วย API token พร้อมตัวอย่างโค้ด
 - [MCP](docs/MCP.md) — เชื่อม Claude Code หรือ agent ด้วย token, และสร้าง Agent Skill (SKILL.md)
 - [Architecture](docs/ARCHITECTURE.md) — บทบาทของแต่ละ service และแหล่งข้อมูลหลัก
 - [High-level Data Flow](docs/DATA_FLOW.md) — ลำดับการไหลของ upload/query/answer

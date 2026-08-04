@@ -28,6 +28,11 @@ docker compose -f docker-compose.yml -f docker-compose.production.yml up -d --bu
 
 ไฟล์ production จะเปิด `APP_ENV=production`, `COOKIE_SECURE=true`, ปิด query text log และตั้ง restart policy ให้บริการหลัก ห้ามเปิดพอร์ต PostgreSQL, Redis, Neo4j หรือ LightRAG สู่สาธารณะ
 
+**Swagger UI เปิดอยู่โดยค่าเริ่มต้น** — FastAPI ให้ `/docs` และ `/openapi.json` มาเสมอและระบบไม่ได้ปิดไว้
+ใช้เป็น schema reference ของ endpoint ทั้งหมดรวมถึง [Ingestion API](INGEST_API.md) ได้สะดวกตอนพัฒนา
+แต่บน production ควร block ทั้งสอง path ที่ reverse proxy เพราะเปิดเผยโครงสร้าง API ทั้งระบบให้คนนอก
+(ตัว endpoint ยังต้องยืนยันตัวตนตามปกติ การเปิด `/docs` ไม่ได้ให้สิทธิ์เข้าถึงข้อมูล)
+
 ## Migration และตรวจสอบ
 
 `migrate` จะรัน `alembic upgrade head` ก่อน API เริ่มทำงาน หากรันแยก:
@@ -53,3 +58,4 @@ docker compose ps
 - เปลี่ยน embedding model/dimension ต้อง reindex embeddings ทั้ง Knowledge Base อย่างควบคุม (ค่าเริ่มต้น dimension 1536)
 - เพิ่ม/แก้ `published_at` ได้ตอน upload หรือผ่าน `PATCH /api/v1/documents/{id}/metadata`; ไม่มีการ backfill อัตโนมัติ
 - หาก deploy API ใหม่แล้ว web ได้ `502` ให้ recreate web เพื่อให้ nginx resolve IP ของ API ใหม่: `docker compose up -d --force-recreate web`
+- migration `0023_token_ingest_scope` ถอน wildcard ของ `allowed_tools` (รายการว่างเคยหมายถึง "ทุก tool") โดยเขียนชื่อ tool ทั้ง 9 ตัวลงในแถวเดิมที่ค่าว่าง สิทธิ์ของ token เก่าจึงเท่าเดิมทุกใบ และ `allowed_scopes` เริ่มต้นเป็นรายการว่าง = ยังไม่มีใบใดเขียนได้ ต้องเปิด "Write access" ให้ใบใหม่เองเมื่อจะใช้ Ingestion API

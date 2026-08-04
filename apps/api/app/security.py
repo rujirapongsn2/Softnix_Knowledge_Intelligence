@@ -14,6 +14,8 @@ from .models import TokenKey, User
 
 password_hasher = PasswordHasher()
 
+INGEST_SCOPE = "documents:write"
+
 
 def password_hash(value: str) -> str:
     return password_hasher.hash(value)
@@ -98,7 +100,29 @@ def bearer_token(request: Request, db: Session = Depends(get_db)) -> TokenKey:
 
 
 def authorize(token: TokenKey, tool: str, kb_ids: list[str]) -> None:
-    if token.allowed_tools and tool not in token.allowed_tools:
+    # Membership is positive: an empty allowed_tools list grants nothing. It used
+    # to mean "every tool", which made any capability checked here reachable by
+    # every legacy credential. Migration 0023 wrote the explicit tool list onto
+    # those rows so their authority is unchanged.
+    if tool not in (token.allowed_tools or []):
         error("AUTH_TOOL_NOT_ALLOWED", "Tool is not allowed", status.HTTP_403_FORBIDDEN)
     if token.allowed_knowledge_base_ids and not set(kb_ids).issubset(set(token.allowed_knowledge_base_ids)):
         error("AUTH_KNOWLEDGE_BASE_NOT_ALLOWED", "Knowledge base is not allowed", status.HTTP_403_FORBIDDEN)
+
+
+def ingest_token(request: Request, db: Session = Depends(get_db)) -> TokenKey:
+    """Authenticate a machine caller that is allowed to write documents.
+
+    Ingestion never falls back to a wildcard on either axis: the scope must be
+    granted explicitly, and the token must name the one Knowledge Base it may
+    write to. This is a dedicated field, separate from allowed_knowledge_base_ids
+    (the MCP read axis), so a token's read scope and write scope never have to
+    match — create_token() already enforces this field is set whenever the scope
+    is granted; the check here is defense in depth.
+    """
+    token = bearer_token(request, db)
+    if INGEST_SCOPE not in (token.allowed_scopes or []):
+        error("AUTH_SCOPE_NOT_ALLOWED", "Token is not allowed to ingest documents", status.HTTP_403_FORBIDDEN)
+    if not token.allowed_ingest_knowledge_base_id:
+        error("AUTH_KNOWLEDGE_BASE_NOT_ALLOWED", "Token has no Knowledge Base scope for ingestion", status.HTTP_403_FORBIDDEN)
+    return token

@@ -232,7 +232,7 @@ def test_upload_rejects_unknown_document_type():
 
 def test_token_is_not_returned_after_creation():
     test_client = next(client())
-    token = test_client.post("/api/v1/tokens", json={"name": "agent"}).json()
+    token = test_client.post("/api/v1/tokens", json={"name": "agent", "allowed_tools": ["search_knowledge"]}).json()
     assert token["token"].startswith("skik_live_")
     listed = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()
     assert "tools" in listed["result"]
@@ -347,7 +347,7 @@ def test_auto_retrieval_fixture_exercises_scopes_exact_dates_and_rerank_policy(m
 
 def test_revoked_token_cannot_call_mcp():
     test_client = next(client())
-    token = test_client.post("/api/v1/tokens", json={"name": "agent"}).json()
+    token = test_client.post("/api/v1/tokens", json={"name": "agent", "allowed_tools": ["search_knowledge"]}).json()
     assert test_client.post(f"/api/v1/tokens/{token['id']}/revoke").status_code == 200
     response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert response.status_code == 200
@@ -832,7 +832,9 @@ def test_document_restore_graph_layout_and_feedback_lifecycle():
 
 def test_mcp_rate_limit_returns_jsonrpc_error():
     test_client = next(client())
-    token = test_client.post("/api/v1/tokens", json={"name": "limited", "requests_per_minute": 1}).json()
+    token = test_client.post("/api/v1/tokens", json={
+        "name": "limited", "requests_per_minute": 1, "allowed_tools": ["search_knowledge"],
+    }).json()
     request = {"jsonrpc": "2.0", "id": 7, "method": "tools/list"}
     assert test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json=request).json()["result"]["tools"]
     response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json=request)

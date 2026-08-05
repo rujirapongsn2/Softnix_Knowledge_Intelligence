@@ -29,7 +29,7 @@ from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
 from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
-from .security import authorize, bearer_token, create_session_token, create_token_secret, current_admin, password_hash, refresh_admin, token_digest, verify_password
+from .security import INGEST_SCOPE, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, password_hash, refresh_admin, token_digest, verify_password
 from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
@@ -49,7 +49,8 @@ def record_request_transaction(request: Request, request_id: str, status_code: i
     path = request.url.path
     if path in REQUEST_LOG_EXCLUDED_PATHS or (not path.startswith("/api/") and path != "/mcp"):
         return
-    auth_type = "mcp_token" if request.headers.get("authorization", "").lower().startswith("bearer ") else (
+    bearer = request.headers.get("authorization", "").lower().startswith("bearer ")
+    auth_type = ("ingest_token" if path.startswith("/api/v1/ingest") else "mcp_token") if bearer else (
         "admin_session" if "skip_access" in request.cookies else "anonymous"
     )
     db = SessionLocal()
@@ -848,7 +849,11 @@ def get_legal_map(kb_id: str, view: str = "verified", instrument_id: str | None 
             "kind": item.kind,
             "document_class": item.document_class,
             "status": item.status,
+            "status_reason": item.status_reason,
             "review_status": item.review_status,
+            "authority_level": item.authority_level,
+            "source_uri": item.source_uri,
+            "source_reference": item.source_reference,
             "family_id": item.family_id,
             "version_label": item.version_label,
             "version_date": item.version_date.isoformat() if item.version_date else None,
@@ -1279,6 +1284,29 @@ def query_impact(payload: ImpactRequest, _: User = Depends(current_admin), db: S
 
 @app.post("/api/v1/tokens", response_model=TokenCreated)
 def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    # An unknown name would silently grant nothing now that authorize() requires
+    # positive membership, so a typo is rejected at issue time instead.
+    if set(payload.allowed_tools) - {tool["name"] for tool in MCP_TOOLS}:
+        raise HTTPException(400, {"code": "TOKEN_TOOL_UNKNOWN", "message": "Token includes a tool that does not exist.", "retryable": False})
+    if set(payload.allowed_scopes) - {INGEST_SCOPE}:
+        raise HTTPException(400, {"code": "TOKEN_SCOPE_UNKNOWN", "message": "Token includes a scope that does not exist.", "retryable": False})
+    # MCP tools and Ingest write access are managed on separate menus and must
+    # never share a credential: a token that could both read via MCP and write
+    # via Ingest would defeat the point of splitting them for easier management.
+    # Checked before the Knowledge Base validity checks below so a conflicting
+    # request is rejected for the real reason instead of a misleading
+    # KNOWLEDGE_BASE_INACTIVE/allowed_knowledge_base_ids complaint.
+    if payload.allowed_tools and INGEST_SCOPE in payload.allowed_scopes:
+        raise HTTPException(400, {"code": "TOKEN_CAPABILITY_CONFLICT", "message": "A token may be scoped to MCP tools or to Ingest write access, not both.", "retryable": False})
+    # allowed_knowledge_base_ids is the MCP read scope; a token with Ingest
+    # write access carries no allowed_tools (enforced above), so that list
+    # would never be consulted by authorize() and would only mislead an admin
+    # reviewing the token's scope later. Drop it before the active-Knowledge-Base
+    # check below so an ingest-only token is never rejected with a misleading
+    # "MCP tokens can only be scoped to active Knowledge Bases" error because of
+    # a read-scope list that is about to be discarded anyway.
+    if INGEST_SCOPE in payload.allowed_scopes:
+        payload.allowed_knowledge_base_ids = []
     # A token may only be granted a scope that is usable at the time it is issued.
     # Runtime authorization repeats this check so disabling a Knowledge Base also
     # takes effect for tokens that were created earlier.
@@ -1298,9 +1326,33 @@ def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: 
                 "message": "MCP tokens can only be scoped to active Knowledge Bases.",
                 "retryable": False,
             })
+    # The ingest Knowledge Base is a separate axis from allowed_knowledge_base_ids
+    # (the MCP read scope) and is required exactly when documents:write is
+    # requested, so a write-scoped token can never be issued without knowing
+    # where it may write, and a read-only token can never carry a dangling one.
+    if INGEST_SCOPE in payload.allowed_scopes:
+        if not payload.allowed_ingest_knowledge_base_id:
+            raise HTTPException(400, {"code": "INGEST_KNOWLEDGE_BASE_REQUIRED", "message": "Write access requires exactly one Knowledge Base to ingest into.", "retryable": False})
+        ingest_kb = db.query(KnowledgeBase).filter(
+            KnowledgeBase.id == payload.allowed_ingest_knowledge_base_id,
+            KnowledgeBase.status == "active", KnowledgeBase.deleted_at.is_(None),
+        ).first()
+        if not ingest_kb:
+            raise HTTPException(400, {"code": "KNOWLEDGE_BASE_INACTIVE", "message": "The ingest Knowledge Base must be an active Knowledge Base.", "retryable": False})
+    elif payload.allowed_ingest_knowledge_base_id:
+        raise HTTPException(400, {"code": "INGEST_KNOWLEDGE_BASE_NOT_ALLOWED", "message": "An ingest Knowledge Base requires Write access.", "retryable": False})
+    # An empty allowed_tools list used to mean "every tool" (wildcard), so an
+    # issuer who left it blank still got a working MCP token. authorize() now
+    # requires positive membership, so the same omission would silently mint a
+    # credential that can do nothing. Reject it at issue time instead, once the
+    # more specific ingest-scope checks above have had a chance to explain a
+    # dangling allowed_ingest_knowledge_base_id first.
+    if not payload.allowed_tools and INGEST_SCOPE not in payload.allowed_scopes:
+        raise HTTPException(400, {"code": "TOKEN_NO_CAPABILITY", "message": "Token must be granted at least one MCP tool or Ingest write access.", "retryable": False})
     secret = create_token_secret()
     token = TokenKey(name=payload.name, description=payload.description, token_prefix=secret[:16], token_hash=token_digest(secret),
                      allowed_knowledge_base_ids=payload.allowed_knowledge_base_ids, allowed_tools=payload.allowed_tools,
+                     allowed_scopes=payload.allowed_scopes, allowed_ingest_knowledge_base_id=payload.allowed_ingest_knowledge_base_id,
                      expires_at=payload.expires_at, requests_per_minute=payload.requests_per_minute,
                      max_concurrent_requests=payload.max_concurrent_requests, query_timeout_seconds=payload.query_timeout_seconds)
     db.add(token); db.flush(); record_audit(db, "token.create", user.id, "token", token.id, {"name": token.name}); db.commit(); db.refresh(token)
@@ -1360,6 +1412,13 @@ def rotate_token(token_id: str, user: User = Depends(current_admin), db: Session
         raise HTTPException(404, "Token not found")
     if previous.status == "revoked":
         raise HTTPException(409, {"code": "TOKEN_ALREADY_REVOKED", "message": "A revoked token cannot be rotated.", "retryable": False})
+    # Defense-in-depth: create_token() already enforces that MCP tools and Ingest
+    # write access never share a credential, but there is no DB-level constraint
+    # backing that invariant. Re-check here so rotating a row that somehow ended
+    # up mixed (e.g. a manual DB edit) doesn't silently mint a replacement with
+    # the same conflict instead of surfacing it.
+    if previous.allowed_tools and INGEST_SCOPE in (previous.allowed_scopes or []):
+        raise HTTPException(400, {"code": "TOKEN_CAPABILITY_CONFLICT", "message": "A token may be scoped to MCP tools or to Ingest write access, not both.", "retryable": False})
     requested_kb_ids = set(previous.allowed_knowledge_base_ids or [])
     if requested_kb_ids:
         active_kb_ids = {
@@ -1373,10 +1432,22 @@ def rotate_token(token_id: str, user: User = Depends(current_admin), db: Session
                 "message": "The token includes a Knowledge Base that is no longer active; activate it or create a new scope before rotating.",
                 "retryable": False,
             })
+    if previous.allowed_ingest_knowledge_base_id:
+        ingest_kb = db.query(KnowledgeBase).filter(
+            KnowledgeBase.id == previous.allowed_ingest_knowledge_base_id,
+            KnowledgeBase.status == "active", KnowledgeBase.deleted_at.is_(None),
+        ).first()
+        if not ingest_kb:
+            raise HTTPException(status_code=400, detail={
+                "code": "KNOWLEDGE_BASE_INACTIVE",
+                "message": "The token's ingest Knowledge Base is no longer active; activate it or create a new scope before rotating.",
+                "retryable": False,
+            })
     secret = create_token_secret()
     replacement = TokenKey(
         name=previous.name, description=previous.description, token_prefix=secret[:16], token_hash=token_digest(secret),
         allowed_knowledge_base_ids=list(previous.allowed_knowledge_base_ids or []), allowed_tools=list(previous.allowed_tools or []),
+        allowed_scopes=list(previous.allowed_scopes or []), allowed_ingest_knowledge_base_id=previous.allowed_ingest_knowledge_base_id,
         expires_at=previous.expires_at, requests_per_minute=previous.requests_per_minute,
         max_concurrent_requests=previous.max_concurrent_requests, query_timeout_seconds=previous.query_timeout_seconds,
         # Preserve a disabled credential's safety posture. Rotating a key must
@@ -1744,7 +1815,7 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
         deadline_token = set_deadline(token.query_timeout_seconds)
         method, params = body.get("method"), body.get("params", {})
         if method == "initialize": result = {"protocolVersion": "2025-03-26", "serverInfo": {"name": "softnix-knowledge", "version": "0.1.0"}, "capabilities": {"tools": {}}}
-        elif method == "tools/list": result = {"tools": [tool for tool in MCP_TOOLS if not token.allowed_tools or tool["name"] in token.allowed_tools]}
+        elif method == "tools/list": result = {"tools": [tool for tool in MCP_TOOLS if tool["name"] in (token.allowed_tools or [])]}
         elif method == "tools/call":
             name = params.get("name"); arguments = params.get("arguments", {}); tool_name, tool_arguments = name, arguments
             authorize(token, name, list(token.allowed_knowledge_base_ids or []))
@@ -1883,3 +1954,200 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
     finally:
         if deadline_token is not None: reset_deadline(deadline_token)
         if acquired and token is not None: mcp_limiter.release(token)
+
+
+INGEST_MAX_BATCH_FILES = 20
+
+
+def ingest_budget(token: TokenKey = Depends(ingest_token)):
+    """Charge an ingest call against the token's shared rate and concurrency budget.
+
+    The slot is released in a finally block because FastAPI runs post-yield
+    cleanup even when the handler raises, so a rejected upload cannot leak a
+    concurrency slot for the rest of the token's timeout window.
+    """
+    try:
+        mcp_limiter.acquire(token)
+    except McpLimitExceeded as exc:
+        raise HTTPException(503 if exc.code == "MCP_LIMIT_STORE_UNAVAILABLE" else 429,
+                            {"code": exc.code, "message": exc.message, "retryable": True})
+    try:
+        yield token
+    finally:
+        mcp_limiter.release(token)
+
+
+def ingest_knowledge_base(db: Session, token: TokenKey, kb_id: str) -> KnowledgeBase:
+    kb = db.get(KnowledgeBase, kb_id)
+    # Out of scope answers 404 rather than 403 so a token cannot enumerate the
+    # Knowledge Bases it was never granted. Ingest scope is a single Knowledge
+    # Base, distinct from the MCP read list.
+    if not kb or kb.deleted_at or kb_id != token.allowed_ingest_knowledge_base_id:
+        raise HTTPException(404, {"code": "KNOWLEDGE_BASE_NOT_FOUND", "message": "Knowledge base not found", "retryable": False})
+    if kb.status != "active":
+        raise HTTPException(409, {"code": "KNOWLEDGE_BASE_DISABLED", "message": "Activate this Knowledge Base before uploading documents.", "retryable": False})
+    return kb
+
+
+def ingest_knowledge_base_view(kb: KnowledgeBase) -> dict:
+    return {"id": kb.id, "code": kb.code, "name": kb.name, "status": kb.status}
+
+
+def ingest_document_row(db: Session, token: TokenKey, document_id: str) -> Document:
+    doc = db.get(Document, document_id)
+    if not doc or doc.deleted_at or doc.knowledge_base_id != token.allowed_ingest_knowledge_base_id:
+        raise HTTPException(404, {"code": "DOCUMENT_NOT_FOUND", "message": "Document not found", "retryable": False})
+    return doc
+
+
+def ingest_job_view(job: ProcessingJob) -> dict:
+    return {"id": job.id, "type": job.job_type, "status": job.status, "stage": job.current_stage,
+            "progress_percent": job.progress_percent, "attempt_count": job.attempt_count,
+            "error_code": job.error_code, "error_message": job.error_message}
+
+
+def ingest_document_view(db: Session, doc: Document) -> dict:
+    job = db.query(ProcessingJob).filter_by(document_id=doc.id).order_by(ProcessingJob.created_at.desc()).first()
+    return {"document_id": doc.id, "knowledge_base_id": doc.knowledge_base_id, "title": doc.title,
+            "filename": doc.original_filename, "status": doc.status, "document_type": doc.document_type,
+            "error_code": doc.error_code, "created_at": doc.created_at,
+            "latest_job": ingest_job_view(job) if job else None}
+
+
+def ingest_upload_error(exc: ValueError) -> HTTPException:
+    code = str(exc)
+    # A duplicate is a conflict rather than a bad request so a retrying client can
+    # tell "already sent this" apart from "sent something invalid".
+    status_code = 413 if code == "FILE_TOO_LARGE" else 409 if code == "FILE_DUPLICATE" else 400
+    return HTTPException(status_code, {"code": code, "message": "Upload rejected", "retryable": False})
+
+
+def record_ingest_audit(db: Session, token: TokenKey, doc: Document, kb_id: str, *, batch: bool = False) -> None:
+    # Shares the UI action name so Logging groups both origins, with attribution
+    # in metadata because a token call has no User row.
+    record_audit(db, "document.upload", None, "document", doc.id, {
+        "knowledge_base_id": kb_id, "filename": doc.original_filename, "document_type": doc.document_type,
+        "transport": "ingest_api", "token_id": token.id, "token_name": token.name, "batch": batch,
+    })
+
+
+def record_ingest_rejection(db: Session, token: TokenKey, kb_id: str, filename: str | None, error_code: str) -> None:
+    record_audit(db, "document.ingest.rejected", None, "token", token.id, {
+        "knowledge_base_id": kb_id, "filename": filename, "error_code": error_code, "token_name": token.name,
+    })
+    db.commit()
+
+
+@app.get("/api/v1/ingest/knowledge-bases")
+def ingest_list_knowledge_bases(token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    """Report the (single) Knowledge Base this token may write to.
+
+    An ingest token is scoped to exactly one Knowledge Base, so this always
+    returns 0 or 1 items - never a directory of every tenant's KBs. A KB is
+    still reported here even if disabled (status != "active") so a client can
+    tell "nothing configured" apart from "configured but paused"; uploads to
+    a disabled KB still fail with KNOWLEDGE_BASE_DISABLED.
+    """
+    kb = db.get(KnowledgeBase, token.allowed_ingest_knowledge_base_id)
+    items = [ingest_knowledge_base_view(kb)] if kb and not kb.deleted_at else []
+    return {"items": items}
+
+
+@app.post("/api/v1/ingest/knowledge-bases/{kb_id}/documents", status_code=202)
+def ingest_upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None),
+                           document_type: str = Form("general"), template_id: str | None = Form(None),
+                           metadata_json: str | None = Form(None), published_at: date | None = Form(None),
+                           token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    ingest_knowledge_base(db, token, kb_id)
+    try:
+        template, profile, metadata = _upload_metadata(template_id, document_type, metadata_json, db, kb_id)
+        doc, job = create_document_job(db, kb_id, file, title, profile, published_at, template, metadata)
+    except ValueError as exc:
+        record_ingest_rejection(db, token, kb_id, file.filename, str(exc))
+        raise ingest_upload_error(exc)
+    # create_document_job() already committed the document; the audit row is
+    # best-effort observability and must never turn an already-queued upload
+    # into a lost document_id if this second commit fails.
+    try:
+        record_ingest_audit(db, token, doc, kb_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+    return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type,
+            "template_id": doc.metadata_template_id}
+
+
+@app.post("/api/v1/ingest/knowledge-bases/{kb_id}/documents/batch", status_code=202)
+def ingest_upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), document_type: str = Form("general"),
+                                  template_id: str | None = Form(None), metadata_json: str | None = Form(None),
+                                  token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    """Queue a bounded batch where a per-file failure never discards the rest."""
+    ingest_knowledge_base(db, token, kb_id)
+    if not files:
+        raise HTTPException(400, {"code": "BATCH_FILES_REQUIRED", "message": "Send at least one file.", "retryable": False})
+    if len(files) > INGEST_MAX_BATCH_FILES:
+        raise HTTPException(400, {"code": "BATCH_TOO_MANY_FILES", "message": f"A batch can contain at most {INGEST_MAX_BATCH_FILES} files.", "retryable": False})
+    try:
+        template, profile, metadata = _upload_metadata(template_id, document_type, metadata_json, db, kb_id)
+    except ValueError as exc:
+        record_ingest_rejection(db, token, kb_id, None, str(exc))
+        raise HTTPException(400, {"code": str(exc), "message": "Document metadata is invalid.", "retryable": False})
+
+    results = []
+    for upload in files:
+        filename = upload.filename or "unnamed-file"
+        result = {"filename": filename, "status": "failed", "document_type": profile, "template_id": template.get("id")}
+        try:
+            doc, job = create_document_job(db, kb_id, upload, None, profile, None, template, metadata)
+        except ValueError as exc:
+            record_ingest_rejection(db, token, kb_id, filename, str(exc))
+            result.update({"error_code": str(exc), "message": "Upload rejected"})
+            results.append(result)
+            continue
+        except Exception:
+            db.rollback()
+            record_ingest_rejection(db, token, kb_id, filename, "UPLOAD_FAILED")
+            result.update({"error_code": "UPLOAD_FAILED", "message": "Upload could not be queued"})
+            results.append(result)
+            continue
+        # The document is already committed by create_document_job(); a failure
+        # writing the (best-effort) audit row must not demote this file back to
+        # failed and strand a queued document with no id in the response.
+        result.update({"status": "queued", "document_id": doc.id, "job_id": job.id})
+        try:
+            record_ingest_audit(db, token, doc, kb_id, batch=True)
+            db.commit()
+        except Exception:
+            db.rollback()
+        results.append(result)
+
+    queued_count = sum(item["status"] == "queued" for item in results)
+    return {"status": "queued" if queued_count == len(results) else "partial", "document_type": profile,
+            "template_id": template.get("id"), "total": len(results), "queued_count": queued_count,
+            "failed_count": len(results) - queued_count, "results": results}
+
+
+@app.get("/api/v1/ingest/knowledge-bases/{kb_id}/documents")
+def ingest_list_documents(kb_id: str, status: str | None = None, limit: int = 50, offset: int = 0,
+                          token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    ingest_knowledge_base(db, token, kb_id)
+    if limit < 1 or limit > 100 or offset < 0:
+        raise HTTPException(400, {"code": "DOCUMENT_PAGE_INVALID", "message": "limit must be 1-100 and offset must be non-negative.", "retryable": False})
+    rows = db.query(Document).filter(Document.knowledge_base_id == kb_id, Document.deleted_at.is_(None))
+    if status:
+        rows = rows.filter(Document.status == status)
+    total = rows.count()
+    documents = rows.order_by(Document.created_at.desc()).offset(offset).limit(limit).all()
+    return {"items": [ingest_document_view(db, doc) for doc in documents], "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/v1/ingest/documents/{document_id}")
+def ingest_document_status(document_id: str, token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    return ingest_document_view(db, ingest_document_row(db, token, document_id))
+
+
+@app.get("/api/v1/ingest/documents/{document_id}/jobs")
+def ingest_document_jobs(document_id: str, token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    doc = ingest_document_row(db, token, document_id)
+    rows = db.query(ProcessingJob).filter_by(document_id=doc.id).order_by(ProcessingJob.created_at.desc()).all()
+    return [ingest_job_view(job) for job in rows]

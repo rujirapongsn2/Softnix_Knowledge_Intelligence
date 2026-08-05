@@ -1,6 +1,7 @@
 # REST API
 
 Base path คือ `/api/v1` และ endpoint ของผู้ดูแลใช้ secure HTTP-only session cookie
+ยกเว้น `/api/v1/ingest/...` ที่ใช้ Bearer token สำหรับระบบภายนอก ดู [INGEST_API.md](INGEST_API.md)
 
 ## Login และระบบ
 
@@ -19,6 +20,18 @@ Base path คือ `/api/v1` และ endpoint ของผู้ดูแล�
 - `GET /knowledge-bases/{id}/documents` (legacy list), `GET /knowledge-bases/{id}/documents/page` (bounded UI page with `limit`, `offset`, `search`, `status`, `document_type`, plus global processing/completed/legal flags), `POST /knowledge-bases/{id}/documents/reindex`
 - `GET /documents/{id}/text|jobs`, `POST /documents/{id}/reprocess`, `DELETE /documents/{id}`, `POST /documents/{id}/restore`
 - `PATCH /documents/{id}/metadata` รองรับ `published_at: YYYY-MM-DD` และแก้ค่าฟิลด์ metadata ตาม snapshot ของเอกสาร
+
+## Ingestion API (token)
+
+Surface แยกสำหรับระบบภายนอกที่ยืนยันตัวตนด้วย Bearer token ที่มี scope `documents:write` และระบุ
+Knowledge Base ไว้ชัดเจน ไม่ใช่ session cookie — รายละเอียด error contract, การ poll สถานะ และตัวอย่าง
+curl/Python/Node อยู่ใน [INGEST_API.md](INGEST_API.md)
+
+- `POST /ingest/knowledge-bases/{id}/documents` และ `/documents/batch` (≤20 ไฟล์) — ตอบ `202` เพราะงานเข้าคิว batch รายงานผลรายไฟล์ใน `results[]`
+- `GET /ingest/knowledge-bases/{id}/documents` — `status`, `limit` 1-100, `offset`
+- `GET /ingest/documents/{id}` และ `GET /ingest/documents/{id}/jobs`
+
+Knowledge Base และเอกสารที่อยู่นอกสิทธิ์ของ token ตอบ `404` เหมือนไม่มีอยู่จริง เพื่อไม่ให้ไล่เดาทรัพยากรของคนอื่น
 
 ## Query และ graph
 

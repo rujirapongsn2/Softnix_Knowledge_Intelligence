@@ -252,6 +252,8 @@ class TokenCreate(BaseModel):
     description: str | None = None
     allowed_knowledge_base_ids: list[str] = Field(default_factory=list, max_length=100)
     allowed_tools: list[str] = Field(default_factory=list, max_length=10)
+    allowed_scopes: list[str] = Field(default_factory=list, max_length=5)
+    allowed_ingest_knowledge_base_id: str | None = None
     expires_at: datetime | None = None
     requests_per_minute: int = Field(default=60, ge=1, le=10000)
     max_concurrent_requests: int = Field(default=5, ge=1, le=100)
@@ -264,6 +266,8 @@ class TokenOut(ORMModel):
     token_prefix: str
     allowed_knowledge_base_ids: list[str]
     allowed_tools: list[str]
+    allowed_scopes: list[str]
+    allowed_ingest_knowledge_base_id: str | None
     status: str
     expires_at: datetime | None
     requests_per_minute: int

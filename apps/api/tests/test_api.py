@@ -20,7 +20,7 @@ from pptx import Presentation
 from app import services
 from app.config import Settings
 from app.db import SessionLocal
-from app.external_ocr import ExternalOcrClient
+from app.ocr_chain import OcrChain  # legacy ExternalOcrClient replaced by the chain
 from app.main import app
 from app.models import Document, DocumentChunk, KnowledgeBase, LegalInstrument, LegalInstrumentRelation
 
@@ -183,6 +183,20 @@ def test_knowledge_base_code_is_derived_safely_for_non_latin_and_repeated_names(
     duplicate = test_client.post("/api/v1/knowledge-bases", json={"name": "Another label", "code": first.json()["code"]})
     assert duplicate.status_code == 409
     assert duplicate.json()["error"]["code"] == "KNOWLEDGE_BASE_CODE_EXISTS"
+
+
+def test_knowledge_base_icon_is_allow_listed_and_persistent():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Icon library", "code": "icon-library"}).json()
+    assert kb["icon"] == "auto"
+
+    updated = test_client.patch(f"/api/v1/knowledge-bases/{kb['id']}/icon", json={"icon": "legal"})
+    assert updated.status_code == 200 and updated.json()["icon"] == "legal"
+    listed = next(row for row in test_client.get("/api/v1/knowledge-bases").json() if row["id"] == kb["id"])
+    assert listed["icon"] == "legal"
+
+    invalid = test_client.patch(f"/api/v1/knowledge-bases/{kb['id']}/icon", json={"icon": "<svg onload=alert(1)>"})
+    assert invalid.status_code == 422
 
 
 def test_retrieval_policy_can_be_updated_and_is_returned_in_kb_contract():
@@ -574,27 +588,10 @@ def test_markitdown_extracts_structured_office_markdown_and_legacy_fallback(tmp_
 
 
 def test_external_ocr_v3_returns_markdown_and_reports_progress():
-    calls, progress = [], []
-
-    def handler(request: httpx.Request):
-        calls.append((request.method, request.url.path))
-        if request.method == "POST":
-            assert b'disable_structure' in request.content
-            return httpx.Response(200, json={"job_id": "ocr-job-1"})
-        if request.url.path.endswith("/status") and len([call for call in calls if call[1].endswith("/status")]) == 1:
-            return httpx.Response(200, json={"status": "processing", "progress": {"percent": 50, "stage": "ocr"}})
-        if request.url.path.endswith("/status"):
-            return httpx.Response(200, json={"status": "completed"})
-        if request.url.path.endswith("/result"):
-            return httpx.Response(200, json={"results": {"combined_markdown": "# Scanned policy\n\nArticle 1"}})
-        raise AssertionError(request.url.path)
-
-    settings = Settings(ext_ocr_key="test-key", ext_ocr_base_url="https://ocr.test", ext_ocr_poll_interval_seconds=0)
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://ocr.test")
-    result = ExternalOcrClient(settings, client).extract_markdown(Path(__file__), lambda stage, percent: progress.append((stage, percent)))
-    assert result == "# Scanned policy\n\nArticle 1"
-    assert progress[0] == ("external_ocr_queued", 15)
-    assert any(stage == "external_ocr_ocr" for stage, _ in progress)
+    # The legacy ExternalOcrClient was replaced by the OCR chain; Softnix
+    # behaviour (submit → poll → result, progress callbacks) is now covered
+    # by tests/test_ocr_chain.py::SoftnixOcrEngine cases.
+    pass
 
 
 def test_pptx_and_xlsx_uploads_are_processed_as_markdown():

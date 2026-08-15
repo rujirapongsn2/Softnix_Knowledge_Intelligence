@@ -125,8 +125,12 @@ class SoftnixOcrEngine:
             status_response = self.client.get(f"/v3/ai-process-file/{job_id}/status")
             status_response.raise_for_status()
             payload = status_response.json()
+            if not isinstance(payload, dict):
+                raise ValueError(f"unexpected status payload: {type(payload).__name__}")
             state = payload.get("status")
-            progress = payload.get("progress") or {}
+            progress = payload.get("progress")
+            if not isinstance(progress, dict):
+                progress = {}
             if state in {"completed", "partial_success"}:
                 return self._result(job_id)
             if state in {"failed", "cancelled"}:
@@ -206,20 +210,25 @@ class TesseractOcrEngine:
         return binary
 
     def recognize(self, image: bytes, page: int) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
-            handle.write(image)
-            path = Path(handle.name)
         try:
-            result = subprocess.run(  # noqa: S603 - fixed binary, fixed args
-                [self._binary(), str(path), "stdout", "-l", "tha+eng", "--oem", "1"],
-                capture_output=True,
-                text=True,
-                timeout=self.settings.tesseract_timeout_seconds,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+                handle.write(image)
+                path = Path(handle.name)
+            try:
+                result = subprocess.run(  # noqa: S603 - fixed binary, fixed args
+                    [self._binary(), str(path), "stdout", "-l", "tha+eng", "--oem", "1"],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=self.settings.tesseract_timeout_seconds,
+                )
+            finally:
+                path.unlink(missing_ok=True)
+        except (subprocess.TimeoutExpired, OSError, UnicodeDecodeError) as exc:
+            # TimeoutExpired: page budget blown; OSError: spawn/disk/temp-file
+            # failures (FileNotFoundError is a subclass); UnicodeDecodeError:
+            # non-UTF8 bytes on stdout despite errors="replace" guards.
             raise OcrChainError([f"tesseract: {type(exc).__name__}"]) from exc
-        finally:
-            path.unlink(missing_ok=True)
         if result.returncode != 0:
             raise OcrChainError([f"tesseract: exit {result.returncode}"])
         return result.stdout
@@ -309,15 +318,24 @@ class OcrChain:
         self.close()
 
     def engine_names(self) -> list[str]:
-        """Configured engines that are actually usable right now."""
-        names: list[str] = []
+        """Configured engines that are actually usable right now.
+
+        Pure configuration check — never constructs engines or httpx
+        clients, so probing readiness cannot leak resources.
+        """
+        usable = []
         for name in self.engine_order:
-            engine = self._build_engine(name)
-            if engine is None:
-                logger.info("OCR engine '%s' not configured; skipping", name)
+            if name == "softnix":
+                ok = bool(self.settings.softnix_ocr_base_url and self.settings.softnix_ocr_token)
+            elif name == "mistral":
+                ok = bool(self.settings.mistral_api_key)
             else:
-                names.append(name)
-        return names
+                ok = True  # tesseract: availability checked at use time
+            if ok:
+                usable.append(name)
+            else:
+                logger.info("OCR engine '%s' not configured; skipping", name)
+        return usable
 
     def recognize(self, image: bytes, page: int) -> str:
         attempts: list[str] = []

@@ -258,3 +258,47 @@ def test_mistral_payload_is_base64_data_uri():
     prefix, _, payload = seen["image_url"].partition(",")
     assert prefix == "data:image/png;base64"
     assert base64.b64decode(payload) == b"PNGDATA"
+
+
+def test_engine_internal_errors_stay_inside_the_chain_contract(monkeypatch):
+    """Non-OcrChainError engine failures must surface as OcrChainError from
+    chain.recognize — the anydoc callback contract allows nothing else."""
+    from app.ocr_chain import SoftnixOcrEngine, TesseractOcrEngine, OcrChainError
+
+    # Softnix: non-dict 'progress' payload must not raise AttributeError.
+    def weird(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/v3/ai-process-file"):
+            return httpx.Response(200, json={"job_id": "job-x"})
+        if request.url.path.endswith("/job-x/status"):
+            return httpx.Response(200, json={"status": "processing", "progress": 42})
+        raise AssertionError(request.url.path)
+
+    engine = SoftnixOcrEngine(
+        _settings(),
+        httpx.Client(base_url="https://softnix.test", transport=httpx.MockTransport(weird)),
+    )
+    try:
+        engine.recognize(b"png", 1)
+        raised = None
+    except Exception as exc:  # noqa: BLE001 - contract test
+        raised = exc
+    assert isinstance(raised, OcrChainError), f"expected OcrChainError, got {type(raised).__name__}"
+
+    # Tesseract: binary present but subprocess dies with OSError-ish failure
+    # (simulate via a broken PATH lookup raising inside _binary).
+    tess = TesseractOcrEngine(_settings(tesseract_timeout_seconds=2))
+    monkeypatch.setattr(tess, "_binary", lambda: (_ for _ in ()).throw(OSError("spawn failed")))
+    try:
+        tess.recognize(b"png", 1)
+        raised = None
+    except Exception as exc:  # noqa: BLE001 - contract test
+        raised = exc
+    assert isinstance(raised, OcrChainError), f"expected OcrChainError, got {type(raised).__name__}"
+
+
+def test_engine_names_is_a_pure_config_check():
+    """Probing usable engines must not construct httpx clients."""
+    settings = _settings(mistral_api_key="")
+    chain = OcrChain(settings, clients={})
+    assert chain.engine_names() == ["softnix", "tesseract"]
+    assert chain.clients == {} and not chain._engines  # nothing was built

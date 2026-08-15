@@ -9,3 +9,42 @@
 .graph-canvas-dense .graph-node-type,.graph-canvas-dense .graph-node-review{display:none}
 .graph-canvas-dense .react-flow__edge-text{font-size:10px}
 .react-flow__edge-text{pointer-events:none}
+
+/* Graph explorer: semantic icons, focused paths, and compact discovery controls. */
+.graph-toolbar { align-items: flex-start; }
+.graph-summary { display: flex; flex: 0 0 auto; gap: .35rem; padding-top: 2px; }
+.graph-toolbar-controls { display: flex; min-width: 0; flex: 1; justify-content: flex-end; align-items: end; gap: .5rem; flex-wrap: wrap; }
+.graph-toolbar-controls .snx-field { min-width: 118px; }
+.graph-toolbar-controls .relationship-picker { display: grid; gap: 4px; color: var(--text-color-kumo-subtle); font-size: 11px; }
+.graph-toolbar-controls .relationship-picker input { width: 148px; min-height: 32px; border-color: var(--color-kumo-line); background: var(--color-kumo-control); }
+.graph-layout-switch { display: inline-flex; align-items: center; gap: 2px; border: 1px solid var(--color-kumo-line); border-radius: 7px; padding: 2px; background: var(--color-kumo-elevated); }
+.graph-layout-switch .snx-button { min-height: 26px; padding: 0 7px; color: var(--text-color-kumo-subtle); }
+.graph-layout-switch .snx-button.selected { color: #fff; background: var(--color-kumo-brand); }
+.graph-explorer-legend { display: flex; align-items: center; gap: 6px; min-height: 40px; overflow-x: auto; padding: 7px 14px; border-bottom: 1px solid var(--color-kumo-line); background: var(--color-kumo-elevated); scrollbar-width: thin; }
+.graph-explorer-legend-title { flex: 0 0 auto; margin-right: 2px; color: var(--text-color-kumo-subtle); font-size: 11px; font-weight: 750; }
+.graph-explorer-legend button { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; min-height: 25px; border: 1px solid transparent; border-radius: 999px; padding: 3px 7px 3px 4px; color: var(--text-color-kumo-subtle); background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
+.graph-explorer-legend button:hover, .graph-explorer-legend button:focus-visible, .graph-explorer-legend button.selected { border-color: var(--color-kumo-brand); color: var(--text-color-kumo-default); background: #2786C20d; }
+.graph-explorer-legend i { display: grid; width: 19px; height: 19px; place-items: center; border-radius: 50%; color: var(--graph-node-color); background: var(--graph-node-tint); font-style: normal; }
+.graph-explorer-result-count { flex: 0 0 auto; margin-left: auto; color: var(--text-color-kumo-inactive); font-size: 11px; }
+.graph-visual-node { transition: opacity .16s ease, filter .16s ease; }
+.graph-visual-node.is-muted { opacity: .27; filter: grayscale(.35); }
+.graph-visual-node.is-connected .graph-node-circle { box-shadow: 0 0 0 3px var(--graph-node-tint), 0 4px 10px #12344424; }
+.graph-node-circle { border-color: var(--color-kumo-control); color: var(--graph-node-color); background: var(--graph-node-tint) !important; box-shadow: 0 2px 7px #12344420; }
+.graph-node-circle svg { display: block; }
+.graph-visual-node.selected .graph-node-circle { outline-color: var(--graph-node-color); }
+.graph-node-type { color: var(--graph-node-color); font-weight: 700; }
+.graph-canvas { background: radial-gradient(circle at 50% 45%, #fff 0%, #f6fafb 63%, #edf5f7 100%) !important; }
+.react-flow__edge-path { transition: opacity .16s ease, stroke-width .16s ease; }
+
+@media (max-width: 1000px) {
+  .graph-toolbar-controls { justify-content: flex-start; }
+  .graph-explorer-result-count { display: none; }
+}
+
+@media (max-width: 700px) {
+  .graph-toolbar-controls { width: 100%; }
+  .graph-toolbar-controls .relationship-picker, .graph-toolbar-controls .relationship-picker input, .graph-toolbar-controls .snx-field { width: 100%; }
+  .graph-layout-switch { width: 100%; justify-content: space-between; }
+  .graph-layout-switch .snx-button { flex: 1; }
+  .graph-explorer-legend { padding-right: 10px; padding-left: 10px; }
+}

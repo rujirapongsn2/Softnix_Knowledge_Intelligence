@@ -1,0 +1,131 @@
+/* Cloudflare OS-inspired consolidation layer. Legacy feature styles keep their layout rules,
+   while this final layer gives every surface the shared Kumo hierarchy. */
+:root { --color-text-primary: var(--text-color-kumo-default); --color-text-secondary: var(--text-color-kumo-subtle); --color-background: var(--color-kumo-control); --color-background-surface: var(--color-kumo-control); --color-background-body: var(--color-kumo-base); --color-border: var(--color-kumo-line); }
+body { background: var(--color-kumo-base); }
+.workspace { max-width: none; padding-bottom: 0; }
+.page-heading { align-items: center; padding: 0 0 20px; }.page-heading h1 { font-size: 24px; letter-spacing: -.035em; }.page-heading p:not(.eyebrow) { max-width: 680px; font-size: 13px; }.eyebrow { color: var(--color-kumo-brand); font-size: 10px; letter-spacing: .1em; }.section-copy, .metric-detail { color: var(--text-color-kumo-subtle); }
+.workflow-navigation { margin: -6px 0 18px; border-bottom-color: var(--color-kumo-line); }.workflow-back, .workflow-next, .workflow-breadcrumbs button { color: var(--text-color-kumo-subtle); }.workflow-breadcrumbs span { color: var(--text-color-kumo-default); }.workflow-next:hover, .workflow-back:hover:not(:disabled) { color: var(--color-kumo-brand); }
+.kb-hero { margin-bottom: 20px; border: 1px solid var(--color-kumo-line); border-radius: 10px; padding: 24px; background: radial-gradient(ellipse 520px 220px at 100% 0%, #2786C22e 0%, #0d687412 34%, transparent 72%), linear-gradient(135deg, #ffffff 0%, #f7fbfd 100%); color: var(--text-color-kumo-default); box-shadow: 0 1px 2px #14111008; }.kb-hero .eyebrow { color: var(--color-kumo-brand); }.kb-hero h1 { margin: 3px 0 6px; color: var(--text-color-kumo-default); font-size: 25px; }.kb-hero > p { margin-bottom: 18px; color: var(--text-color-kumo-subtle); }.kb-hero-search { max-width: 800px; padding: 0; background: transparent; }.kb-hero-search label { color: var(--text-color-kumo-default); }.kb-hub-heading { margin-bottom: 12px; text-align: left; }.kb-hub-heading h2 { padding: 0; border: 0; font-size: 16px; }.kb-hub-card { border-color: var(--color-kumo-line); border-radius: 10px; background: var(--color-kumo-control); padding: 16px; }.kb-hub-card:hover { border-color: #2786C266; box-shadow: 0 8px 22px #1411100d; }.kb-hub-card.selected { border-color: var(--color-kumo-brand); }.kb-hub-link, .kb-hub-create-trigger, .kb-hub-code { color: var(--text-color-kumo-subtle); }.kb-hub-create-icon { border-color: var(--color-kumo-brand); color: var(--color-kumo-brand); }
+.metric-grid { gap: 12px; }.metric-value { font-size: 25px; }.content-section { margin-top: 24px; }.section-title { margin-bottom: 10px; }.two-column { gap: 12px; }.next-step-card { border-color: #2786C233; border-radius: 10px; background: var(--color-kumo-elevated); box-shadow: none; }
+.upload-layout, .mcp-grid { gap: 16px; }.document-filter-bar, .token-filter-bar { border-color: var(--color-kumo-line); border-radius: 8px; background: var(--color-kumo-elevated); }.document-item, .token-row, .ingest-endpoint-row { border-color: var(--color-kumo-line); border-radius: 8px; background: var(--color-kumo-control); }.document-title, .legal-instrument-open, .legal-instrument-source-link { color: var(--text-color-kumo-default); }.document-item:hover { border-color: #2786C266; }.document-preview-overlay, .document-type-drawer-overlay { background: #14110f55; }.document-preview-modal, .document-type-drawer { border-radius: 10px; background: var(--color-kumo-control); box-shadow: 0 24px 70px #14110f30; }.document-preview-tabs { border-color: var(--color-kumo-line); background: var(--color-kumo-elevated); }.document-preview-tabs button.selected { background: var(--color-kumo-brand); }.drawer-close:hover, .drawer-close:focus-visible { color: var(--color-kumo-brand); background: #2786C20d; }
+.mcp-overview, .legal-metadata-panel, .legal-timeline-primary, .legal-timeline, .document-metadata-panel { border-color: var(--color-kumo-line); border-radius: 10px; background: var(--color-kumo-elevated); box-shadow: none; }.scope-option, .tool-option, .ingest-toggle, .advanced-options { border-color: var(--color-kumo-line); border-radius: 7px; background: var(--color-kumo-control); }.scope-option.selected, .tool-option.selected { border-color: var(--color-kumo-brand); background: #2786C20d; }.scope-option input, .tool-option input, .ingest-toggle input { accent-color: var(--color-kumo-brand); }.code-panel { border-color: var(--color-kumo-line); border-radius: 8px; background: #1e1c1a; }.code-panel-top { background: #292725; color: #eee9e5; }.code-panel-top button { color: #8AC5EA; }.token-reveal { border-color: #2786C255; border-radius: 8px; background: #F3F8FC; }
+.graph-workspace { border-color: var(--color-kumo-line); border-radius: 10px; }.graph-toolbar, .graph-status-legend { border-color: var(--color-kumo-line); background: var(--color-kumo-elevated); }.graph-inspector { border-color: var(--color-kumo-line) !important; border-radius: 10px !important; background: var(--color-kumo-control) !important; }.knowledge-node:hover, .knowledge-node.selected { border-color: var(--color-kumo-brand); }.graph-visual-node.selected .graph-node-circle { outline-color: var(--color-kumo-brand); }.graph-node-review.verified { background: #e7f7eb; }.legal-timeline-item-primary { --timeline-accent: var(--color-kumo-brand); }
+.login-page { background: var(--color-kumo-base); }.login-card { border-color: var(--color-kumo-line); border-radius: 10px; background: var(--color-kumo-control); box-shadow: 0 20px 60px #14111014; }.login-card h1 { color: var(--text-color-kumo-default); font-size: 28px; }.login-copy { color: var(--text-color-kumo-subtle); }.inline-error { border-radius: 7px; }
+@media (max-width: 700px) { .kb-hero { padding: 18px; }.page-heading h1 { font-size: 22px; }.next-step-card { gap: 14px; }.document-preview-modal { border-radius: 0; } }
+
+/* Compact application type scale. Legacy screens use many rem values, so the
+   root size establishes a single baseline before the semantic tiers below. */
+:root { font-size: 14px; }
+body { font-size: 13px; line-height: 1.45; }
+button, input, select, textarea { font-size: inherit; }
+
+/* Page hierarchy: 22 / 16 / 14 / 13. Keep a distinction without the large
+   marketing-style headings inherited from the former interface. */
+.workspace h1 { font-size: 22px !important; line-height: 1.25; letter-spacing: -.025em; }
+.workspace h2 { font-size: 16px !important; line-height: 1.35; letter-spacing: -.015em; }
+.workspace h3 { font-size: 14px !important; line-height: 1.4; letter-spacing: 0; }
+.workspace h4 { font-size: 13px !important; line-height: 1.4; }
+.login-card h1 { font-size: 24px !important; line-height: 1.25; }
+
+/* The reading and operational tiers remain intentionally compact. */
+.workspace :is(.page-heading p:not(.eyebrow), .section-copy, .metric-detail, .document-main p, .source-grid p, .token-row p, .token-row small, .legal-current-card p, .legal-current-meta, .legal-instrument-authority, .legal-instrument-metrics, .trace-detail-heading p, .trace-empty-note, .query-result .answer-copy) { font-size: 13px !important; line-height: 1.5; }
+.workspace :is(.eyebrow, .kb-hub-code, .kb-hub-link, .document-status-help, .document-pagination span, .document-type-drawer-header p:last-child, .document-type-row-main p, .document-type-row-main small, .document-metadata-values dt, .legal-map-stat span, .legal-map-stat small, .legal-class-chip, .legal-instrument-filename, .legal-instrument-version, .legal-instrument-open, .legal-instrument-open-doc, .legal-status, .legal-timeline-legend, .legal-timeline-date, .legal-timeline-kind, .graph-node-type, .graph-node-review, .graph-status-legend, .trace-summary small, .trace-context span, .trace-plan b, .trace-meta-list dt, .trace-meta-list dd, .trace-safe-note, .waterfall-heading, .waterfall-row small) { font-size: 11px !important; }
+.workspace :is(.kb-hub-title, .document-title, .source-grid h3, .token-row > div > b, .legal-instrument-card h3, .legal-current-card h3, .trace-summary b, .waterfall-row b, .graph-node-label) { font-size: 14px !important; line-height: 1.35; }
+.workspace :is(.metric-value, .legal-map-stat strong) { font-size: 24px !important; line-height: 1.1; }
+.workspace :is(.document-type-drawer-header h2, .document-preview-modal .preview-heading h2) { font-size: 18px !important; }
+
+/* Inputs, controls, navigation, and graph labels are all one compact step. */
+.workspace :is(.native-field, .metadata-native-field, .legal-search-field, .legal-filter-field, .relationship-picker, .scope-option, .tool-option, .ingest-toggle, .ingest-language-tabs button, .log-tabs button, .document-preview-tabs button, .inspector-tabs button, .entity-list button, .retrieval-policy-form .native-field, .policy-checks, .policy-numbers label) { font-size: 12px !important; }
+.workspace :is(.graph-node-label, .graph-node-type, .graph-node-review, .react-flow__edge-text, .relationship-direction, .inspector-meta dd, .inspector-evidence p, .inspector-relations span, .inspector-relations small) { font-size: 11px !important; }
+
+/* Knowledge-base cards were the most visibly oversized surface in the audit. */
+.kb-hub-avatar { width: 40px; height: 40px; font-size: 14px; }
+.kb-hub-card { gap: 7px; padding: 14px; }
+.kb-hub-create-trigger { padding: 12px 0; }
+.kb-hub-create-icon { width: 34px; height: 34px; font-size: 18px; }
+.kb-hub-avatar { display: grid; place-items: center; border: 1px solid #2786C233; border-radius: 8px; color: var(--color-kumo-brand); background: #2786C20d; }
+.kb-hub-avatar svg { display: block; }
+.kb-hub-actions { align-items: center; }
+.kb-icon-picker { position: relative; }
+.kb-icon-picker > summary { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; cursor: pointer; color: var(--text-color-kumo-subtle); font-size: 11px; font-weight: 650; list-style: none; }
+.kb-icon-picker > summary::-webkit-details-marker { display: none; }
+.kb-icon-picker > summary svg { color: var(--color-kumo-brand); }
+.kb-icon-palette { position: absolute; z-index: 4; bottom: calc(100% + 6px); left: 0; display: grid; grid-template-columns: repeat(4, 30px); gap: 4px; width: max-content; border: 1px solid var(--color-kumo-line); border-radius: 8px; padding: 6px; background: var(--color-kumo-control); box-shadow: 0 10px 26px #14110f20; }
+.kb-icon-palette button { display: grid; width: 30px; height: 30px; place-items: center; border: 1px solid transparent; border-radius: 5px; color: var(--text-color-kumo-subtle); background: transparent; cursor: pointer; }
+.kb-icon-palette button:hover, .kb-icon-palette button:focus-visible { color: var(--color-kumo-brand); background: #2786C20d; }
+.kb-icon-palette button.selected { border-color: var(--color-kumo-brand); color: var(--color-kumo-brand); background: #2786C20d; }
+
+@media (max-width: 700px) {
+  :root { font-size: 14px; }
+  .workspace h1 { font-size: 20px !important; }
+  .workspace :is(.document-type-drawer-header h2, .document-preview-modal .preview-heading h2) { font-size: 17px !important; }
+}
+
+/* Navigation hierarchy: clearer wayfinding while the content canvas remains
+   visually dominant. The blue accent only marks the current destination. */
+.snx-rail { background: #f8fafc; border-right-color: #14111014; }
+.snx-rail-brand { background: var(--color-kumo-control); border-bottom-color: #14111012; }
+.snx-rail-create { padding: 12px 10px 10px; border-bottom: 1px solid #1411100d; }
+.snx-rail-nav { gap: 12px; padding: 12px 8px 18px; }
+.snx-nav-section { display: grid; gap: 4px; }
+.snx-nav-section + .snx-nav-section { margin-top: 4px; padding-top: 12px; border-top: 1px solid #1411100d; }
+.snx-nav-section > p { margin: 0 8px 4px; color: #77716c; font-size: 10px; font-weight: 800; letter-spacing: .08em; }
+.snx-nav-item { position: relative; min-height: 34px; padding: 0 10px; color: #5d5955; font-weight: 550; }
+.snx-nav-item svg { color: #77716c; }
+.snx-nav-item:hover { color: var(--text-color-kumo-default); background: #14111006; }
+.snx-nav-item:hover svg { color: #5d5955; }
+.snx-nav-item.is-active { color: #1d6eaa; background: #eaf4fa; font-weight: 700; }
+.snx-nav-item.is-active svg { color: var(--color-kumo-brand); }
+.snx-nav-item.is-active::before { position: absolute; top: 8px; bottom: 8px; left: 0; width: 3px; border-radius: 0 3px 3px 0; background: var(--color-kumo-brand); content: ""; }
+.snx-rail-collapsed .snx-nav-section + .snx-nav-section { margin-top: 4px; padding-top: 12px; }
+
+.workflow-navigation { margin: -2px 0 16px; padding: 0 0 10px; border-bottom-color: #14111012; }
+.workflow-navigation-inner { min-height: 28px; }
+.workflow-navigation-path { gap: 8px; }
+.workflow-back { padding: 3px 6px; color: var(--text-color-kumo-subtle); font-size: 11px; font-weight: 650; }
+.workflow-back:hover:not(:disabled) { color: var(--color-kumo-brand); background: #2786C20d; text-decoration: none; }
+.workflow-breadcrumbs { gap: 0; color: var(--text-color-kumo-inactive); font-size: 11px; }
+.workflow-breadcrumbs li + li::before { margin-right: 7px; color: var(--text-color-kumo-inactive); }
+.workflow-breadcrumbs button { color: var(--text-color-kumo-subtle); font-weight: 600; }
+.workflow-breadcrumbs button:hover { color: var(--color-kumo-brand); text-decoration: none; }
+.workflow-breadcrumbs span { color: var(--text-color-kumo-default); font-weight: 700; }
+.workflow-context { max-width: 220px; color: var(--text-color-kumo-subtle); font-size: 11px; font-weight: 600; }
+.workflow-context::before { color: var(--text-color-kumo-inactive); }
+.workflow-next { padding: 3px 6px; color: var(--text-color-kumo-subtle); font-size: 11px; font-weight: 650; }
+.workflow-next:hover { color: var(--color-kumo-brand); background: #2786C20d; text-decoration: none; }
+
+@media (max-width: 700px) {
+  .snx-rail-nav { padding-top: 12px; }
+  .workflow-navigation { margin-top: 0; }
+}
+
+/* Upload flow: keep the task linear and make the final action easy to find. */
+.upload-drawer .upload-layout { grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: stretch; }
+.upload-stepper { margin: 0 0 4px; }
+.upload-stepper ol { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.upload-stepper li { display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; gap: 7px; min-width: 0; color: var(--text-color-kumo-inactive); font-size: 11px; font-weight: 650; }
+.upload-stepper li.is-active { color: var(--color-kumo-brand); }
+.upload-step-number { display: grid; width: 24px; height: 24px; place-items: center; border: 1px solid var(--color-kumo-line); border-radius: 50%; color: var(--text-color-kumo-inactive); background: var(--color-kumo-control); font-size: 11px; font-weight: 750; }
+.upload-stepper li.is-active .upload-step-number { border-color: var(--color-kumo-brand); color: #fff; background: var(--color-kumo-brand); }
+.upload-stepper li.is-complete { color: var(--text-color-kumo-subtle); }
+.upload-stepper li.is-complete .upload-step-number { border-color: #2786C255; color: var(--color-kumo-brand); background: #eaf4fa; }
+.upload-drawer .upload-meta { gap: 12px; padding-top: 16px; border-top: 1px solid var(--color-kumo-line); }
+.upload-selection-summary { display: flex; min-height: 28px; align-items: center; width: fit-content; border-radius: 999px; padding: 4px 9px; color: var(--text-color-kumo-brand); background: #2786C20d; font-size: 12px; font-weight: 700; }
+.upload-review { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--color-kumo-line); border-radius: 8px; background: var(--color-kumo-elevated); }
+.upload-review h3 { margin: 0; color: var(--text-color-kumo-default); }
+.upload-review p { margin: 0; color: var(--text-color-kumo-subtle); font-size: 12px; }
+.upload-review dl { display: grid; gap: 7px; margin: 0; }
+.upload-review dl div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 8px; }
+.upload-review dt { color: var(--text-color-kumo-subtle); font-size: 11px; }
+.upload-review dd { min-width: 0; margin: 0; color: var(--text-color-kumo-default); font-size: 12px; font-weight: 650; overflow-wrap: anywhere; }
+.upload-actions { position: sticky; bottom: -20px; z-index: 2; display: flex; justify-content: flex-end; margin: 4px -20px -20px; padding: 12px 20px 20px; border-top: 1px solid var(--color-kumo-line); background: color-mix(in srgb, var(--color-kumo-control) 94%, transparent); backdrop-filter: blur(8px); }
+.snx-file-list li > span { display: grid; min-width: 0; gap: 2px; overflow: hidden; }
+.snx-file-list li > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.snx-file-list li button { display: grid; width: 24px; height: 24px; flex: 0 0 auto; place-items: center; border: 0; border-radius: 5px; color: var(--text-color-kumo-subtle); background: transparent; cursor: pointer; font-size: 16px; line-height: 1; }
+.snx-file-list li button:hover, .snx-file-list li button:focus-visible { color: #a52b2b; background: #fff0f0; }
+@media (max-width: 700px) {
+  .upload-stepper li { grid-template-columns: 1fr; align-content: start; gap: 4px; }
+  .upload-stepper li > span:last-child { font-size: 10px; }
+  .upload-review dl div { grid-template-columns: 1fr; gap: 2px; }
+  .upload-actions { bottom: -16px; margin-right: -16px; margin-left: -16px; padding-right: 16px; padding-left: 16px; }
+}

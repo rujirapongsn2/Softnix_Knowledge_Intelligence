@@ -18,7 +18,6 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .audit import record_audit, record_mcp_error_trace, record_retrieval_execution
 from .db import Base, engine, get_db, SessionLocal
-from .external_ocr import ExternalOcrClient
 from .graph_store import Neo4jGraphStore
 from .legal_registry import provision_number_matches, resolve_instrument_statuses
 from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, TokenKey, TraceRun, TraceSpan, User
@@ -28,7 +27,7 @@ from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
-from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
+from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
 from .security import INGEST_SCOPE, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, password_hash, refresh_admin, token_digest, verify_password
 from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
@@ -141,10 +140,15 @@ def ready(db: Session = Depends(get_db)):
             httpx.get(f"{settings.lightrag_base_url.rstrip('/')}/health", headers=headers, timeout=3).raise_for_status()
             dependencies["lightrag"] = "ready"
         except httpx.HTTPError: failures["lightrag"] = "unavailable"
-    if settings.ext_ocr_key:
+    if settings.softnix_ocr_base_url and settings.softnix_ocr_token:
         try:
-            ExternalOcrClient(settings).check(); dependencies["external_ocr"] = "ready"
-        except RuntimeError: failures["external_ocr"] = "unavailable"
+            probe = httpx.get(f"{settings.softnix_ocr_base_url.rstrip('/')}/v3/queue-info",
+                              headers={"Authorization": f"Bearer {settings.softnix_ocr_token}"},
+                              verify=not settings.softnix_ocr_insecure_tls, timeout=5)
+            probe.raise_for_status()
+            dependencies["ocr_chain"] = "ready"
+        except (httpx.HTTPError, OSError):
+            failures["ocr_chain"] = "unavailable"
     if failures:
         raise HTTPException(503, {"code": "DEPENDENCY_UNAVAILABLE", "message": "One or more dependencies are unavailable", "retryable": True, "details": failures})
     return {"status": "ready", "dependencies": dependencies}
@@ -232,6 +236,17 @@ def update_retrieval_config(kb_id: str, payload: RetrievalConfigUpdate, user: Us
         raise HTTPException(422, {"code": "RETRIEVAL_CONFIG_INVALID", "message": str(exc), "retryable": False}) from exc
     record_audit(db, "knowledge_base.retrieval_config.update", user.id, "knowledge_base", kb.id,
                  {"config": kb.retrieval_config})
+    db.commit(); db.refresh(kb)
+    return kb
+
+
+@app.patch("/api/v1/knowledge-bases/{kb_id}/icon", response_model=KnowledgeBaseOut)
+def update_kb_icon(kb_id: str, payload: KnowledgeBaseIconUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    kb.icon = payload.icon
+    record_audit(db, "knowledge_base.icon.update", user.id, "knowledge_base", kb.id, {"icon": kb.icon})
     db.commit(); db.refresh(kb)
     return kb
 

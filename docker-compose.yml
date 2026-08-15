@@ -1,6 +1,19 @@
+# Shared build definition for api/worker/migrate: the context is the repo
+# root, and the anydoc fork (a sibling checkout at ../Anydoc-ocr) is mounted
+# as an additional named build context so its wheel can be baked in without
+# copying the tree into this repo.
+x-api-build: &api-build
+  context: .
+  dockerfile: apps/api/Dockerfile
+  additional_contexts:
+    anydoc: ${ANYDOC_DIR:-../Anydoc-ocr}
+  args:
+    ANYDOC_SRC: /
+
 services:
   api:
-    build: ./apps/api
+    build: *api-build
+    restart: unless-stopped
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://skip:skip@postgres:5432/skip
@@ -22,8 +35,9 @@ services:
       timeout: 5s
       retries: 5
   worker:
-    build: ./apps/api
+    build: *api-build
     command: python -m app.worker
+    restart: unless-stopped
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://skip:skip@postgres:5432/skip
@@ -35,7 +49,7 @@ services:
     volumes: [files:/data/files]
     depends_on: [api]
   migrate:
-    build: ./apps/api
+    build: *api-build
     command: alembic upgrade head
     env_file: .env
     environment:
@@ -46,6 +60,7 @@ services:
       context: ./apps/web
       args:
         MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
+    restart: unless-stopped
     environment:
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
     depends_on: [api]
@@ -57,6 +72,7 @@ services:
       retries: 5
   postgres:
     image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+    restart: unless-stopped
     environment: {POSTGRES_DB: skip, POSTGRES_USER: skip, POSTGRES_PASSWORD: skip}
     volumes: [postgres:/var/lib/postgresql/data]
     healthcheck:
@@ -66,6 +82,7 @@ services:
       retries: 5
   redis:
     image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    restart: unless-stopped
     volumes: [redis:/data]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -74,11 +91,13 @@ services:
       retries: 5
   neo4j:
     image: neo4j@sha256:4bae36aff76271e27fd6a6ed0835413f86a284cd179cfb1cb7d188f5f7533aca
+    restart: unless-stopped
     environment:
       NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-change-me-now}"
     volumes: [neo4j:/data]
   lightrag:
     image: ${LIGHTRAG_IMAGE:-ghcr.io/hkuds/lightrag:latest}
+    restart: unless-stopped
     environment:
       HOST: 0.0.0.0
       PORT: 9621

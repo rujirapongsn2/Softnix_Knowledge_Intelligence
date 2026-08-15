@@ -1,0 +1,13 @@
+# Keep the build context lean. The anydoc source arrives via a named
+# additional context, not this directory tree.
+.git
+.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+data
+test_reports
+*.db
+.env
+# Never bake these into images.
+ Anydoc-ocr

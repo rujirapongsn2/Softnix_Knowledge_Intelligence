@@ -1,25 +1,9 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
-import {Theme} from "@astryxdesign/core/theme";
-import {neutralTheme} from "@astryxdesign/theme-neutral/built";
-import {AppShell} from "@astryxdesign/core/AppShell";
-import {Badge} from "@astryxdesign/core/Badge";
-import {Button} from "@astryxdesign/core/Button";
-import {Card} from "@astryxdesign/core/Card";
-import {CheckboxInput} from "@astryxdesign/core/CheckboxInput";
-import {EmptyState} from "@astryxdesign/core/EmptyState";
-import {FileInput} from "@astryxdesign/core/FileInput";
-import {ProgressBar} from "@astryxdesign/core/ProgressBar";
-import {SideNav, SideNavHeading, SideNavItem, SideNavSection} from "@astryxdesign/core/SideNav";
-import {Selector} from "@astryxdesign/core/Selector";
-import {TextArea} from "@astryxdesign/core/TextArea";
-import {TextInput} from "@astryxdesign/core/TextInput";
-import {Toast} from "@astryxdesign/core/Toast";
-import {TopNav, TopNavHeading} from "@astryxdesign/core/TopNav";
+import {Theme, AppShell, Badge, Button, Card, CheckboxInput, CommandPalette, EmptyState, FileInput, ProgressBar, SideNav, SideNavHeading, SideNavItem, SideNavSection, Selector, TextArea, TextInput, Toast, TopNav, TopNavHeading, useDialogFocus} from "./ui.jsx";
+import {AppWindow, BookOpen, Buildings, ChartLineUp, CirclesThree, Cloud, Compass, Database, FileText, Gavel, GitBranch, HardDrives, Key, Lightbulb, MagnifyingGlass, Scales, ShieldCheck, User} from "@phosphor-icons/react";
 import {Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow, ReactFlowProvider, useEdgesState, useNodesState, useReactFlow} from "@xyflow/react";
-import "@astryxdesign/core/reset.css";
-import "@astryxdesign/core/astryx.css";
-import "@astryxdesign/theme-neutral/theme.css";
+import "./kumo.css";
 import "@xyflow/react/dist/style.css";
 import "./style.css";
 import "./access.css";
@@ -31,6 +15,7 @@ import "./legal-registry.css";
 import "./knowledge-hub.css";
 import "./logging.css";
 import "./documents.css";
+import "./cloudflare-overrides.css";
 import {connectionHandles} from "./graph-geometry.mjs";
 import {LanguageProvider, useLanguage} from "./language.jsx";
 import {legalLabels} from "./translations.js";
@@ -38,6 +23,8 @@ import {legalLabels} from "./translations.js";
 const ACCEPTED_FILES = ".pdf,.docx,.pptx,.xlsx,.xls,.txt,.md,.html,.htm,.csv,.json";
 const MAX_FILE_SIZE_MB = Math.max(1, Number(import.meta.env.VITE_MAX_FILE_SIZE_MB || 100));
 const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
+const WORKSPACE_VIEWS = new Set(["knowledge-bases", "documents", "search", "explore", "mcp-tokens", "ingest-tokens", "logs"]);
+const isActiveProcessingJob = job => ["queued", "running"].includes(job?.status);
 const DOCUMENT_TYPE_OPTIONS = [
   {value: "general", labelKey: "documentType.general.label", descriptionKey: "documentType.general.description"},
   {value: "legal", labelKey: "documentType.legal.label", descriptionKey: "documentType.legal.description"},
@@ -45,11 +32,18 @@ const DOCUMENT_TYPE_OPTIONS = [
   {value: "contract", labelKey: "documentType.contract.label", descriptionKey: "documentType.contract.description"},
 ];
 const documentTypeLabel = (t, type) => t(DOCUMENT_TYPE_OPTIONS.find(option => option.value === type)?.labelKey || "documentType.general.label");
+const documentTypeDescription = (t, type) => t(DOCUMENT_TYPE_OPTIONS.find(option => option.value === type)?.descriptionKey || "documentType.general.description");
+
+// Workspace location is part of the browser address rather than transient UI
+// state, so a reload (or a copied URL) keeps the user in the same context.
+const readWorkspaceRoute = () => {
+  const params = new URLSearchParams(window.location.search);
+  const view = params.get("view");
+  return {view: WORKSPACE_VIEWS.has(view) ? view : "knowledge-bases", knowledgeBaseId: params.get("kb") || ""};
+};
 
 // Keep native HTML semantics where the browser owns the interaction (file/date
-// inputs), but route all choice fields through Astryx Selector. This gives the
-// product one accessible, keyboard-friendly control with the active Meta theme
-// instead of a mix of browser-specific <select> rendering and Astryx controls.
+// inputs), while routing choice fields through the shared Kumo-style adapter.
 const DesignSystemSelect = ({label, value, onChange, options, isLabelHidden = false, isDisabled = false, className, size = "sm", description}) => (
   <Selector
     label={label}
@@ -115,10 +109,11 @@ function Login({onLogin}) {
 
 function App() {
   const {language, setLanguage, t} = useLanguage();
+  const initialRoute = useMemo(() => readWorkspaceRoute(), []);
   const [user, setUser] = useState(null);
   const [isSessionLoading, setIsSessionLoading] = useState(true);
   const [kbs, setKbs] = useState([]);
-  const [selectedKbId, setSelectedKbId] = useState("");
+  const [selectedKbId, setSelectedKbId] = useState(() => initialRoute.knowledgeBaseId);
   const [entities, setEntities] = useState([]);
   const [relationships, setRelationships] = useState([]);
   const [documents, setDocuments] = useState([]);
@@ -132,6 +127,8 @@ function App() {
   const [hasCompletedDocuments, setHasCompletedDocuments] = useState(false);
   const [documentPreview, setDocumentPreview] = useState(null);
   const [documentJobs, setDocumentJobs] = useState([]);
+  const [documentJobPolling, setDocumentJobPolling] = useState(false);
+  const [documentJobPollError, setDocumentJobPollError] = useState("");
   const [graph, setGraph] = useState(null);
   const [impact, setImpact] = useState(null);
   const [query, setQuery] = useState("");
@@ -140,8 +137,9 @@ function App() {
   const [queryResult, setQueryResult] = useState(null);
   const [isQuerying, setIsQuerying] = useState(false);
   const [message, setMessage] = useState(null);
-  const [activeView, setActiveView] = useState("knowledge-bases");
-  const [viewTrail, setViewTrail] = useState(["knowledge-bases"]);
+  const [activeView, setActiveView] = useState(() => initialRoute.view);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [viewTrail, setViewTrail] = useState(() => [initialRoute.view]);
   const [newKbName, setNewKbName] = useState("");
   const [uploadFile, setUploadFile] = useState([]);
   const [uploadTitle, setUploadTitle] = useState("");
@@ -162,9 +160,20 @@ function App() {
   const [legalRebuildStatus, setLegalRebuildStatus] = useState(null);
   const [legalInstruments, setLegalInstruments] = useState([]);
   const selectedKb = useMemo(() => kbs.find(kb => kb.id === selectedKbId), [kbs, selectedKbId]);
+  const loadRequestRef = useRef(0);
 
   const notify = (body, type = "info") => setMessage({body, type, id: Date.now()});
   const showError = error => notify(error.message || t("app.error.generic"), "error");
+  const closeCommandPalette = useCallback(() => setIsCommandPaletteOpen(false), []);
+  const writeWorkspaceRoute = useCallback((view, knowledgeBaseId, {replace = false} = {}) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", view);
+    if (knowledgeBaseId) url.searchParams.set("kb", knowledgeBaseId);
+    else url.searchParams.delete("kb");
+    const nextLocation = `${url.pathname}${url.search}${url.hash}`;
+    const currentLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (nextLocation !== currentLocation) window.history[replace ? "replaceState" : "pushState"](window.history.state, "", nextLocation);
+  }, []);
   useEffect(() => {
     let active = true;
     const expireSession = () => { setUser(null); setKbs([]); setSelectedKbId(""); setActiveView("knowledge-bases"); setViewTrail(["knowledge-bases"]); setDocumentPreview(null); };
@@ -176,13 +185,34 @@ function App() {
     }).then(session => { if (active) setUser(session); }).catch(() => undefined).finally(() => { if (active) setIsSessionLoading(false); });
     return () => { active = false; window.removeEventListener("softnix:session-expired", expireSession); };
   }, []);
+  useEffect(() => {
+    if (!user) return;
+    // Selection can also change from cards or API responses, outside a view
+    // navigation. Keep the current history entry accurate in those cases.
+    writeWorkspaceRoute(activeView, selectedKbId, {replace: true});
+  }, [user, activeView, selectedKbId, writeWorkspaceRoute]);
+  useEffect(() => {
+    const restoreWorkspaceRoute = () => {
+      const route = readWorkspaceRoute();
+      setActiveView(route.view);
+      setSelectedKbId(route.knowledgeBaseId);
+      setViewTrail([route.view]);
+      setDocumentPreview(null);
+    };
+    window.addEventListener("popstate", restoreWorkspaceRoute);
+    return () => window.removeEventListener("popstate", restoreWorkspaceRoute);
+  }, []);
   const loadKbs = async () => {
-    const rows = await api("/v1/knowledge-bases"); setKbs(rows);
+    const response = await api("/v1/knowledge-bases");
+    const rows = Array.isArray(response) ? response : response.items || [];
+    setKbs(rows);
     setSelectedKbId(current => rows.some(kb => kb.id === current) ? current : rows[0]?.id || "");
   };
   const loadKbData = async (id, includeDeleted = showDeletedDocuments, options = {}) => {
     const {background = false} = options;
-    if (!id) { setEntities([]); setRelationships([]); setDocuments([]); setDocumentTemplates([]); setDocumentTotal(0); setProcessingDocumentsTotal(0); setHasCompletedDocuments(false); setIsLegalGraph(false); setLegalInstruments([]); return; }
+    const requestId = ++loadRequestRef.current;
+    const isCurrentRequest = () => requestId === loadRequestRef.current;
+    if (!id) { if (isCurrentRequest()) { setEntities([]); setRelationships([]); setDocuments([]); setDocumentTemplates([]); setDocumentTotal(0); setProcessingDocumentsTotal(0); setHasCompletedDocuments(false); setIsLegalGraph(false); setLegalInstruments([]); setDocumentsLoading(false); } return; }
     const isDocumentsView = activeView === "documents";
     const params = new URLSearchParams({limit: "50", offset: String(isDocumentsView ? documentOffset : 0)});
     if (includeDeleted && isDocumentsView) params.set("include_deleted", "true");
@@ -198,9 +228,11 @@ function App() {
         api(`/v1/knowledge-bases/${id}/documents/page?${params.toString()}`),
         api(`/v1/knowledge-bases/${id}/document-templates?include_inactive=true`),
       ]);
+      if (!isCurrentRequest()) return;
       const nextDocuments = documentPage.items || [];
       const hasLegalDocuments = Boolean(documentPage.has_legal_documents);
       const nextLegalInstruments = hasLegalDocuments ? await api(`/v1/knowledge-bases/${id}/legal-registry`) : [];
+      if (!isCurrentRequest()) return;
       setDocuments(nextDocuments); setDocumentTotal(documentPage.total || 0);
       setDocumentTemplates(templates || []);
       setProcessingDocumentsTotal(documentPage.processing_count || 0);
@@ -211,11 +243,14 @@ function App() {
         const graphData = hasLegalDocuments
           ? await api(`/v1/knowledge-bases/${id}/legal-graph?view=${legalGraphView}`)
           : await Promise.all([api(`/v1/knowledge-bases/${id}/entities`), api(`/v1/knowledge-bases/${id}/relationships`)]);
+        if (!isCurrentRequest()) return;
         const [nextEntities, nextRelationships] = hasLegalDocuments ? [graphData.nodes, graphData.edges] : graphData;
         setEntities(nextEntities); setRelationships(nextRelationships);
         if (!background) { setGraph(null); setImpact(null); }
       }
-    } finally { setDocumentsLoading(false); }
+    } catch (error) {
+      if (isCurrentRequest()) throw error;
+    } finally { if (isCurrentRequest()) setDocumentsLoading(false); }
   };
   useEffect(() => { if (user) loadKbs().catch(showError); }, [user]);
   useEffect(() => { setLegalRebuildStatus(null); }, [selectedKbId]);
@@ -226,6 +261,43 @@ function App() {
     const timer = window.setInterval(() => loadKbData(selectedKbId, undefined, {background: true}).catch(showError), 5000);
     return () => window.clearInterval(timer);
   }, [activeView, selectedKbId, user, processingDocumentsTotal, showDeletedDocuments]);
+  const hasActiveDocumentJobs = documentJobs.some(isActiveProcessingJob);
+  useEffect(() => {
+    const documentId = documentPreview?.document_id;
+    if (!user || !documentId || !hasActiveDocumentJobs) {
+      setDocumentJobPolling(false);
+      return undefined;
+    }
+    let cancelled = false;
+    let timer;
+    setDocumentJobPolling(true);
+    setDocumentJobPollError("");
+    const poll = async () => {
+      try {
+        const [nextPreview, nextJobs] = await Promise.all([
+          api(`/v1/documents/${documentId}/text`),
+          api(`/v1/documents/${documentId}/jobs`),
+        ]);
+        if (cancelled) return;
+        setDocumentJobs(nextJobs);
+        setDocumentPreview(current => current && current.document_id === documentId
+          ? {...current, ...nextPreview, title: current.title}
+          : current);
+        setDocumentJobPollError("");
+        if (nextJobs.some(isActiveProcessingJob)) {
+          timer = window.setTimeout(poll, 2000);
+        } else {
+          setDocumentJobPolling(false);
+        }
+      } catch (error) {
+        if (cancelled) return;
+        setDocumentJobPollError(error.message || t("app.error.generic"));
+        timer = window.setTimeout(poll, 5000);
+      }
+    };
+    timer = window.setTimeout(poll, 0);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [user, documentPreview?.document_id, hasActiveDocumentJobs]);
   useEffect(() => {
     if (!user || !selectedKbId || !legalRebuildStatus || !["queued", "running"].includes(legalRebuildStatus.status)) return undefined;
     const poll = async () => {
@@ -262,6 +334,17 @@ function App() {
       setKbs(items => items.map(item => item.id === updated.id ? updated : item));
       notify(t("app.notify.retrievalPolicyUpdated"));
     } catch (error) { showError(error); }
+  };
+  const updateKnowledgeBaseIcon = async (knowledgeBase, icon) => {
+    try {
+      const updated = await api(`/v1/knowledge-bases/${knowledgeBase.id}/icon`, {method: "PATCH", body: JSON.stringify({icon})});
+      setKbs(items => items.map(item => item.id === updated.id ? updated : item));
+      notify(t("app.notify.kbIconUpdated"));
+      return true;
+    } catch (error) {
+      showError(error);
+      return false;
+    }
   };
   const addEntity = async ({name, entityType}) => {
     if (!selectedKbId || !name?.trim()) return null;
@@ -330,7 +413,7 @@ function App() {
     catch (error) { showError(error); }
   };
   const uploadDocument = async event => {
-    event.preventDefault(); if (!selectedKbId || !uploadFile.length) return;
+    event.preventDefault(); if (!selectedKbId || !uploadFile.length) return false;
     const template = documentTemplates.find(row => row.id === uploadTemplateId);
     const form = new FormData(); uploadFile.forEach(file => form.append("files", file)); form.append("document_type", template?.base_document_type || uploadDocumentType); form.append("template_id", uploadTemplateId); form.append("metadata_json", JSON.stringify(uploadMetadata)); if (uploadFile.length === 1 && uploadTitle.trim()) form.append("title", uploadTitle.trim());
     setIsUploading(true);
@@ -339,11 +422,17 @@ function App() {
       const selectedCount = uploadFile.length;
       setUploadFile([]); setUploadTitle(""); setUploadDocumentType("general"); setUploadTemplateId("system:general"); setUploadMetadata({}); await loadKbData(selectedKbId);
       notify(result.failed_count ? t("app.notify.uploadPartialFailure", {queued: result.queued_count, total: selectedCount, failed: result.failed_count}) : t("app.notify.uploadQueued", {queued: result.queued_count}));
-    } catch (error) { showError(error); }
+      return true;
+    } catch (error) { showError(error); return false; }
     finally { setIsUploading(false); }
   };
   const extractLegalMetadata = async document => {
-    try { await api(`/v1/documents/${document.id}/legal-extract`, {method: "POST"}); await openDocument(document); notify(t("app.notify.legalExtractQueued")); }
+    try {
+      setDocumentJobPollError("");
+      await api(`/v1/documents/${document.id}/legal-extract`, {method: "POST"});
+      await openDocument(document);
+      notify(t("app.notify.legalExtractQueued"));
+    }
     catch (error) { showError(error); }
   };
   const saveLegalMetadata = async (document, metadata) => {
@@ -379,6 +468,7 @@ function App() {
   const openDocument = async document => {
     try {
       const [preview, jobs] = await Promise.all([api(`/v1/documents/${document.id}/text`), api(`/v1/documents/${document.id}/jobs`)]);
+      setDocumentJobPollError("");
       setDocumentPreview({...preview, title: document.title || document.original_filename}); setDocumentJobs(jobs);
     } catch (error) { showError(error); }
   };
@@ -421,6 +511,15 @@ function App() {
   useEffect(() => {
     if (user && activeView === "logs") Promise.all([loadTransactionLogs(), loadTraceLogs()]).catch(showError);
   }, [user, activeView]);
+  useEffect(() => {
+    const onKeyDown = event => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault(); setIsCommandPaletteOpen(open => !open);
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
   const createMcpToken = async (payload, label = "MCP") => {
     const result = await api("/v1/tokens", {method: "POST", body: JSON.stringify(payload)});
     await loadAccess(); notify(t("app.notify.tokenCreated", {label})); return result;
@@ -444,37 +543,46 @@ function App() {
   const switchView = view => {
     setActiveView(view); setDocumentPreview(null);
     setViewTrail(current => current.at(-1) === view ? current : pushViewTrail(current, view));
+    writeWorkspaceRoute(view, selectedKbId);
   };
   const navigateToView = view => {
     setActiveView(view); setDocumentPreview(null);
     setViewTrail(current => pushViewTrail(current, view));
+    writeWorkspaceRoute(view, selectedKbId);
   };
   const goBack = () => {
     const next = viewTrail.length > 1 ? viewTrail.slice(0, -1) : viewTrail;
+    const view = next.at(-1) || "knowledge-bases";
     setViewTrail(next);
-    setActiveView(next.at(-1) || "knowledge-bases");
+    setActiveView(view);
     setDocumentPreview(null);
+    writeWorkspaceRoute(view, selectedKbId, {replace: true});
   };
-  const sideNav = <SideNav header={<div className="brand-lockup"><img src="/logo-softnix.png" alt="Softnix"/><SideNavHeading superheading="SOFTNIX" heading="Knowledge Intelligence"/></div>} topContent={<Button label={t("sideNav.newKnowledgeBase")} variant="primary" onClick={() => switchView("knowledge-bases")}/>} collapsible>
+  const sideNav = <SideNav header={<div className="brand-lockup"><img src="/logo-softnix.png" alt="Softnix"/><SideNavHeading superheading="SOFTNIX" heading="Knowledge Intelligence"/></div>} topContent={<Button label={t("sideNav.newKnowledgeBase")} variant="primary" onClick={() => switchView("knowledge-bases")}/>} collapsible ariaLabel={t("ui.primaryNavigation")} expandLabel={t("ui.expandNavigation")} collapseLabel={t("ui.collapseNavigation")}>
     <SideNavSection title={t("sideNav.category.knowledge")} subtitle={t("sideNav.category.knowledge.subtitle")} className="side-nav-category">
-      <SideNavItem label={t("workflow.knowledgeBases")} isSelected={activeView === "knowledge-bases"} onClick={() => switchView("knowledge-bases")}/>
-      <SideNavItem label={t("workflow.documents")} isSelected={activeView === "documents"} onClick={() => switchView("documents")}/>
+      <SideNavItem icon={<Database weight="regular"/>} label={t("workflow.knowledgeBases")} isSelected={activeView === "knowledge-bases"} onClick={() => switchView("knowledge-bases")}/>
+      <SideNavItem icon={<FileText weight="regular"/>} label={t("workflow.documents")} isSelected={activeView === "documents"} onClick={() => switchView("documents")}/>
     </SideNavSection>
     <SideNavSection title={t("sideNav.category.insights")} subtitle={t("sideNav.category.insights.subtitle")} className="side-nav-category">
-      <SideNavItem label={t("workflow.search")} isSelected={activeView === "search"} onClick={() => switchView("search")}/>
-      <SideNavItem label={t("workflow.explore")} isSelected={activeView === "explore"} onClick={() => switchView("explore")}/>
+      <SideNavItem icon={<MagnifyingGlass weight="regular"/>} label={t("workflow.search")} isSelected={activeView === "search"} onClick={() => switchView("search")}/>
+      <SideNavItem icon={<Compass weight="regular"/>} label={t("workflow.explore")} isSelected={activeView === "explore"} onClick={() => switchView("explore")}/>
     </SideNavSection>
-    <SideNavSection title={t("sideNav.category.administration")} subtitle={t("sideNav.category.administration.subtitle")} className="side-nav-category"><SideNavItem label={t("workflow.mcpTokens")} isSelected={activeView === "mcp-tokens"} onClick={() => switchView("mcp-tokens")}/><SideNavItem label={t("workflow.ingestTokens")} isSelected={activeView === "ingest-tokens"} onClick={() => switchView("ingest-tokens")}/><SideNavItem label={t("workflow.logs")} isSelected={activeView === "logs"} onClick={() => switchView("logs")}/></SideNavSection>
+    <SideNavSection title={t("sideNav.category.administration")} subtitle={t("sideNav.category.administration.subtitle")} className="side-nav-category"><SideNavItem icon={<Key weight="regular"/>} label={t("workflow.mcpTokens")} isSelected={activeView === "mcp-tokens"} onClick={() => switchView("mcp-tokens")}/><SideNavItem icon={<BookOpen weight="regular"/>} label={t("workflow.ingestTokens")} isSelected={activeView === "ingest-tokens"} onClick={() => switchView("ingest-tokens")}/><SideNavItem icon={<ChartLineUp weight="regular"/>} label={t("workflow.logs")} isSelected={activeView === "logs"} onClick={() => switchView("logs")}/></SideNavSection>
   </SideNav>;
-  const topNav = <TopNav label={t("app.workspaceNavAriaLabel")} heading={<TopNavHeading heading={selectedKb?.name || t("app.workspaceTitle")}/>} endContent={<div className="topnav-user"><Button label={language === "th" ? "EN" : "TH"} size="sm" variant="ghost" onClick={() => setLanguage(language === "th" ? "en" : "th")} aria-label={t("app.toggleLanguage")}/><span className="status-indicator"/> {user.username}</div>}/>;
+  const topNav = <TopNav label={t("app.workspaceNavAriaLabel")} menuLabel={t("ui.openNavigation")} commandLabel={t("ui.openCommandPalette")} heading={<TopNavHeading heading={selectedKb?.name || t("app.workspaceTitle")}/>} endContent={<div className="topnav-user"><Button label={language === "th" ? "EN" : "TH"} size="sm" variant="ghost" onClick={() => setLanguage(language === "th" ? "en" : "th")} aria-label={t("app.toggleLanguage")}/><span className="status-indicator"/> {user.username}</div>}/>;
+  const commandItems = [
+    ["knowledge-bases", Database, t("workflow.knowledgeBases")], ["documents", FileText, t("workflow.documents")], ["search", MagnifyingGlass, t("workflow.search")], ["explore", Compass, t("workflow.explore")], ["mcp-tokens", Key, t("workflow.mcpTokens")], ["ingest-tokens", BookOpen, t("workflow.ingestTokens")], ["logs", ChartLineUp, t("workflow.logs")],
+  ].map(([id, Icon, label]) => ({id, label, icon: <Icon size={16}/>, group: t("app.workspaceTitle"), onSelect: () => switchView(id)}));
+  commandItems.push(...kbs.map(kb => ({id: `kb-${kb.id}`, label: kb.name, icon: <Database size={16}/>, group: t("workflow.knowledgeBases"), onSelect: () => { setSelectedKbId(kb.id); switchView("knowledge-bases"); }})));
 
-  return <Theme theme={neutralTheme}><AppShell topNav={topNav} sideNav={sideNav} mobileNav={{breakpoint: "md"}} height="auto" variant="elevated" contentPadding={4}>
+  return <Theme><AppShell topNav={topNav} sideNav={sideNav} onCommand={() => setIsCommandPaletteOpen(true)} closeNavigationLabel={t("ui.closeNavigation")}>
     <div className="workspace" aria-live="polite">
-      {message && <Toast body={message.body} type={message.type} isAutoHide={message.type !== "error"} autoHideDuration={5000} onDismiss={() => setMessage(null)}/>} 
+      {message && <Toast body={message.body} type={message.type} isAutoHide={message.type !== "error"} autoHideDuration={5000} dismissLabel={t("ui.dismissNotification")} onDismiss={() => setMessage(null)}/>}
+      <CommandPalette open={isCommandPaletteOpen} onClose={closeCommandPalette} items={commandItems} title={t("app.workspaceNavAriaLabel")} searchPlaceholder={t("ui.commandSearchPlaceholder")} searchLabel={t("ui.commandSearchLabel")} noMatchLabel={t("ui.commandNoMatch")}/>
       <WorkflowNavigation activeView={activeView} selectedKb={selectedKb} hasCompletedDocuments={hasCompletedDocuments} viewTrail={viewTrail} onNavigate={navigateToView} onBack={goBack} onNavigateNext={switchView}/>
-      {activeView === "knowledge-bases" && <KnowledgeBases kbs={kbs} selectedKbId={selectedKbId} setSelectedKbId={setSelectedKbId} newKbName={newKbName} setNewKbName={setNewKbName} createKb={createKb} manageKnowledgeBase={manageKnowledgeBase} updateRetrievalConfig={updateRetrievalConfig} onContinue={() => switchView("documents")}/>}
+      {activeView === "knowledge-bases" && <KnowledgeBases kbs={kbs} selectedKbId={selectedKbId} setSelectedKbId={setSelectedKbId} newKbName={newKbName} setNewKbName={setNewKbName} createKb={createKb} manageKnowledgeBase={manageKnowledgeBase} updateRetrievalConfig={updateRetrievalConfig} updateKnowledgeBaseIcon={updateKnowledgeBaseIcon} onContinue={() => switchView("documents")}/>}
       {activeView === "documents" && (
-        <Documents selectedKb={selectedKb} documents={documents} documentTotal={documentTotal} documentOffset={documentOffset} setDocumentOffset={setDocumentOffset} documentSearch={documentSearch} setDocumentSearch={setDocumentSearch} documentStatusFilter={documentStatusFilter} setDocumentStatusFilter={setDocumentStatusFilter} documentTypeFilter={documentTypeFilter} setDocumentTypeFilter={setDocumentTypeFilter} documentsLoading={documentsLoading} hasCompletedDocuments={hasCompletedDocuments} showDeletedDocuments={showDeletedDocuments} setShowDeletedDocuments={setShowDeletedDocuments} uploadFile={uploadFile} setUploadFile={setUploadFile} uploadTitle={uploadTitle} setUploadTitle={setUploadTitle} uploadDocumentType={uploadDocumentType} setUploadDocumentType={setUploadDocumentType} documentTemplates={documentTemplates} uploadTemplateId={uploadTemplateId} setUploadTemplateId={setUploadTemplateId} uploadMetadata={uploadMetadata} setUploadMetadata={setUploadMetadata} createDocumentTemplate={createDocumentTemplate} updateDocumentTemplate={updateDocumentTemplate} deactivateDocumentTemplate={deactivateDocumentTemplate} activateDocumentTemplate={activateDocumentTemplate} uploadDocument={uploadDocument} isUploading={isUploading} openDocument={openDocument} extractLegalMetadata={extractLegalMetadata} saveLegalMetadata={saveLegalMetadata} deleteLegalMetadata={deleteLegalMetadata} saveDocumentMetadata={saveDocumentMetadata} reprocessDocument={reprocessDocument} deleteDocument={deleteDocument} restoreDocument={restoreDocument} reindexEmbeddings={reindexEmbeddings} refreshDocuments={() => loadKbData(selectedKbId).catch(showError)} documentPreview={documentPreview} documentJobs={documentJobs} legalInstruments={legalInstruments} resolveLegalRegistry={resolveLegalRegistry} updateLegalInstrument={updateLegalInstrument} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={() => loadKbData(selectedKbId).catch(showError)} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship} onClosePreview={closePreview} onCreateKb={() => switchView("knowledge-bases")} onSearch={() => switchView("search")} onExplore={() => switchView("explore")}/>
+        <Documents selectedKb={selectedKb} documents={documents} documentTotal={documentTotal} documentOffset={documentOffset} setDocumentOffset={setDocumentOffset} documentSearch={documentSearch} setDocumentSearch={setDocumentSearch} documentStatusFilter={documentStatusFilter} setDocumentStatusFilter={setDocumentStatusFilter} documentTypeFilter={documentTypeFilter} setDocumentTypeFilter={setDocumentTypeFilter} documentsLoading={documentsLoading} hasCompletedDocuments={hasCompletedDocuments} showDeletedDocuments={showDeletedDocuments} setShowDeletedDocuments={setShowDeletedDocuments} uploadFile={uploadFile} setUploadFile={setUploadFile} uploadTitle={uploadTitle} setUploadTitle={setUploadTitle} uploadDocumentType={uploadDocumentType} setUploadDocumentType={setUploadDocumentType} documentTemplates={documentTemplates} uploadTemplateId={uploadTemplateId} setUploadTemplateId={setUploadTemplateId} uploadMetadata={uploadMetadata} setUploadMetadata={setUploadMetadata} createDocumentTemplate={createDocumentTemplate} updateDocumentTemplate={updateDocumentTemplate} deactivateDocumentTemplate={deactivateDocumentTemplate} activateDocumentTemplate={activateDocumentTemplate} uploadDocument={uploadDocument} isUploading={isUploading} openDocument={openDocument} extractLegalMetadata={extractLegalMetadata} saveLegalMetadata={saveLegalMetadata} deleteLegalMetadata={deleteLegalMetadata} saveDocumentMetadata={saveDocumentMetadata} reprocessDocument={reprocessDocument} deleteDocument={deleteDocument} restoreDocument={restoreDocument} reindexEmbeddings={reindexEmbeddings} refreshDocuments={() => loadKbData(selectedKbId).catch(showError)} documentPreview={documentPreview} documentJobs={documentJobs} documentJobPolling={documentJobPolling} documentJobPollError={documentJobPollError} legalInstruments={legalInstruments} resolveLegalRegistry={resolveLegalRegistry} updateLegalInstrument={updateLegalInstrument} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={() => loadKbData(selectedKbId).catch(showError)} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship} onClosePreview={closePreview} onCreateKb={() => switchView("knowledge-bases")} onSearch={() => switchView("search")} onExplore={() => switchView("explore")}/>
       )}
       {activeView === "search" && (
         <SearchView selectedKb={selectedKb} documents={documents} completedDocuments={hasCompletedDocuments} query={query} setQuery={setQuery} queryAsOfDate={queryAsOfDate} setQueryAsOfDate={setQueryAsOfDate} queryIncludeHistorical={queryIncludeHistorical} setQueryIncludeHistorical={setQueryIncludeHistorical} runQuery={runQuery} isQuerying={isQuerying} queryResult={queryResult} submitFeedback={submitQueryFeedback} onDocuments={() => switchView("documents")} onOpenSource={document => { switchView("documents"); openDocument(document); }}/>
@@ -630,7 +738,7 @@ const WORKFLOW_KEYS = {
 };
 const isAdministrationView = view => view === "mcp-tokens" || view === "ingest-tokens" || view === "logs";
 // Bound how far "Back" can retrace: enough to undo a few steps without the
-// breadcrumb trail growing without limit as the user bounces between views.
+// history growing without limit as the user bounces between views.
 const MAX_VIEW_TRAIL = 4;
 const pushViewTrail = (current, view) => {
   const index = current.lastIndexOf(view);
@@ -641,11 +749,12 @@ const pushViewTrail = (current, view) => {
 function WorkflowNavigation({activeView, selectedKb, hasCompletedDocuments, viewTrail, onNavigate, onBack, onNavigateNext}) {
   const {t} = useLanguage();
   const workflowLabel = view => view === "administration" ? t("nav.administration") : t(WORKFLOW_KEYS[view]);
-  const breadcrumbViews = viewTrail.reduce((items, view) => {
-    if (isAdministrationView(view) && items.at(-1) !== "administration") items.push("administration");
-    items.push(view);
-    return items;
-  }, []);
+  // Breadcrumbs describe the current information architecture, not the route
+  // history. The latter is reserved for the Back control so navigation stays
+  // legible after visiting several screens.
+  const breadcrumbViews = activeView === "knowledge-bases" ? ["knowledge-bases"]
+    : isAdministrationView(activeView) ? ["administration", activeView]
+      : ["knowledge-bases", activeView];
   const previousView = viewTrail.length > 1 ? viewTrail[viewTrail.length - 2] : null;
   const previousLabel = previousView ? workflowLabel(previousView) : null;
   const nextView = activeView === "knowledge-bases" ? "documents"
@@ -660,8 +769,8 @@ function WorkflowNavigation({activeView, selectedKb, hasCompletedDocuments, view
   return <nav className="workflow-navigation" aria-label={t("nav.workflowAriaLabel")}>
     <div className="workflow-navigation-inner">
       <div className="workflow-navigation-path">
-        <button type="button" className="workflow-back" onClick={onBack} disabled={!previousView} aria-label={backLabel}>
-          <span aria-hidden="true">←</span> {backLabel}
+        <button type="button" className="workflow-back" onClick={onBack} disabled={!previousView} aria-label={backLabel} title={backLabel}>
+          <span aria-hidden="true">←</span> {t("nav.back")}
         </button>
         <ol className="workflow-breadcrumbs">
           {breadcrumbViews.map((view, index) => <li key={`${view}-${index}`}>
@@ -684,10 +793,46 @@ const StatusBadge = ({status}) => {
 };
 const Metric = ({value, label, detail}) => <Card padding={3}><p className="metric-value">{value}</p><p className="metric-label">{label}</p>{detail && <p className="metric-detail">{detail}</p>}</Card>;
 
-const KB_AVATAR_COLORS = ["#0d6874", "#2f6690", "#c97b2c", "#5b6ee1", "#2f9e6f", "#a8467a"];
-const kbInitial = name => (name || "").trim().charAt(0).toUpperCase() || "?";
+const KB_ICON_OPTIONS = [
+  {id: "auto", Icon: Database}, {id: "database", Icon: Database}, {id: "book", Icon: BookOpen},
+  {id: "document", Icon: FileText}, {id: "policy", Icon: ShieldCheck}, {id: "legal", Icon: Scales},
+  {id: "court", Icon: Gavel}, {id: "agency", Icon: Buildings},
+];
+const KB_ICON_COMPONENTS = Object.fromEntries(KB_ICON_OPTIONS.map(option => [option.id, option.Icon]));
 
-function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKbName, createKb, manageKnowledgeBase, updateRetrievalConfig, onContinue}) {
+const inferredKnowledgeBaseIcon = name => {
+  const value = (name || "").toLocaleLowerCase();
+  if (/(คำพิพากษา|ศาล|court|judgment)/.test(value)) return "court";
+  if (/(กฎหมาย|กฏหมาย|กฎ|กฏ|พระราช|ระเบียบ|ข้อบังคับ|legal|law|regulation)/.test(value)) return "legal";
+  if (/(pdpa|privacy|security|ความปลอดภัย|นโยบาย|policy|it\b|ไอที)/.test(value)) return "policy";
+  if (/(กระทรวง|กรม|หน่วยงาน|agency|government)/.test(value)) return "agency";
+  if (/(ประกาศ|หนังสือเวียน|คู่มือ|หนังสือ|manual|guide|reference)/.test(value)) return "book";
+  if (/(บันทึก|เอกสาร|document|contract|agreement)/.test(value)) return "document";
+  return "database";
+};
+
+function KnowledgeBaseIcon({knowledgeBase, icon, size = 20, className}) {
+  const resolvedIcon = icon === "auto" ? inferredKnowledgeBaseIcon(knowledgeBase?.name) : (icon || (knowledgeBase?.icon && knowledgeBase.icon !== "auto" ? knowledgeBase.icon : inferredKnowledgeBaseIcon(knowledgeBase?.name)));
+  const Icon = KB_ICON_COMPONENTS[resolvedIcon] || Database;
+  return <Icon className={className} size={size} weight="duotone" aria-hidden="true"/>;
+}
+
+function KnowledgeBaseIconPicker({knowledgeBase, onChange}) {
+  const {t} = useLanguage();
+  const pickerRef = useRef(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const selectedIcon = knowledgeBase.icon || "auto";
+  const selectIcon = async icon => {
+    if (icon === selectedIcon || isSaving) return;
+    setIsSaving(true);
+    const saved = await onChange(knowledgeBase, icon);
+    setIsSaving(false);
+    if (saved && pickerRef.current) pickerRef.current.open = false;
+  };
+  return <details ref={pickerRef} className="kb-icon-picker"><summary><KnowledgeBaseIcon knowledgeBase={knowledgeBase} size={16}/><span>{t("kb.icon.change")}</span></summary><div className="kb-icon-palette" role="group" aria-label={t("kb.icon.pickerLabel", {name: knowledgeBase.name})}>{KB_ICON_OPTIONS.map(option => <button key={option.id} type="button" className={option.id === selectedIcon ? "selected" : ""} aria-label={t(`kb.icon.${option.id}`)} title={t(`kb.icon.${option.id}`)} aria-pressed={option.id === selectedIcon} disabled={isSaving} onClick={() => selectIcon(option.id)}><KnowledgeBaseIcon knowledgeBase={knowledgeBase} icon={option.id} size={18}/></button>)}</div></details>;
+}
+
+function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKbName, createKb, manageKnowledgeBase, updateRetrievalConfig, updateKnowledgeBaseIcon, onContinue}) {
   const {t} = useLanguage();
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -711,15 +856,16 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
     </section>
     <div className="kb-hub-heading"><h2>{t("kb.hub.heading")}</h2><p>{kbs.length ? t("kb.hub.shownCount", {shown: visibleKnowledgeBases.length, total: kbs.length}) : t("kb.hub.createFirst")}</p></div>
     <section className="kb-hub-grid">
-      {visibleKnowledgeBases.map((kb, index) => <article className={`kb-hub-card ${kb.id === selectedKbId ? "selected" : ""}`} key={kb.id}>
+      {visibleKnowledgeBases.map(kb => <article className={`kb-hub-card ${kb.id === selectedKbId ? "selected" : ""}`} key={kb.id}>
         <button type="button" className="kb-hub-open" onClick={() => openKnowledgeBase(kb)}>
-          <span className="kb-hub-avatar" style={{background: KB_AVATAR_COLORS[index % KB_AVATAR_COLORS.length]}}>{kbInitial(kb.name)}</span>
+          <span className="kb-hub-avatar"><KnowledgeBaseIcon knowledgeBase={kb} size={22}/></span>
           <span className="kb-hub-title">{kb.name}</span>
           <span className="kb-hub-code">{kb.code}</span>
           <StatusBadge status={kb.status}/>
           <span className="kb-hub-link">{t("kb.hub.open")}</span>
         </button>
         <div className="kb-hub-actions">
+          <KnowledgeBaseIconPicker knowledgeBase={kb} onChange={updateKnowledgeBaseIcon}/>
           {kb.status === "active" ? <Button label={t("common.disable")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "disable")}/> : <Button label={t("common.activate")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "activate")}/>}
           <Button label={t("common.delete")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "delete")}/>
         </div>
@@ -770,14 +916,14 @@ function DocumentTypeEditor({draft, setDraft, editing, error, setError, onSubmit
   return <form className="template-form" onSubmit={onSubmit}>
     <div className="drawer-form-heading"><div><p className="eyebrow">{editing ? t("documentType.editor.editEyebrow") : t("documentType.editor.newEyebrow")}</p><h3>{editing ? t("documentType.editor.editTitle") : t("documentType.editor.createTitle")}</h3></div><span className="section-copy">{t("documentType.editor.description")}</span></div>
     <TextInput label={t("documentType.editor.typeName")} value={draft.name} onChange={name => setDraft(current => ({...current, name}))} placeholder={t("documentType.editor.typeNamePlaceholder")} isRequired/>
-    <TextInput label={t("documentType.editor.shortDescription")} value={draft.description} onChange={description => setDraft(current => ({...current, description}))} placeholder={t("documentType.editor.shortDescriptionPlaceholder")} isOptional/>
+    <TextInput label={t("documentType.editor.shortDescription")} value={draft.description} onChange={description => setDraft(current => ({...current, description}))} placeholder={t("documentType.editor.shortDescriptionPlaceholder")} isOptional optionalLabel={t("common.optional")}/>
     <DesignSystemSelect label={t("documentType.editor.processingProfile")} value={draft.base_document_type} onChange={base_document_type => setDraft(current => ({...current, base_document_type, fields: current.fields.length ? current.fields : (profileDefaults[base_document_type] || []).map(field => ({...field}))}))} options={DOCUMENT_TYPE_OPTIONS.map(option => ({value: option.value, label: t(option.labelKey)}))}/>
     <div className="template-field-builder"><div><b>{t("documentType.editor.metadataFields")}</b><span className="template-field-actions"><Button label={t("documentType.editor.useProfileDefaults")} type="button" size="sm" variant="ghost" onClick={copyProfileDefaults} isDisabled={!profileDefaults[draft.base_document_type]?.length}/><Button label={t("documentType.editor.addField")} type="button" size="sm" variant="ghost" onClick={addField}/></span></div>{draft.fields.map((field, index) => <div className="template-field-row" key={`${field.key}-${index}`}>
       <div className="template-field-control"><TextInput label={t("documentType.editor.fieldKey")} value={field.key} onChange={key => updateField(index, {key})} placeholder="issuer"/></div>
       <div className="template-field-control"><TextInput label={t("documentType.editor.label")} value={field.label} onChange={label => updateField(index, {label})} placeholder={t("documentType.editor.labelPlaceholder")}/></div>
       <div className="template-field-control"><DesignSystemSelect label={t("documentType.editor.fieldType")} value={field.field_type} onChange={field_type => updateField(index, {field_type})} options={["text", "textarea", "date", "number", "select", "boolean"].map(value => ({value, label: value}))}/></div>
       <div className="template-field-control template-field-required"><DesignSystemCheckbox label={t("documentType.editor.required")} checked={field.required} onChange={required => updateField(index, {required})}/></div>
-      <div className="template-field-control template-field-help"><TextInput label={t("documentType.editor.helpText")} value={field.help_text || ""} onChange={help_text => updateField(index, {help_text})} placeholder={t("documentType.editor.helpTextPlaceholder")} isOptional/></div>
+      <div className="template-field-control template-field-help"><TextInput label={t("documentType.editor.helpText")} value={field.help_text || ""} onChange={help_text => updateField(index, {help_text})} placeholder={t("documentType.editor.helpTextPlaceholder")} isOptional optionalLabel={t("common.optional")}/></div>
       {field.field_type === "select" && <div className="template-field-control template-field-options"><TextInput label={t("documentType.editor.options")} value={(field.options || []).join(", ")} onChange={value => updateField(index, {options: value.split(",").map(item => item.trim()).filter(Boolean)})} placeholder={t("documentType.editor.optionsPlaceholder")}/></div>}
       <details className="template-field-advanced"><summary>{t("documentType.editor.capabilitiesSummary")}</summary><div className="template-field-capabilities"><DesignSystemCheckbox label={t("documentType.editor.searchCapability")} checked={field.searchable !== false} onChange={searchable => updateField(index, {searchable})}/><DesignSystemCheckbox label={t("documentType.editor.filterCapability")} checked={Boolean(field.filterable)} onChange={filterable => updateField(index, {filterable})}/><DesignSystemCheckbox label={t("documentType.editor.graphCapability")} checked={Boolean(field.graph_relationship)} onChange={enabled => updateField(index, enabled ? {graph_entity_type: field.graph_entity_type || "Entity", graph_relationship: field.graph_relationship || "RELATED_TO"} : {graph_entity_type: "", graph_relationship: ""})}/></div>{field.graph_relationship && <div className="template-field-control template-field-graph"><TextInput label={t("documentType.editor.graphEntityType")} value={field.graph_entity_type || ""} onChange={graph_entity_type => updateField(index, {graph_entity_type})} placeholder={t("documentType.editor.graphEntityTypePlaceholder")}/><TextInput label={t("documentType.editor.relationship")} value={field.graph_relationship || ""} onChange={graph_relationship => updateField(index, {graph_relationship: graph_relationship.toUpperCase().replace(/[^A-Z0-9_]/g, "")})} placeholder="ISSUED_BY"/></div>}</details>
       <div className="template-field-action"><Button label={t("documentType.editor.remove")} type="button" size="sm" variant="destructive" onClick={() => removeField(index)}/></div>
@@ -860,15 +1006,25 @@ function DocumentTypeDrawer({open, templates, onClose, onCreate, onUpdate, onDea
   </aside></div>;
 }
 
-function Documents({selectedKb, documents, documentTotal, documentOffset, setDocumentOffset, documentSearch, setDocumentSearch, documentStatusFilter, setDocumentStatusFilter, documentTypeFilter, setDocumentTypeFilter, documentsLoading, hasCompletedDocuments, showDeletedDocuments, setShowDeletedDocuments, uploadFile, setUploadFile, uploadTitle, setUploadTitle, uploadDocumentType, setUploadDocumentType, documentTemplates, uploadTemplateId, setUploadTemplateId, uploadMetadata, setUploadMetadata, createDocumentTemplate, updateDocumentTemplate, deactivateDocumentTemplate, activateDocumentTemplate, uploadDocument, isUploading, openDocument, extractLegalMetadata, saveLegalMetadata, deleteLegalMetadata, saveDocumentMetadata, reprocessDocument, deleteDocument, restoreDocument, reindexEmbeddings, refreshDocuments, documentPreview, documentJobs, legalInstruments, resolveLegalRegistry, updateLegalInstrument, entities, relationships, addEntity, addRelationship, impact, analyzeImpact, syncGraphFromDocuments, refreshGraph, isLegalGraph, legalGraphView, setLegalGraphView, queueLegalGraphRebuild, legalRebuildStatus, reviewLegalRelationship, onClosePreview, onCreateKb, onSearch, onExplore}) {
+function Documents({selectedKb, documents, documentTotal, documentOffset, setDocumentOffset, documentSearch, setDocumentSearch, documentStatusFilter, setDocumentStatusFilter, documentTypeFilter, setDocumentTypeFilter, documentsLoading, hasCompletedDocuments, showDeletedDocuments, setShowDeletedDocuments, uploadFile, setUploadFile, uploadTitle, setUploadTitle, uploadDocumentType, setUploadDocumentType, documentTemplates, uploadTemplateId, setUploadTemplateId, uploadMetadata, setUploadMetadata, createDocumentTemplate, updateDocumentTemplate, deactivateDocumentTemplate, activateDocumentTemplate, uploadDocument, isUploading, openDocument, extractLegalMetadata, saveLegalMetadata, deleteLegalMetadata, saveDocumentMetadata, reprocessDocument, deleteDocument, restoreDocument, reindexEmbeddings, refreshDocuments, documentPreview, documentJobs, documentJobPolling, documentJobPollError, legalInstruments, resolveLegalRegistry, updateLegalInstrument, entities, relationships, addEntity, addRelationship, impact, analyzeImpact, syncGraphFromDocuments, refreshGraph, isLegalGraph, legalGraphView, setLegalGraphView, queueLegalGraphRebuild, legalRebuildStatus, reviewLegalRelationship, onClosePreview, onCreateKb, onSearch, onExplore}) {
   const {t} = useLanguage();
   const [isTypeDrawerOpen, setIsTypeDrawerOpen] = useState(false);
+  const [isUploadDrawerOpen, setIsUploadDrawerOpen] = useState(false);
+  const [uploadStep, setUploadStep] = useState(1);
   const [libraryTab, setLibraryTab] = useState("files");
   const typeManagerTriggerRef = useRef(null);
+  const uploadTriggerRef = useRef(null);
+  const uploadDrawerRef = useRef(null);
+  const uploadDrawerHeadingRef = useRef(null);
   const documentTriggerRef = useRef(null);
   const closeTypeDrawer = useCallback(() => {
     setIsTypeDrawerOpen(false);
     window.requestAnimationFrame(() => typeManagerTriggerRef.current?.focus());
+  }, []);
+  const closeUploadDrawer = useCallback(() => {
+    setIsUploadDrawerOpen(false);
+    setUploadStep(1);
+    window.requestAnimationFrame(() => uploadTriggerRef.current?.focus());
   }, []);
   const openDocumentFromLibrary = (document, event) => {
     documentTriggerRef.current = event?.currentTarget || null;
@@ -879,6 +1035,10 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
     window.requestAnimationFrame(() => documentTriggerRef.current?.focus());
   }, [onClosePreview]);
   useEffect(() => { setLibraryTab("files"); }, [selectedKb?.id]);
+  useEffect(() => {
+    if (!uploadFile.length && uploadStep !== 1) setUploadStep(1);
+  }, [uploadFile.length, uploadStep]);
+  useDialogFocus({open: isUploadDrawerOpen, dialogRef: uploadDrawerRef, initialFocusRef: uploadDrawerHeadingRef, onClose: closeUploadDrawer});
   if (!selectedKb) return <EmptyState title={t("documents.emptyKb.title")} description={t("documents.emptyKb.description")} actions={<Button label={t("documents.emptyKb.action")} variant="primary" onClick={onCreateKb}/>}/>;
   const pageSize = 50;
   const pageStart = documentTotal ? documentOffset + 1 : 0;
@@ -888,8 +1048,37 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
   const processingStatus = document => document.processing_job_status && ["queued", "running"].includes(document.processing_job_status) ? document.processing_job_status : document.status;
   const activeTemplates = documentTemplates.filter(template => template.is_active !== false);
   const uploadTemplate = activeTemplates.find(template => template.id === uploadTemplateId) || activeTemplates[0] || {id: "system:general", name: t("documents.upload.fallbackTemplateName"), base_document_type: uploadDocumentType, fields: [], description: t("documents.upload.fallbackTemplateDescription")};
-  return <><PageHeading eyebrow={t("documents.pageHeading.eyebrow")} title={t("documents.pageHeading.title", {name: selectedKb.name})} description={t("documents.pageHeading.description")} actions={<><Button ref={typeManagerTriggerRef} label={t("documents.manageTypes")} variant="secondary" onClick={() => setIsTypeDrawerOpen(true)}/><Button label={showDeletedDocuments ? t("documents.hideDeleted") : t("documents.showDeleted")} variant="ghost" onClick={() => { setDocumentOffset(0); setShowDeletedDocuments(value => !value); }}/><Button label={t("documents.reindex")} variant="secondary" onClick={reindexEmbeddings}/><Button label={t("documents.refreshStatus")} variant="ghost" onClick={refreshDocuments}/></>}/>
-    <Card padding={4} variant="muted"><form className="upload-layout" onSubmit={uploadDocument}><FileInput label={t("documents.upload.addDocuments")} value={uploadFile} onChange={files => setUploadFile(Array.isArray(files) ? files : files ? [files] : [])} isMultiple maxFiles={20} accept={ACCEPTED_FILES} maxSize={MAX_FILE_SIZE} mode="dropzone" description={t("documents.upload.description", {maxSize: MAX_FILE_SIZE_MB})} isLoading={isUploading}/><div className="upload-meta"><DesignSystemSelect label={t("documents.upload.documentType")} value={uploadTemplate.id} onChange={templateId => { const next = activeTemplates.find(template => template.id === templateId); setUploadTemplateId(templateId); setUploadDocumentType(next?.base_document_type || "general"); setUploadMetadata({}); }} options={activeTemplates.map(template => ({value: template.id, label: template.name}))} isDisabled={isUploading} size="md"/><p className="section-copy document-type-help">{t("documents.upload.templateHelp", {description: uploadTemplate.description})}</p><MetadataFields fields={uploadTemplate.fields} values={uploadMetadata} onChange={setUploadMetadata} isDisabled={isUploading}/><TextInput label={t("documents.upload.titleLabel")} value={uploadTitle} onChange={setUploadTitle} placeholder={t("documents.upload.titlePlaceholder")} isOptional isDisabled={uploadFile.length !== 1 || isUploading}/>{uploadFile.length > 1 && <p className="section-copy document-type-help">{t("documents.upload.batchNote")}</p>}<Button label={uploadFile.length > 1 ? t("documents.upload.submitMultiple", {count: uploadFile.length}) : t("documents.upload.submitSingle")} type="submit" variant="primary" isDisabled={!uploadFile.length} isLoading={isUploading}/></div></form><p className="section-copy upload-format-note">{t("documents.upload.formatNote")}</p></Card>
+  const templateLabel = template => template.is_system ? documentTypeLabel(t, template.base_document_type) : template.name;
+  const templateDescription = template => template.is_system ? documentTypeDescription(t, template.base_document_type) : template.description || t("documents.upload.fallbackTemplateDescription");
+  const uploadSteps = [[1, "documents.upload.step.files"], [2, "documents.upload.step.details"], [3, "documents.upload.step.review"]];
+  const handleUploadSubmit = async event => {
+    if (uploadStep < 3) {
+      event.preventDefault();
+      if (uploadStep === 1 && !uploadFile.length) return;
+      setUploadStep(step => Math.min(3, step + 1));
+      return;
+    }
+    const uploaded = await uploadDocument(event);
+    if (uploaded) closeUploadDrawer();
+  };
+  const uploadStepper = <nav className="upload-stepper" aria-label={t("documents.upload.stepperLabel")}>
+    <ol>{uploadSteps.map(([step, labelKey]) => <li key={step} className={uploadStep === step ? "is-active" : uploadStep > step ? "is-complete" : ""} aria-current={uploadStep === step ? "step" : undefined}><span className="upload-step-number" aria-hidden="true">{uploadStep > step ? "✓" : step}</span><span>{t(labelKey)}</span></li>)}</ol>
+  </nav>;
+  const uploadForm = <form className="upload-layout" onSubmit={handleUploadSubmit}>
+    {uploadStep === 1 && <FileInput label={t("documents.upload.addDocuments")} value={uploadFile} onChange={files => setUploadFile(Array.isArray(files) ? files : files ? [files] : [])} onRemove={index => setUploadFile(current => current.filter((_, fileIndex) => fileIndex !== index))} removeLabel={t("ui.file.remove")} isMultiple maxFiles={20} accept={ACCEPTED_FILES} maxSize={MAX_FILE_SIZE} mode="dropzone" description={t("documents.upload.description", {maxSize: MAX_FILE_SIZE_MB})} isLoading={isUploading} chooseLabel={t("ui.file.choose")} uploadingLabel={t("ui.file.uploading")} tooManyFilesMessage={t("ui.file.tooMany", {maxFiles: 20})} tooLargeFilesMessage={files => t("ui.file.tooLarge", {maxSize: MAX_FILE_SIZE_MB, names: files.map(file => file.name).join(", ")})}/>}
+    {uploadStep === 2 && uploadFile.length > 0 && <div className="upload-meta">
+      <div className="upload-selection-summary" role="status">{t(uploadFile.length === 1 ? "documents.upload.fileSummaryOne" : "documents.upload.fileSummaryOther", {count: uploadFile.length})}</div>
+      <DesignSystemSelect label={t("documents.upload.documentType")} value={uploadTemplate.id} onChange={templateId => { const next = activeTemplates.find(template => template.id === templateId); setUploadTemplateId(templateId); setUploadDocumentType(next?.base_document_type || "general"); setUploadMetadata({}); }} options={activeTemplates.map(template => ({value: template.id, label: templateLabel(template)}))} isDisabled={isUploading} size="md"/>
+      <p className="section-copy document-type-help">{t("documents.upload.templateHelp", {description: templateDescription(uploadTemplate)})}</p>
+      <MetadataFields fields={uploadTemplate.fields} values={uploadMetadata} onChange={setUploadMetadata} isDisabled={isUploading}/>
+      <TextInput label={t("documents.upload.titleLabel")} value={uploadTitle} onChange={setUploadTitle} placeholder={t("documents.upload.titlePlaceholder")} isOptional optionalLabel={t("common.optional")} isDisabled={uploadFile.length !== 1 || isUploading}/>
+      {uploadFile.length > 1 && <p className="section-copy document-type-help">{t("documents.upload.batchNote")}</p>}
+    </div>}
+    {uploadStep === 3 && <section className="upload-review" aria-labelledby="upload-review-title"><h3 id="upload-review-title">{t("documents.upload.reviewTitle")}</h3><p>{t("documents.upload.reviewDescription")}</p><dl><div><dt>{t("documents.upload.documentType")}</dt><dd>{templateLabel(uploadTemplate)}</dd></div><div><dt>{t(uploadFile.length === 1 ? "documents.upload.fileSummaryOne" : "documents.upload.fileSummaryOther", {count: uploadFile.length})}</dt><dd>{uploadFile.map(file => file.name).join(", ")}</dd></div></dl></section>}
+    <div className="upload-actions">{uploadStep > 1 && <Button label={t("documents.upload.back")} type="button" variant="ghost" onClick={() => setUploadStep(step => Math.max(1, step - 1))} isDisabled={isUploading}/>}<Button label={uploadStep < 3 ? t("documents.upload.next") : uploadFile.length > 1 ? t("documents.upload.submitMultiple", {count: uploadFile.length}) : t("documents.upload.submitSingle")} type="submit" variant="primary" isDisabled={uploadStep === 1 && !uploadFile.length} isLoading={uploadStep === 3 && isUploading}/></div>
+  </form>;
+  return <><PageHeading eyebrow={t("documents.pageHeading.eyebrow")} title={t("documents.pageHeading.title", {name: selectedKb.name})} description={t("documents.pageHeading.description")} actions={<><Button ref={uploadTriggerRef} label={t("documents.upload.addDocuments")} variant="primary" onClick={() => { setUploadStep(1); setIsUploadDrawerOpen(true); }}/><Button ref={typeManagerTriggerRef} label={t("documents.manageTypes")} variant="secondary" onClick={() => setIsTypeDrawerOpen(true)}/><Button label={showDeletedDocuments ? t("documents.hideDeleted") : t("documents.showDeleted")} variant="ghost" onClick={() => { setDocumentOffset(0); setShowDeletedDocuments(value => !value); }}/><Button label={t("documents.reindex")} variant="secondary" onClick={reindexEmbeddings}/><Button label={t("documents.refreshStatus")} variant="ghost" onClick={refreshDocuments}/></>}/>
+    {isUploadDrawerOpen && <div className="document-type-drawer-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) closeUploadDrawer(); }}><aside ref={uploadDrawerRef} className="document-type-drawer upload-drawer" role="dialog" aria-modal="true" aria-labelledby="upload-drawer-title" onMouseDown={event => event.stopPropagation()}><header className="document-type-drawer-header"><div><p className="eyebrow">{t("documents.pageHeading.eyebrow")}</p><h2 id="upload-drawer-title" tabIndex={-1} ref={uploadDrawerHeadingRef}>{t("documents.upload.addDocuments")}</h2><p>{t("documents.upload.formatNote")}</p></div><button type="button" className="drawer-close" onClick={closeUploadDrawer} aria-label={t("documentPreview.closeAriaLabel")}>×</button></header>{uploadStepper}{uploadForm}</aside></div>}
     {legalInstruments?.length > 0 && <div className="log-tabs" role="tablist"><button role="tab" aria-selected={libraryTab === "files"} className={libraryTab === "files" ? "selected" : ""} onClick={() => setLibraryTab("files")}>{t("documents.tabs.files")}</button><button role="tab" aria-selected={libraryTab === "legal"} className={libraryTab === "legal" ? "selected" : ""} onClick={() => setLibraryTab("legal")}>{t("documents.tabs.legal")}</button></div>}
     {(libraryTab === "files" || !(legalInstruments?.length > 0)) && <section className="content-section"><div className="section-title"><div><h2>{showDeletedDocuments ? t("documents.library.allTitle") : t("documents.library.title")}</h2><p>{documentTotal ? t(documentTotal === 1 ? "documents.library.showingCountOne" : "documents.library.showingCountOther", {start: pageStart, end: pageEnd, total: documentTotal}) : t("documents.library.empty")}</p></div>{documents.some(document => ["queued", "extracting", "indexing"].includes(document.status) || ["queued", "running"].includes(document.processing_job_status)) && <span className="live-status" role="status">{t("documents.library.updatingLive")}</span>}</div>
       <div className="document-filter-bar"><TextInput label={t("documents.filter.findLabel")} value={documentSearch} onChange={value => { setDocumentOffset(0); setDocumentSearch(value); }} placeholder={t("documents.filter.findPlaceholder")}/><DesignSystemSelect label={t("common.status")} value={documentStatusFilter} onChange={value => { setDocumentOffset(0); setDocumentStatusFilter(value); }} options={[{value: "all", label: t("common.allStatuses")}, ...STATUS_KEYS.filter(key => key !== "disabled").map(key => ({value: key, label: t(`status.${key}.label`)})), {value: "deleted", label: t("documents.filter.status.deleted")}]}/><DesignSystemSelect label={t("documents.upload.documentType")} value={documentTypeFilter} onChange={value => { setDocumentOffset(0); setDocumentTypeFilter(value); }} options={[{value: "all", label: t("common.allTypes")}, ...DOCUMENT_TYPE_OPTIONS.map(option => ({value: option.value, label: t(option.labelKey)})), ...documentTemplates.filter(template => !template.is_system).map(template => ({value: template.id, label: template.name}))]}/></div>
@@ -898,7 +1087,7 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
     </section>}
     {hasCompletedDocuments && <section className="next-step-card"><div><p className="eyebrow">{t("documents.nextStep.eyebrow")}</p><h2>{t("documents.nextStep.title")}</h2><p>{t("documents.nextStep.description")}</p></div><div className="next-step-actions"><Button label={t("documents.nextStep.search")} variant="primary" onClick={onSearch}/><Button label={t("workflow.explore")} variant="secondary" onClick={onExplore}/></div></section>}
     {libraryTab === "legal" && legalInstruments?.length > 0 && <LegalInstrumentsTab knowledgeBaseId={selectedKb.id} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={refreshGraph} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship} resolveLegalRegistry={resolveLegalRegistry} onOpenDocument={openDocumentFromLibrary}/>}
-    {documentPreview && <DocumentPreview preview={documentPreview} jobs={documentJobs} templates={documentTemplates} legalInstrument={legalInstruments?.find(row => row.document_id === documentPreview.document_id)} onExtractLegal={extractLegalMetadata} onSaveLegal={saveLegalMetadata} onDeleteLegal={deleteLegalMetadata} onSaveDocumentMetadata={saveDocumentMetadata} onUpdateLegalInstrument={updateLegalInstrument} onClose={closeDocumentPreview}/>}<DocumentTypeDrawer open={isTypeDrawerOpen} templates={documentTemplates} onClose={closeTypeDrawer} onCreate={createDocumentTemplate} onUpdate={updateDocumentTemplate} onDeactivate={deactivateDocumentTemplate} onActivate={activateDocumentTemplate}/></>
+    {documentPreview && <DocumentPreview preview={documentPreview} jobs={documentJobs} isPollingJobs={documentJobPolling} pollingError={documentJobPollError} templates={documentTemplates} legalInstrument={legalInstruments?.find(row => row.document_id === documentPreview.document_id)} onExtractLegal={extractLegalMetadata} onSaveLegal={saveLegalMetadata} onDeleteLegal={deleteLegalMetadata} onSaveDocumentMetadata={saveDocumentMetadata} onUpdateLegalInstrument={updateLegalInstrument} onClose={closeDocumentPreview}/>}<DocumentTypeDrawer open={isTypeDrawerOpen} templates={documentTemplates} onClose={closeTypeDrawer} onCreate={createDocumentTemplate} onUpdate={updateDocumentTemplate} onDeactivate={deactivateDocumentTemplate} onActivate={activateDocumentTemplate}/></>
 }
 
 const legalStatusLabel = (labels, status) => labels.status[status] || labels.status.unknown;
@@ -946,6 +1135,31 @@ function ExploreView({selectedKb, entities, relationships, addEntity, addRelatio
   </>;
 }
 
+const GRAPH_TYPE_VISUALS = {
+  application: {Icon: AppWindow, color: "#2786C2", tint: "#eaf4fa"},
+  service: {Icon: Cloud, color: "#5f5fc4", tint: "#efeffb"},
+  server: {Icon: HardDrives, color: "#0d7c83", tint: "#e8f7f7"},
+  database: {Icon: Database, color: "#287d65", tint: "#e8f6ef"},
+  businessprocess: {Icon: GitBranch, color: "#c27a18", tint: "#fff5e5"},
+  organization: {Icon: Buildings, color: "#a14878", tint: "#fbeef5"},
+  person: {Icon: User, color: "#9a5a20", tint: "#fff3e7"},
+  document: {Icon: FileText, color: "#6f6a63", tint: "#f4f2ef"},
+  concept: {Icon: Lightbulb, color: "#7454bf", tint: "#f2effc"},
+  legalinstrument: {Icon: Gavel, color: "#6750a4", tint: "#f1edfb"},
+  provision: {Icon: BookOpen, color: "#2786C2", tint: "#eaf4fa"},
+  legalauthority: {Icon: Buildings, color: "#0d7c83", tint: "#e8f7f7"},
+  legalparty: {Icon: User, color: "#a14878", tint: "#fbeef5"},
+  obligation: {Icon: Scales, color: "#c27a18", tint: "#fff5e5"},
+  right: {Icon: ShieldCheck, color: "#287d65", tint: "#e8f6ef"},
+  prohibition: {Icon: Gavel, color: "#a04646", tint: "#fceded"},
+  penalty: {Icon: Scales, color: "#9a5a20", tint: "#fff3e7"},
+  definition: {Icon: BookOpen, color: "#54717b", tint: "#edf3f5"},
+  amendment: {Icon: FileText, color: "#5f5fc4", tint: "#efeffb"},
+  default: {Icon: CirclesThree, color: "#54717b", tint: "#edf3f5"},
+};
+const graphTypeKey = type => String(type || "").replace(/[^a-z]/gi, "").toLowerCase();
+const graphTypeVisual = type => GRAPH_TYPE_VISUALS[graphTypeKey(type)] || GRAPH_TYPE_VISUALS.default;
+const entityTypeOrder = type => ["organization", "businessprocess", "application", "service", "server", "database", "document", "concept"].indexOf(graphTypeKey(type));
 const ENTITY_TYPES = ["Application", "Service", "Server", "Database", "BusinessProcess", "Organization", "Concept"];
 const LEGAL_ENTITY_TYPES = ["LegalInstrument", "Provision", "LegalAuthority", "LegalParty", "Obligation", "Right", "Prohibition", "Penalty", "Definition", "Amendment"];
 const RELATIONSHIP_TYPES = ["DEPENDS_ON", "RUNS_ON", "USES", "SUPPORTS", "AFFECTS"];
@@ -954,18 +1168,19 @@ const entityTypeLabel = (t, type) => { const key = `graph.entityType.${type}`; c
 function KnowledgeNode({data, selected}) {
   const {t, language} = useLanguage();
   const labels = legalLabels[language];
-  const isPerson = /person|people|organization|user|team/i.test(data.entityType);
   const isLegal = Boolean(data.isLegal || labels.entity[data.entityType]);
   const reviewStatus = data.reviewStatus || "unreviewed";
+  const visual = graphTypeVisual(data.entityType);
+  const Icon = visual.Icon;
   const handles = [
     ["top", Position.Top],
     ["right", Position.Right],
     ["bottom", Position.Bottom],
     ["left", Position.Left],
   ];
-  return <div className={`knowledge-node graph-visual-node ${isPerson ? "person-node" : "asset-node"} ${selected ? "selected" : ""}`}>
+  return <div className={`knowledge-node graph-visual-node ${selected ? "selected" : ""} ${data.isMuted ? "is-muted" : ""} ${data.isConnected ? "is-connected" : ""}`} style={{"--graph-node-color": visual.color, "--graph-node-tint": visual.tint}}>
     {handles.map(([id, position]) => <Handle key={id} id={id} type="source" position={position} className={`graph-handle graph-handle-${id}`}/>) }
-    <div className="graph-node-circle" title={isLegal ? legalEntityLabel(labels, data.entityType) : entityTypeLabel(t, data.entityType)}>{isPerson ? <span className="person-glyph"><i/><b/></span> : <span className="asset-glyph"><i/><i/><i/><i/><i/><i/></span>}</div>
+    <div className="graph-node-circle" title={isLegal ? legalEntityLabel(labels, data.entityType) : entityTypeLabel(t, data.entityType)}><Icon size={28} weight="duotone" aria-hidden="true"/></div>
     <strong className="graph-node-label" title={data.label}>{data.label}</strong>
     <span className="graph-node-type" title={isLegal ? legalEntityLabel(labels, data.entityType) : entityTypeLabel(t, data.entityType)}>{isLegal ? legalEntityLabel(labels, data.entityType) : entityTypeLabel(t, data.entityType)}{data.documentId ? ` · ${String(data.documentId).slice(0, 8)}` : ""}</span>
     {isLegal && <span className={`graph-node-review ${reviewStatus}`}><i aria-hidden="true"/>{reviewStatusLabel(labels, reviewStatus)}</span>}
@@ -1143,17 +1358,88 @@ function GraphCanvas({knowledgeBaseId, entities, relationships, addEntity, addRe
   const [graphTypeFilter, setGraphTypeFilter] = useState("all");
   const [graphStatusFilter, setGraphStatusFilter] = useState("all");
   const [graphDepth, setGraphDepth] = useState(1);
+  const [graphRelationshipFilter, setGraphRelationshipFilter] = useState("all");
+  const [graphLayoutMode, setGraphLayoutMode] = useState("by-type");
+  const [graphScope, setGraphScope] = useState("all");
 
   useEffect(() => { api(`/v1/knowledge-bases/${knowledgeBaseId}/graph-layout`).then(data => setLayout(Object.fromEntries(data.items.map(item => [item.entity_id, {x: item.x, y: item.y}])))).catch(() => setLayout({})); }, [knowledgeBaseId]);
 
+  const graphEntityTypes = useMemo(() => [...new Set(entities.map(entity => entity.entity_type).filter(Boolean))].sort((a, b) => {
+    const aOrder = entityTypeOrder(a); const bOrder = entityTypeOrder(b);
+    return (aOrder < 0 ? Number.MAX_SAFE_INTEGER : aOrder) - (bOrder < 0 ? Number.MAX_SAFE_INTEGER : bOrder) || a.localeCompare(b);
+  }), [entities]);
+  const graphRelationshipTypes = useMemo(() => [...new Set(relationships.map(relationship => relationship.relationship_type).filter(Boolean))].sort(), [relationships]);
+  const filteredEntities = useMemo(() => entities.filter(entity => (!graphSearch.trim() || `${entity.name} ${entity.entity_type}`.toLowerCase().includes(graphSearch.trim().toLowerCase())) && (graphTypeFilter === "all" || entity.entity_type === graphTypeFilter) && (graphStatusFilter === "all" || entity.review_status === graphStatusFilter)), [entities, graphSearch, graphTypeFilter, graphStatusFilter]);
+  const filteredEntityIds = useMemo(() => new Set(filteredEntities.map(entity => entity.id)), [filteredEntities]);
+  const filteredRelationships = useMemo(() => relationships.filter(relationship => (graphRelationshipFilter === "all" || relationship.relationship_type === graphRelationshipFilter) && filteredEntityIds.has(relationship.source_entity_id) && filteredEntityIds.has(relationship.target_entity_id)), [relationships, graphRelationshipFilter, filteredEntityIds]);
+  const visibleEntityIds = useMemo(() => {
+    if (graphScope !== "focus" || !selectedEntityId || !filteredEntityIds.has(selectedEntityId)) return filteredEntityIds;
+    const neighbours = new Map();
+    filteredRelationships.forEach(relationship => {
+      if (!neighbours.has(relationship.source_entity_id)) neighbours.set(relationship.source_entity_id, []);
+      if (!neighbours.has(relationship.target_entity_id)) neighbours.set(relationship.target_entity_id, []);
+      neighbours.get(relationship.source_entity_id).push(relationship.target_entity_id);
+      neighbours.get(relationship.target_entity_id).push(relationship.source_entity_id);
+    });
+    const ids = new Set([selectedEntityId]); let frontier = [selectedEntityId];
+    for (let depth = 0; depth < graphDepth; depth += 1) {
+      frontier = frontier.flatMap(id => neighbours.get(id) || []).filter(id => !ids.has(id));
+      frontier.forEach(id => ids.add(id));
+    }
+    return ids;
+  }, [graphScope, selectedEntityId, filteredEntityIds, filteredRelationships, graphDepth]);
+  const visibleEntities = useMemo(() => filteredEntities.filter(entity => visibleEntityIds.has(entity.id)), [filteredEntities, visibleEntityIds]);
+  const visibleRelationships = useMemo(() => filteredRelationships.filter(relationship => visibleEntityIds.has(relationship.source_entity_id) && visibleEntityIds.has(relationship.target_entity_id)), [filteredRelationships, visibleEntityIds]);
+
   useEffect(() => {
-    const degree = relationships.reduce((counts, relationship) => ({...counts, [relationship.source_entity_id]: (counts[relationship.source_entity_id] || 0) + 1, [relationship.target_entity_id]: (counts[relationship.target_entity_id] || 0) + 1}), {});
-    const ordered = [...entities].sort((a, b) => (degree[b.id] || 0) - (degree[a.id] || 0) || a.name.localeCompare(b.name));
+    if (selectedEntityId && !filteredEntityIds.has(selectedEntityId)) {
+      setSelectedEntityId("");
+      setGraphScope("all");
+    }
+  }, [selectedEntityId, filteredEntityIds]);
+  useEffect(() => {
+    if (selectedRelationshipId && !visibleRelationships.some(relationship => relationship.id === selectedRelationshipId)) {
+      setSelectedRelationshipId("");
+    }
+  }, [selectedRelationshipId, visibleRelationships]);
+
+  useEffect(() => {
+    const degree = {};
+    visibleRelationships.forEach(relationship => {
+      degree[relationship.source_entity_id] = (degree[relationship.source_entity_id] || 0) + 1;
+      degree[relationship.target_entity_id] = (degree[relationship.target_entity_id] || 0) + 1;
+    });
+    const ordered = [...visibleEntities].sort((a, b) => (degree[b.id] || 0) - (degree[a.id] || 0) || a.name.localeCompare(b.name));
     const rankById = Object.fromEntries(ordered.map((entity, index) => [entity.id, index]));
-    const autoArrangeDenseLegal = isLegalGraph && entities.length > 10;
-    const visible = entities.filter(entity => (!graphSearch.trim() || `${entity.name} ${entity.entity_type}`.toLowerCase().includes(graphSearch.trim().toLowerCase())) && (graphTypeFilter === "all" || entity.entity_type === graphTypeFilter) && (graphStatusFilter === "all" || entity.review_status === graphStatusFilter));
-    setNodes(current => visible.map((entity, index) => {
-      const existing = current.find(node => node.id === entity.id);
+    const groupedEntities = new Map();
+    visibleEntities.forEach(entity => {
+      const type = entity.entity_type || "Other";
+      if (!groupedEntities.has(type)) groupedEntities.set(type, []);
+      groupedEntities.get(type).push(entity);
+    });
+    const groups = [...groupedEntities.keys()].sort((a, b) => {
+      const aOrder = entityTypeOrder(a); const bOrder = entityTypeOrder(b);
+      return (aOrder < 0 ? Number.MAX_SAFE_INTEGER : aOrder) - (bOrder < 0 ? Number.MAX_SAFE_INTEGER : bOrder) || a.localeCompare(b);
+    });
+    const typePositionById = {};
+    let groupX = 140;
+    groups.forEach(type => {
+      const group = groupedEntities.get(type).sort((a, b) => a.name.localeCompare(b.name));
+      const columns = Math.min(8, Math.max(1, Math.ceil(Math.sqrt(group.length))));
+      group.forEach((entity, index) => {
+        typePositionById[entity.id] = {x: groupX + (index % columns) * 190, y: 100 + Math.floor(index / columns) * 112};
+      });
+      groupX += columns * 190 + 80;
+    });
+    const selectedNeighbourIds = new Set(selectedEntityId ? [selectedEntityId] : []);
+    if (selectedEntityId) visibleRelationships.forEach(relationship => {
+      if (relationship.source_entity_id === selectedEntityId) selectedNeighbourIds.add(relationship.target_entity_id);
+      if (relationship.target_entity_id === selectedEntityId) selectedNeighbourIds.add(relationship.source_entity_id);
+    });
+    setNodes(current => {
+      const currentById = new Map(current.map(node => [node.id, node]));
+      return visibleEntities.map((entity, index) => {
+      const existing = currentById.get(entity.id);
       const rank = rankById[entity.id] ?? index;
       // Keep the highest-degree node in the centre and distribute the rest
       // across multiple rings. A single tight ring works for small graphs but
@@ -1163,27 +1449,30 @@ function GraphCanvas({knowledgeBaseId, entities, relationships, addEntity, addRe
       const slotsPerRing = 8;
       const ringIndex = Math.floor(outerIndex / slotsPerRing);
       const slotIndex = outerIndex % slotsPerRing;
-      const slotCount = Math.min(slotsPerRing, Math.max(1, entities.length - 1 - ringIndex * slotsPerRing));
+      const slotCount = Math.min(slotsPerRing, Math.max(1, visibleEntities.length - 1 - ringIndex * slotsPerRing));
       const angle = ((slotIndex / slotCount) * Math.PI * 2) - Math.PI / 2;
       const radius = 300 + ringIndex * 190;
       const automaticPosition = rank === 0 ? {x: 640, y: 480} : {x: 640 + Math.cos(angle) * radius, y: 480 + Math.sin(angle) * radius};
-      return {id: entity.id, type: "knowledge", position: existing?.position || (!autoArrangeDenseLegal && layout[entity.id]) || automaticPosition, data: {label: entity.name, entityType: entity.entity_type, documentId: entity.attributes?.document_id, reviewStatus: entity.review_status, isLegal: entity.is_legal}};
-    }));
-  }, [entities, relationships, layout, setNodes, graphSearch, graphTypeFilter, graphStatusFilter, isLegalGraph]);
+      const position = graphLayoutMode === "saved" ? layout[entity.id] || existing?.position || automaticPosition : graphLayoutMode === "by-type" ? typePositionById[entity.id] : automaticPosition;
+      return {id: entity.id, type: "knowledge", position, data: {label: entity.name, entityType: entity.entity_type, documentId: entity.attributes?.document_id, reviewStatus: entity.review_status, isLegal: entity.is_legal, isConnected: selectedEntityId && selectedNeighbourIds.has(entity.id), isMuted: selectedEntityId && !selectedNeighbourIds.has(entity.id)}};
+      });
+    });
+  }, [visibleEntities, visibleRelationships, layout, setNodes, graphLayoutMode, selectedEntityId]);
 
   useEffect(() => {
     const nodesById = Object.fromEntries(nodes.map(node => [node.id, node]));
-    setEdges(relationships.filter(relationship => nodesById[relationship.source_entity_id] && nodesById[relationship.target_entity_id]).map(relationship => {
+    setEdges(visibleRelationships.filter(relationship => nodesById[relationship.source_entity_id] && nodesById[relationship.target_entity_id]).map(relationship => {
       const isDependency = /DEPEND|RUNS_ON|USES/i.test(relationship.relationship_type);
       const reviewStatus = relationship.review_status || "verified";
       const statusColor = reviewStatus === "suggested" ? "#d58b14" : reviewStatus === "rejected" ? "#9a6a6a" : relationship.origin === "manual" ? "#65439a" : (isDependency ? "#56328d" : "#008c96");
       const handles = connectionHandles(nodesById[relationship.source_entity_id], nodesById[relationship.target_entity_id]);
-      const showLabel = !isLegalGraph || relationships.length <= 8 || relationship.id === selectedRelationshipId;
-      return {id: relationship.id, source: relationship.source_entity_id, target: relationship.target_entity_id, ...handles, label: showLabel ? relationshipLabel(labels, relationship.relationship_type) : undefined, type: "straight", markerEnd: {type: MarkerType.ArrowClosed, color: statusColor}, style: {stroke: statusColor, strokeWidth: reviewStatus === "suggested" ? 2.2 : 1.8, strokeDasharray: reviewStatus === "suggested" ? "7 5" : reviewStatus === "rejected" ? "3 5" : undefined, opacity: reviewStatus === "rejected" ? .55 : 1}, labelStyle: {fill: statusColor, fontWeight: 700, fontSize: 11}, labelBgStyle: {fill: "#ffffff", fillOpacity: 0.96}};
+      const selectedPath = selectedEntityId && (relationship.source_entity_id === selectedEntityId || relationship.target_entity_id === selectedEntityId);
+      const showLabel = relationship.id === selectedRelationshipId || Boolean(selectedPath && selectedEntityId);
+      return {id: relationship.id, source: relationship.source_entity_id, target: relationship.target_entity_id, ...handles, label: showLabel ? relationshipLabel(labels, relationship.relationship_type) : undefined, type: "smoothstep", markerEnd: {type: MarkerType.ArrowClosed, color: statusColor}, style: {stroke: statusColor, strokeWidth: selectedPath ? 2.8 : reviewStatus === "suggested" ? 2.2 : 1.8, strokeDasharray: reviewStatus === "suggested" ? "7 5" : reviewStatus === "rejected" ? "3 5" : undefined, opacity: selectedEntityId && !selectedPath ? .12 : reviewStatus === "rejected" ? .55 : 1}, labelStyle: {fill: statusColor, fontWeight: 700, fontSize: 11}, labelBgStyle: {fill: "#ffffff", fillOpacity: 0.96}};
     }));
-  }, [nodes, relationships, selectedRelationshipId, isLegalGraph, setEdges, labels]);
+  }, [nodes, visibleRelationships, selectedRelationshipId, selectedEntityId, setEdges, labels]);
 
-  useEffect(() => { if (entities.length) requestAnimationFrame(() => fitView({padding: 0.3, duration: 280})); }, [entities.length, fitView]);
+  useEffect(() => { if (visibleEntities.length) requestAnimationFrame(() => fitView({padding: 0.3, duration: 280})); }, [visibleEntities.length, graphLayoutMode, graphScope, fitView]);
 
   const selectedEntity = entities.find(entity => entity.id === selectedEntityId);
   const selectedRelationship = relationships.find(relationship => relationship.id === selectedRelationshipId);
@@ -1198,18 +1487,19 @@ function GraphCanvas({knowledgeBaseId, entities, relationships, addEntity, addRe
   }, [selectedEntityId, isLegalGraph, graphDepth]);
   const focusSelected = async depth => {
     setGraphDepth(depth); if (!selectedEntityId) return;
+    setGraphScope("focus");
     const neighbourhood = await api(`/v1/entities/${selectedEntityId}/graph?depth=${depth}`).catch(() => null);
     if (!neighbourhood) return;
-    const ids = new Set(neighbourhood.nodes.map(node => node.id)); setNodes(current => current.map(node => ({...node, hidden: !ids.has(node.id)}))); setEdges(current => current.map(edge => ({...edge, hidden: !ids.has(edge.source) || !ids.has(edge.target)}))); setGraphNotice(t("legal.graph.notice.showingConnected", {count: ids.size, depth}));
+    setGraphNotice(t("legal.graph.notice.showingConnected", {count: neighbourhood.nodes.length, depth}));
   };
   const onPaneClick = useCallback(event => {
     if (isLegalGraph && legalGraphView !== "manual") {
-      setSelectedEntityId(""); setSelectedRelationshipId(""); setDraftPosition(null);
+      setSelectedEntityId(""); setSelectedRelationshipId(""); setDraftPosition(null); setGraphScope("all");
       setGraphNotice(t("legal.graph.notice.switchToManualAdd"));
       return;
     }
     const point = screenToFlowPosition({x: event.clientX, y: event.clientY});
-    setSelectedEntityId(""); setSelectedRelationshipId(""); setDraftPosition(point); setEntityName(""); setGraphNotice(t("legal.graph.notice.nameNewEntity"));
+    setSelectedEntityId(""); setSelectedRelationshipId(""); setGraphScope("all"); setDraftPosition(point); setEntityName(""); setGraphNotice(t("legal.graph.notice.nameNewEntity"));
   }, [screenToFlowPosition, isLegalGraph, legalGraphView]);
   const onNodeClick = useCallback((_, node) => { setSelectedEntityId(node.id); setSelectedRelationshipId(""); setDraftPosition(null); setGraphNotice(""); }, []);
   const onConnect = useCallback(async connection => {
@@ -1236,7 +1526,11 @@ function GraphCanvas({knowledgeBaseId, entities, relationships, addEntity, addRe
     try { await api(`/v1/knowledge-bases/${knowledgeBaseId}/graph-layout`, {method: "PUT", body: JSON.stringify({items: nextNodes.map(node => ({entity_id: node.id, x: node.position.x, y: node.position.y}))})}); }
     catch { setGraphNotice(t("legal.graph.notice.layoutSaveFailed")); }
   }, [knowledgeBaseId, t]);
-  const onNodeDragStop = useCallback((_, __, nextNodes) => saveLayout(nextNodes?.length ? nextNodes : nodes), [nodes, saveLayout]);
+  const onNodeDragStop = useCallback((_, __, nextNodes) => {
+    const positionedNodes = nextNodes?.length ? nextNodes : nodes;
+    setLayout(current => ({...current, ...Object.fromEntries(positionedNodes.map(node => [node.id, node.position]))}));
+    setGraphLayoutMode("saved"); saveLayout(positionedNodes);
+  }, [nodes, saveLayout]);
   const updateSelectedEntity = async event => {
     event.preventDefault(); if (!selectedEntity || !editName.trim()) return;
     await api(`/v1/entities/${selectedEntity.id}`, {method: "PATCH", body: JSON.stringify({name: editName.trim(), entity_type: editEntityType})});
@@ -1262,12 +1556,12 @@ function GraphCanvas({knowledgeBaseId, entities, relationships, addEntity, addRe
   };
 
   const closeInspector = () => {
-    setSelectedEntityId(""); setSelectedRelationshipId(""); setDraftPosition(null); setGraphNotice("");
+    setSelectedEntityId(""); setSelectedRelationshipId(""); setDraftPosition(null); setGraphScope("all"); setGraphNotice("");
   };
   const isInspectorOpen = Boolean(draftPosition || selectedEntity || selectedRelationship || graphNotice);
-  const legalTypes = [...new Set(entities.filter(entity => entity.is_legal).map(entity => entity.entity_type))];
   const selectedEntityPanel = isLegalGraph && legalGraphView !== "manual" ? <LegalInspector entity={selectedEntity} data={inspectorData} loading={inspectorLoading} tab={inspectorTab} setTab={setInspectorTab} onImpact={() => analyzeImpact({subject: selectedEntity.name, entityId: selectedEntity.id, scenario})} onFocus={focusSelected}/> : <form className="form-stack" onSubmit={updateSelectedEntity}><p className="eyebrow">{t("legal.graph.entityForm.eyebrow")}</p><h2>{t("legal.graph.entityForm.title")}</h2><TextInput label={t("legal.graph.entityForm.nameLabel")} value={editName} onChange={setEditName} isRequired/><DesignSystemSelect label={t("legal.graph.entityForm.typeLabel")} value={editEntityType} onChange={setEditEntityType} options={ENTITY_TYPES.map(type => ({value: type, label: entityTypeLabel(t, type)}))} size="md"/><p className="section-copy graph-help">{t("legal.graph.entityForm.dragHelp", {type: relationshipLabel(labels, relationshipType)})}</p><Button label={t("legal.graph.entityForm.save")} type="submit" variant="primary" isDisabled={!editName.trim()}/><div className="form-stack graph-impact-form"><TextInput label={t("legal.graph.entityForm.scenarioLabel")} value={scenario} onChange={setScenario} placeholder={t("legal.graph.entityForm.scenarioPlaceholder")} isRequired/><Button label={t("legal.graph.entityForm.analyzeImpact")} type="button" variant="secondary" onClick={() => analyzeImpact({subject: selectedEntity.name, entityId: selectedEntity.id, scenario})}/></div><Button label={t("legal.graph.entityForm.delete")} type="button" variant="destructive" onClick={deleteSelectedEntity}/></form>;
-  return <section className="graph-workspace"><div className="graph-toolbar"><div><Badge label={t("graph.nodesCount", {count: entities.length})} variant="info"/><Badge label={t("graph.connectionsCount", {count: relationships.length})} variant="neutral"/></div>{isLegalGraph ? <><DesignSystemSelect label={t("legal.graph.toolbar.viewLabel")} value={legalGraphView} onChange={setLegalGraphView} options={[{value: "verified", label: t("legal.graph.view.verified")}, {value: "suggested", label: t("legal.graph.view.suggested")}, {value: "manual", label: t("legal.graph.view.manual")}, {value: "all", label: t("legal.graph.view.all")}]}/><label className="relationship-picker">{t("legal.graph.toolbar.searchNodeLabel")}<input value={graphSearch} onChange={event => setGraphSearch(event.target.value)} placeholder={t("legal.graph.toolbar.searchNodePlaceholder")}/></label><DesignSystemSelect label={t("legal.graph.toolbar.nodeTypeLabel")} value={graphTypeFilter} onChange={setGraphTypeFilter} options={[{value: "all", label: t("common.allTypes")}, ...legalTypes.map(type => ({value: type, label: legalEntityLabel(labels, type)}))]}/><DesignSystemSelect label={t("legal.graph.toolbar.reviewStatusLabel")} value={graphStatusFilter} onChange={setGraphStatusFilter} options={[{value: "all", label: t("common.allStatuses")}, {value: "verified", label: labels.reviewStatus.verified}, {value: "suggested", label: labels.reviewStatus.suggested}, {value: "rejected", label: labels.reviewStatus.rejected}]}/><Button label={legalRebuildStatus && ["queued", "running"].includes(legalRebuildStatus.status) ? t("legal.graph.toolbar.rebuilding") : t("legal.graph.toolbar.rebuild")} variant="secondary" size="sm" onClick={queueLegalGraphRebuild} isDisabled={Boolean(legalRebuildStatus && ["queued", "running"].includes(legalRebuildStatus.status))}/></> : <><DesignSystemSelect label={t("legal.graph.toolbar.newRelationshipType")} value={relationshipType} onChange={setRelationshipType} options={RELATIONSHIP_TYPES.map(type => ({value: type, label: relationshipLabel(labels, type)}))}/><Button label={t("legal.graph.toolbar.importFromDocuments")} variant="secondary" size="sm" onClick={syncGraph}/></>}<Button label={t("legal.graph.toolbar.fitView")} variant="ghost" size="sm" onClick={() => fitView({padding: 0.24, duration: 280})}/></div>
+  return <section className="graph-workspace"><div className="graph-toolbar"><div className="graph-summary"><Badge label={t("graph.nodesCount", {count: entities.length})} variant="info"/><Badge label={t("graph.connectionsCount", {count: relationships.length})} variant="neutral"/></div><div className="graph-toolbar-controls"><label className="relationship-picker"><span>{t("graph.controls.findNode")}</span><input value={graphSearch} onChange={event => setGraphSearch(event.target.value)} placeholder={t("graph.controls.findNodePlaceholder")}/></label><DesignSystemSelect label={t("graph.controls.nodeType")} value={graphTypeFilter} onChange={setGraphTypeFilter} options={[{value: "all", label: t("common.allTypes")}, ...graphEntityTypes.map(type => ({value: type, label: isLegalGraph ? legalEntityLabel(labels, type) : entityTypeLabel(t, type)}))]}/><DesignSystemSelect label={t("graph.controls.relationshipType")} value={graphRelationshipFilter} onChange={setGraphRelationshipFilter} options={[{value: "all", label: t("graph.controls.allRelationships")}, ...graphRelationshipTypes.map(type => ({value: type, label: relationshipLabel(labels, type)}))]}/>{isLegalGraph ? <><DesignSystemSelect label={t("legal.graph.toolbar.viewLabel")} value={legalGraphView} onChange={setLegalGraphView} options={[{value: "verified", label: t("legal.graph.view.verified")}, {value: "suggested", label: t("legal.graph.view.suggested")}, {value: "manual", label: t("legal.graph.view.manual")}, {value: "all", label: t("legal.graph.view.all")}]}/><DesignSystemSelect label={t("legal.graph.toolbar.reviewStatusLabel")} value={graphStatusFilter} onChange={setGraphStatusFilter} options={[{value: "all", label: t("common.allStatuses")}, {value: "verified", label: labels.reviewStatus.verified}, {value: "suggested", label: labels.reviewStatus.suggested}, {value: "rejected", label: labels.reviewStatus.rejected}]}/><Button label={legalRebuildStatus && ["queued", "running"].includes(legalRebuildStatus.status) ? t("legal.graph.toolbar.rebuilding") : t("legal.graph.toolbar.rebuild")} variant="secondary" size="sm" onClick={queueLegalGraphRebuild} isDisabled={Boolean(legalRebuildStatus && ["queued", "running"].includes(legalRebuildStatus.status))}/></> : <><DesignSystemSelect label={t("legal.graph.toolbar.newRelationshipType")} value={relationshipType} onChange={setRelationshipType} options={RELATIONSHIP_TYPES.map(type => ({value: type, label: relationshipLabel(labels, type)}))}/><Button label={t("legal.graph.toolbar.importFromDocuments")} variant="secondary" size="sm" onClick={syncGraph}/></>}<div className="graph-layout-switch" role="group" aria-label={t("graph.controls.layout")}><Button label={t("graph.controls.layoutByType")} className={graphLayoutMode === "by-type" ? "selected" : ""} variant="ghost" size="sm" aria-pressed={graphLayoutMode === "by-type"} onClick={() => setGraphLayoutMode("by-type")}/><Button label={t("graph.controls.layoutRadial")} className={graphLayoutMode === "radial" ? "selected" : ""} variant="ghost" size="sm" aria-pressed={graphLayoutMode === "radial"} onClick={() => setGraphLayoutMode("radial")}/><Button label={t("graph.controls.layoutSaved")} className={graphLayoutMode === "saved" ? "selected" : ""} variant="ghost" size="sm" aria-pressed={graphLayoutMode === "saved"} onClick={() => setGraphLayoutMode("saved")}/></div><Button label={graphScope === "focus" ? t("graph.controls.clearFocus") : t("graph.controls.focusSelected")} variant={graphScope === "focus" ? "secondary" : "ghost"} size="sm" onClick={() => setGraphScope(scope => scope === "focus" ? "all" : "focus")} isDisabled={!selectedEntityId}/>{graphScope === "focus" && <DesignSystemSelect label={t("graph.controls.focusDepth")} value={String(graphDepth)} onChange={value => setGraphDepth(Number(value))} options={[{value: "1", label: t("graph.controls.focusDepthOne")}, {value: "2", label: t("graph.controls.focusDepthTwo")}]}/>}<Button label={t("legal.graph.toolbar.fitView")} variant="ghost" size="sm" onClick={() => fitView({padding: 0.24, duration: 280})}/></div></div>
+    <div className="graph-explorer-legend" role="group" aria-label={t("graph.controls.legend")}><span className="graph-explorer-legend-title">{t("graph.controls.legend")}</span>{graphEntityTypes.map(type => { const visual = graphTypeVisual(type); const Icon = visual.Icon; const selected = graphTypeFilter === type; return <button type="button" key={type} className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => setGraphTypeFilter(current => current === type ? "all" : type)}><i style={{"--graph-node-color": visual.color, "--graph-node-tint": visual.tint}}><Icon size={14} weight="duotone" aria-hidden="true"/></i><span>{isLegalGraph ? legalEntityLabel(labels, type) : entityTypeLabel(t, type)}</span></button>; })}<span className="graph-explorer-result-count">{t("graph.controls.shown", {nodes: visibleEntities.length, relationships: visibleRelationships.length})}</span></div>
     {isLegalGraph && <div className="graph-status-legend" role="note"><span className="graph-status-legend-title">{t("legal.graph.statusLegend.title")}</span><span><i className="verified" aria-hidden="true"/>{t("legal.graph.statusLegend.solidLine", {status: labels.reviewStatus.verified})}</span><span><i className="suggested" aria-hidden="true"/>{t("legal.graph.statusLegend.dashedLine", {status: labels.reviewStatus.suggested})}</span><span><i className="manual" aria-hidden="true"/>{t("legal.graph.statusLegend.purpleLine", {status: labels.relationshipOrigin.manual})}</span><span className="graph-status-legend-help">{t("legal.graph.statusLegend.help")}</span></div>}
     <div className="graph-layout"><div className={`graph-canvas ${isLegalGraph && entities.length > 10 ? "graph-canvas-dense" : ""}`}><ReactFlow nodes={nodes} edges={edges} nodeTypes={graphNodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onNodeClick={onNodeClick} onPaneClick={onPaneClick} onNodeDragStop={onNodeDragStop} onEdgeClick={selectEdge} onConnect={onConnect} fitView fitViewOptions={{padding: 0.3}} minZoom={0.25} maxZoom={2} nodesConnectable connectionMode="loose" connectionRadius={24} defaultEdgeOptions={{type: "smoothstep"}}><Background gap={20} size={1} color="#b9cbd3"/><MiniMap pannable zoomable nodeColor="#2c7282"/><Controls showInteractive={false}/></ReactFlow></div>
       <aside className={`graph-inspector ${isInspectorOpen ? "open" : "closed"}`}>{isInspectorOpen && <button type="button" className="graph-inspector-close" onClick={closeInspector} aria-label={t("legal.graph.inspector.closeAriaLabel")} style={{position: "absolute", top: 12, right: 14, border: 0, background: "transparent", color: "#52717a", fontSize: "1.5rem", lineHeight: 1, cursor: "pointer"}}>×</button>}{draftPosition ? <form className="form-stack" onSubmit={createNode}><p className="eyebrow">{t("legal.graph.newNode.eyebrow")}</p><h2>{t("legal.graph.newNode.title")}</h2><p className="section-copy">{t("legal.graph.newNode.description")}</p><TextInput label={t("legal.graph.newNode.nameLabel")} value={entityName} onChange={setEntityName} placeholder={t("legal.graph.newNode.namePlaceholder")} isRequired hasAutoFocus/><DesignSystemSelect label={t("legal.graph.newNode.typeLabel")} value={entityType} onChange={setEntityType} options={ENTITY_TYPES.map(type => ({value: type, label: entityTypeLabel(t, type)}))} size="md"/><Button label={t("legal.graph.newNode.submit")} type="submit" variant="primary" isDisabled={!entityName.trim()}/></form> : selectedEntity ? selectedEntityPanel : selectedRelationship ? <form className="form-stack" onSubmit={updateSelectedRelationship}><p className="eyebrow">{selectedRelationship.review_status === "suggested" ? t("legal.graph.relationship.suggestedEyebrow") : t("legal.graph.relationship.selectedEyebrow")}</p><div className="relationship-heading"><h2>{relationshipLabel(labels, selectedRelationship.relationship_type)}</h2><Badge label={reviewStatusLabel(labels, selectedRelationship.review_status)} variant={reviewBadgeVariant(selectedRelationship.review_status)}/></div><p className="section-copy"><b>{t("legal.graph.relationship.sourceLabel")}</b> {relationshipOriginLabel(labels, selectedRelationship.origin)}{selectedRelationship.confidence == null ? "" : ` · ${t("legal.inspector.confidencePercent", {pct: Math.round(selectedRelationship.confidence * 100)})}`}</p><div className="relationship-direction" aria-label={t("legal.graph.relationship.directionAriaLabel")}><span className="relationship-entity"><b>{entityNamesById[selectedRelationship.source_entity_id] || t("legal.graph.relationship.unknownSource")}</b><code>{String(selectedRelationship.source_entity_id).slice(0, 8)}</code></span><span aria-hidden="true">→</span><span className="relationship-entity"><b>{entityNamesById[selectedRelationship.target_entity_id] || t("legal.graph.relationship.unknownTarget")}</b><code>{String(selectedRelationship.target_entity_id).slice(0, 8)}</code></span></div>{selectedRelationship.sources?.length ? <div className="legal-evidence"><b>{t("legal.graph.relationship.evidenceHeading")}</b>{selectedRelationship.sources.map(source => <details key={`${source.document_id}-${source.excerpt}`}><summary>{source.title}</summary><p>{source.excerpt || t("legal.inspector.noExcerpt")}</p></details>)}</div> : <p className="section-copy">{t("legal.graph.relationship.noEvidence")}</p>}{selectedRelationship.origin === "ai_suggestion" && selectedRelationship.review_status === "suggested" ? <div className="preview-actions"><Button label={t("legal.graph.relationship.approve")} type="button" variant="primary" onClick={() => reviewLegalRelationship(selectedRelationship.id, "verified")}/><Button label={t("legal.graph.relationship.reject")} type="button" variant="destructive" onClick={() => reviewLegalRelationship(selectedRelationship.id, "rejected")}/></div> : (!isLegalGraph || legalGraphView === "manual") && <><DesignSystemSelect label={t("legal.graph.relationship.typeLabel")} value={editRelationshipType} onChange={setEditRelationshipType} options={RELATIONSHIP_TYPES.map(type => ({value: type, label: relationshipLabel(labels, type)}))} size="md"/><Button label={t("legal.graph.relationship.save")} type="submit" variant="primary"/><Button label={t("legal.graph.relationship.delete")} type="button" variant="destructive" onClick={deleteSelectedRelationship}/></>}</form> : null}{graphNotice && <p className="graph-notice" role="status">{graphNotice}</p>}</aside></div>
@@ -1641,7 +1935,7 @@ function LegalInstrumentCard({instrument, onUpdate}) {
   </div>;
 }
 
-function DocumentPreview({preview, jobs, templates, legalInstrument, onExtractLegal, onSaveLegal, onDeleteLegal, onSaveDocumentMetadata, onUpdateLegalInstrument, onClose}) {
+function DocumentPreview({preview, jobs, isPollingJobs, pollingError, templates, legalInstrument, onExtractLegal, onSaveLegal, onDeleteLegal, onSaveDocumentMetadata, onUpdateLegalInstrument, onClose}) {
   const {t} = useLanguage();
   const [editingLegal, setEditingLegal] = useState(false);
   const [legalDraft, setLegalDraft] = useState("");
@@ -1652,8 +1946,12 @@ function DocumentPreview({preview, jobs, templates, legalInstrument, onExtractLe
   const headingRef = useRef(null);
   const modalRef = useRef(null);
   const hasLegalMetadata = Boolean(preview.legal_metadata && Object.keys(preview.legal_metadata).length);
-  useEffect(() => { setEditingLegal(false); setLegalError(""); setLegalDraft(JSON.stringify(preview.legal_metadata || {articles: [], amendments: []}, null, 2)); setTab("content"); }, [preview.document_id, preview.legal_metadata]);
-  useEffect(() => { setEditingMetadata(false); setMetadataDraft(preview.document_metadata || {}); }, [preview.document_id, preview.document_metadata]);
+  const hasActiveExtraction = jobs.some(job => job.type === "EXTRACT_LEGAL_METADATA" && isActiveProcessingJob(job));
+  const isExtracting = hasActiveExtraction || isPollingJobs;
+  useEffect(() => { setEditingLegal(false); setLegalError(""); setTab("content"); }, [preview.document_id]);
+  useEffect(() => { if (!editingLegal) setLegalDraft(JSON.stringify(preview.legal_metadata || {articles: [], amendments: []}, null, 2)); }, [preview.legal_metadata, editingLegal]);
+  useEffect(() => { setEditingMetadata(false); }, [preview.document_id]);
+  useEffect(() => { if (!editingMetadata) setMetadataDraft(preview.document_metadata || {}); }, [preview.document_metadata, editingMetadata]);
   useEffect(() => {
     headingRef.current?.focus();
     const handleKeyDown = event => {
@@ -1696,14 +1994,14 @@ function DocumentPreview({preview, jobs, templates, legalInstrument, onExtractLe
   const tabs = [["content", t("documentPreview.tabs.content")], ["metadata", t("documentPreview.tabs.metadata")], ["legal", t("documentPreview.tabs.legal")], ["activity", t("documentPreview.tabs.activity")]];
   return <div className="document-preview-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <div ref={modalRef} className="document-preview-modal" role="dialog" aria-modal="true" aria-labelledby="document-preview-title" onMouseDown={event => event.stopPropagation()}>
-      <div className="preview-heading"><div><p className="eyebrow">{t("documentPreview.eyebrow")}</p><h2 id="document-preview-title" tabIndex={-1} ref={headingRef}>{preview.title}</h2></div><div className="preview-actions"><StatusBadge status={preview.status}/>{preview.status === "completed" && <Button label={t("documentPreview.extractLegalMetadata")} size="sm" variant="secondary" onClick={() => onExtractLegal({id: preview.document_id, title: preview.title})}/>}<button type="button" className="drawer-close" onClick={onClose} aria-label={t("documentPreview.closeAriaLabel")}>×</button></div></div>
+      <div className="preview-heading"><div><p className="eyebrow">{t("documentPreview.eyebrow")}</p><h2 id="document-preview-title" tabIndex={-1} ref={headingRef}>{preview.title}</h2></div><div className="preview-actions"><StatusBadge status={preview.status}/>{isExtracting && <span className="live-status" role="status" aria-live="polite">{t("documentPreview.extractingMetadata")}</span>}{preview.status === "completed" && <Button label={isExtracting ? t("documentPreview.extractingMetadata") : t("documentPreview.extractLegalMetadata")} size="sm" variant="secondary" isLoading={isExtracting} isDisabled={isExtracting} onClick={() => onExtractLegal({id: preview.document_id, title: preview.title})}/>}<button type="button" className="drawer-close" onClick={onClose} aria-label={t("documentPreview.closeAriaLabel")}>×</button></div></div>
       {preview.error_code && <p className="inline-error">{preview.error_code}</p>}
       <nav className="document-preview-tabs" role="tablist" aria-label={t("documentPreview.sectionsAriaLabel")}>{tabs.map(([value, label]) => <button type="button" role="tab" aria-selected={tab === value} className={tab === value ? "selected" : ""} key={value} onClick={() => setTab(value)}>{label}</button>)}</nav>
       <div className="document-preview-tab-panel">
         {tab === "content" && <pre className="excerpt">{preview.text || t("documentPreview.content.placeholder")}</pre>}
         {tab === "metadata" && (hasDocumentFields ? <div className="document-metadata-panel"><div className="preview-heading"><div><h3>{preview.metadata_template_name || t("documentPreview.metadata.defaultTitle")}</h3><p className="section-copy">{t("documentPreview.metadata.helpText")}</p></div>{!editingMetadata && <Button label={t("documentPreview.metadata.editFields")} size="sm" variant="secondary" onClick={() => setEditingMetadata(true)}/>}</div>{editingMetadata ? <form onSubmit={saveMetadata}><MetadataFields fields={documentFields} values={metadataDraft} onChange={setMetadataDraft}/><div className="preview-actions"><Button label={t("documentPreview.metadata.saveFields")} type="submit" variant="primary"/><Button label={t("common.cancel")} type="button" variant="ghost" onClick={() => { setMetadataDraft(preview.document_metadata || {}); setEditingMetadata(false); }}/></div></form> : <dl className="document-metadata-values">{documentFields.filter(field => preview.document_metadata?.[field.key] !== undefined && preview.document_metadata?.[field.key] !== "").map(field => <div key={field.key}><dt>{field.label}</dt><dd>{String(preview.document_metadata[field.key])}</dd></div>)}</dl>}</div> : <p className="section-copy">{t("documentPreview.metadata.noFields")}</p>)}
         {tab === "legal" && <div className="legal-metadata-panel">{legalInstrument && <LegalInstrumentCard instrument={legalInstrument} onUpdate={onUpdateLegalInstrument}/>}<div className="legal-metadata-heading"><div><h3>{t("documentPreview.legal.heading")}</h3><p className="section-copy">{t("documentPreview.legal.description")}</p></div>{!editingLegal && <div className="legal-metadata-actions"><Button label={hasLegalMetadata ? t("documentPreview.legal.editMetadata") : t("documentPreview.legal.addMetadata")} size="sm" variant="secondary" onClick={startEditing}/>{hasLegalMetadata && <Button label={t("documentPreview.legal.deleteMetadata")} size="sm" variant="destructive" onClick={() => onDeleteLegal({id: preview.document_id, title: preview.title})}/>}</div>}</div>{editingLegal ? <form className="legal-editor" onSubmit={save}><textarea aria-label={t("documentPreview.legal.jsonAriaLabel")} value={legalDraft} onChange={event => setLegalDraft(event.target.value)} rows={18} spellCheck="false"/><p className="section-copy">{t("documentPreview.legal.helpPart1")} <code>instrument</code>, <code>provisions</code> {t("documentPreview.legal.helpPart2")} <code>references</code> {t("documentPreview.legal.helpPart3")} <code>evidence_quote</code>{t("documentPreview.legal.helpPart4")}</p>{legalError && <p className="inline-error" role="alert">{legalError}</p>}<div className="preview-actions"><Button label={t("documentPreview.legal.saveMetadata")} type="submit" variant="primary"/><Button label={t("common.cancel")} type="button" variant="ghost" onClick={() => setEditingLegal(false)}/></div></form> : hasLegalMetadata ? <pre className="excerpt legal-metadata">{JSON.stringify(preview.legal_metadata, null, 2)}</pre> : <p className="section-copy">{t("documentPreview.legal.emptyState", {addLabel: t("documentPreview.legal.addMetadata"), extractLabel: t("documentPreview.extractLegalMetadata")})}</p>}</div>}
-        {tab === "activity" && (jobs.length ? <div className="job-list">{jobs.map(job => <div key={job.id}><span>{job.type || t("documentPreview.activity.defaultType")} · {job.stage || t("documentPreview.activity.queued")}{job.attempt_count ? t("documentPreview.activity.attemptSuffix", {count: job.attempt_count}) : ""}{job.error_code ? ` · ${job.error_code}` : ""}{job.error_message ? `: ${job.error_message}` : ""}</span><StatusBadge status={job.status}/><span>{job.progress_percent}%</span></div>)}</div> : <p className="section-copy">{t("documentPreview.activity.noJobs")}</p>)}
+        {tab === "activity" && <>{pollingError && <p className="inline-error" role="alert">{pollingError}</p>}{isPollingJobs && <p className="live-status" role="status" aria-live="polite">{t("documentPreview.activity.refreshing")}</p>}{jobs.length ? <div className="job-list">{jobs.map(job => <div key={job.id}><span>{job.type || t("documentPreview.activity.defaultType")} · {job.stage || t("documentPreview.activity.queued")}{job.attempt_count ? t("documentPreview.activity.attemptSuffix", {count: job.attempt_count}) : ""}{job.error_code ? ` · ${job.error_code}` : ""}{job.error_message ? `: ${job.error_message}` : ""}</span><StatusBadge status={job.status}/><span>{job.progress_percent}%</span></div>)}</div> : <p className="section-copy">{t("documentPreview.activity.noJobs")}</p>}</>}
       </div>
     </div>
   </div>;

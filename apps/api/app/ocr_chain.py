@@ -28,9 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import base64
-import json
 import logging
-import re
 import shutil
 import subprocess
 import tempfile
@@ -127,8 +125,12 @@ class SoftnixOcrEngine:
             status_response = self.client.get(f"/v3/ai-process-file/{job_id}/status")
             status_response.raise_for_status()
             payload = status_response.json()
+            if not isinstance(payload, dict):
+                raise ValueError(f"unexpected status payload: {type(payload).__name__}")
             state = payload.get("status")
-            progress = payload.get("progress") or {}
+            progress = payload.get("progress")
+            if not isinstance(progress, dict):
+                progress = {}
             if state in {"completed", "partial_success"}:
                 return self._result(job_id)
             if state in {"failed", "cancelled"}:
@@ -208,20 +210,25 @@ class TesseractOcrEngine:
         return binary
 
     def recognize(self, image: bytes, page: int) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
-            handle.write(image)
-            path = Path(handle.name)
         try:
-            result = subprocess.run(  # noqa: S603 - fixed binary, fixed args
-                [self._binary(), str(path), "stdout", "-l", "tha+eng", "--oem", "1"],
-                capture_output=True,
-                text=True,
-                timeout=self.settings.tesseract_timeout_seconds,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+                handle.write(image)
+                path = Path(handle.name)
+            try:
+                result = subprocess.run(  # noqa: S603 - fixed binary, fixed args
+                    [self._binary(), str(path), "stdout", "-l", "tha+eng", "--oem", "1"],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=self.settings.tesseract_timeout_seconds,
+                )
+            finally:
+                path.unlink(missing_ok=True)
+        except (subprocess.TimeoutExpired, OSError, UnicodeDecodeError) as exc:
+            # TimeoutExpired: page budget blown; OSError: spawn/disk/temp-file
+            # failures (FileNotFoundError is a subclass); UnicodeDecodeError:
+            # non-UTF8 bytes on stdout despite errors="replace" guards.
             raise OcrChainError([f"tesseract: {type(exc).__name__}"]) from exc
-        finally:
-            path.unlink(missing_ok=True)
         if result.returncode != 0:
             raise OcrChainError([f"tesseract: exit {result.returncode}"])
         return result.stdout
@@ -235,40 +242,100 @@ def _parse_engine_order(raw: str | None) -> tuple[str, ...]:
     return names or DEFAULT_CHAIN_ENGINES
 
 
+# Sentinel distinguishing "not configured" (cached negative) from a cached engine.
+_NOT_CONFIGURED = object()
+
+
 @dataclass
 class OcrChain:
-    """Engines in configured order; first non-empty text wins per page."""
+    """Engines in configured order; first non-empty text wins per page.
+
+    Engines (and their httpx clients) are built lazily once and cached for
+    the chain's lifetime — one recognize() call serves one page, and a
+    hundred-page document must not construct a fresh connection pool per
+    page. Callers should use ``close()``/the context manager when done,
+    typically one chain per document conversion.
+    """
 
     settings: Settings
     on_progress: ProgressCallback | None = None
     engine_order: tuple[str, ...] = field(default_factory=tuple)
     clients: dict[str, httpx.Client] = field(default_factory=dict)
+    _engines: dict[str, object] = field(default_factory=dict, repr=False)
+    _clients_owned: set[str] = field(default_factory=set, repr=False)
 
     def __post_init__(self) -> None:
         if not self.engine_order:
             self.engine_order = _parse_engine_order(self.settings.ocr_chain_engines)
 
     def _build_engine(self, name: str):
+        cached = self._engines.get(name)
+        if cached is _NOT_CONFIGURED:
+            return None
+        if cached is not None:
+            return cached
+        engine = None
+        client = None
         if name == "softnix":
-            if not (self.settings.softnix_ocr_base_url and self.settings.softnix_ocr_token):
-                return None  # not configured -> skip with a log
-            return SoftnixOcrEngine(self.settings, self.clients.get("softnix"), self.on_progress)
-        if name == "mistral":
-            if not self.settings.mistral_api_key:
-                return None
-            return MistralOcrEngine(self.settings, self.clients.get("mistral"))
-        return TesseractOcrEngine(self.settings)
+            if self.settings.softnix_ocr_base_url and self.settings.softnix_ocr_token:
+                client = self.clients.get("softnix") or httpx.Client(
+                    base_url=self.settings.softnix_ocr_base_url.rstrip("/"),
+                    headers={"Authorization": f"Bearer {self.settings.softnix_ocr_token}"},
+                    verify=not self.settings.softnix_ocr_insecure_tls,
+                    timeout=httpx.Timeout(self.settings.softnix_ocr_request_timeout_seconds),
+                )
+                engine = SoftnixOcrEngine(self.settings, client, self.on_progress)
+        elif name == "mistral":
+            if self.settings.mistral_api_key:
+                client = self.clients.get("mistral") or httpx.Client(
+                    base_url="https://api.mistral.ai/v1",
+                    headers={"Authorization": f"Bearer {self.settings.mistral_api_key}"},
+                    timeout=httpx.Timeout(self.settings.mistral_ocr_timeout_seconds),
+                )
+                engine = MistralOcrEngine(self.settings, client)
+        else:
+            engine = TesseractOcrEngine(self.settings)
+        # Remember which clients this chain owns so close() releases them;
+        # externally supplied clients (tests) stay untouched.
+        if engine is not None and client is not None and name not in self.clients:
+            self.clients[name] = client
+            self._clients_owned.add(name)
+        self._engines[name] = engine if engine is not None else _NOT_CONFIGURED
+        return engine
+
+    def close(self) -> None:
+        """Close httpx clients this chain created (external ones are kept)."""
+        for name in list(self._clients_owned):
+            client = self.clients.pop(name, None)
+            if client is not None:
+                client.close()
+            self._clients_owned.discard(name)
+
+    def __enter__(self) -> "OcrChain":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def engine_names(self) -> list[str]:
-        """Configured engines that are actually usable right now."""
-        names: list[str] = []
+        """Configured engines that are actually usable right now.
+
+        Pure configuration check — never constructs engines or httpx
+        clients, so probing readiness cannot leak resources.
+        """
+        usable = []
         for name in self.engine_order:
-            engine = self._build_engine(name)
-            if engine is None:
-                logger.info("OCR engine '%s' not configured; skipping", name)
+            if name == "softnix":
+                ok = bool(self.settings.softnix_ocr_base_url and self.settings.softnix_ocr_token)
+            elif name == "mistral":
+                ok = bool(self.settings.mistral_api_key)
             else:
-                names.append(name)
-        return names
+                ok = True  # tesseract: availability checked at use time
+            if ok:
+                usable.append(name)
+            else:
+                logger.info("OCR engine '%s' not configured; skipping", name)
+        return usable
 
     def recognize(self, image: bytes, page: int) -> str:
         attempts: list[str] = []

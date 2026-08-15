@@ -205,6 +205,39 @@ def test_build_recognizer_uses_global_settings():
     assert recognizer.engine_order[0] == "softnix"
 
 
+def test_engines_and_clients_are_reused_across_pages():
+    """Regression: the chain must not build a fresh engine/httpx client per
+    page — a hundred-page scan would leak a connection pool per page."""
+    chain = _chain(_settings())
+    softnix_first = chain._build_engine("softnix")
+    mistral_first = chain._build_engine("mistral")
+    assert chain._build_engine("softnix") is softnix_first
+    assert chain._build_engine("mistral") is mistral_first
+    # unconfigured engines stay cached as "not configured" too
+    unconfigured = OcrChain(_settings(mistral_api_key=""), clients={})
+    assert unconfigured._build_engine("mistral") is None
+    assert unconfigured._build_engine("mistral") is None
+
+
+def test_close_releases_clients_the_chain_created():
+    chain = OcrChain(_settings(), clients={})  # no external clients
+    softnix = chain._build_engine("softnix")
+    mistral = chain._build_engine("mistral")
+    external = httpx.Client(base_url="https://softnix.test")
+    chain_with_external = OcrChain(_settings(), clients={"softnix": external})
+    external_engine = chain_with_external._build_engine("softnix")
+
+    chain.close()
+    chain_with_external.close()
+
+    # owned clients are closed and dropped; the external one is untouched
+    assert "softnix" not in chain.clients and "mistral" not in chain.clients
+    softnix_client = getattr(softnix, "client")
+    mistral_client = getattr(mistral, "client")
+    assert softnix_client.is_closed and mistral_client.is_closed
+    assert not external.is_closed and getattr(external_engine, "client") is external
+
+
 def test_mistral_payload_is_base64_data_uri():
     seen: dict[str, str] = {}
 
@@ -225,3 +258,47 @@ def test_mistral_payload_is_base64_data_uri():
     prefix, _, payload = seen["image_url"].partition(",")
     assert prefix == "data:image/png;base64"
     assert base64.b64decode(payload) == b"PNGDATA"
+
+
+def test_engine_internal_errors_stay_inside_the_chain_contract(monkeypatch):
+    """Non-OcrChainError engine failures must surface as OcrChainError from
+    chain.recognize — the anydoc callback contract allows nothing else."""
+    from app.ocr_chain import SoftnixOcrEngine, TesseractOcrEngine, OcrChainError
+
+    # Softnix: non-dict 'progress' payload must not raise AttributeError.
+    def weird(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/v3/ai-process-file"):
+            return httpx.Response(200, json={"job_id": "job-x"})
+        if request.url.path.endswith("/job-x/status"):
+            return httpx.Response(200, json={"status": "processing", "progress": 42})
+        raise AssertionError(request.url.path)
+
+    engine = SoftnixOcrEngine(
+        _settings(),
+        httpx.Client(base_url="https://softnix.test", transport=httpx.MockTransport(weird)),
+    )
+    try:
+        engine.recognize(b"png", 1)
+        raised = None
+    except Exception as exc:  # noqa: BLE001 - contract test
+        raised = exc
+    assert isinstance(raised, OcrChainError), f"expected OcrChainError, got {type(raised).__name__}"
+
+    # Tesseract: binary present but subprocess dies with OSError-ish failure
+    # (simulate via a broken PATH lookup raising inside _binary).
+    tess = TesseractOcrEngine(_settings(tesseract_timeout_seconds=2))
+    monkeypatch.setattr(tess, "_binary", lambda: (_ for _ in ()).throw(OSError("spawn failed")))
+    try:
+        tess.recognize(b"png", 1)
+        raised = None
+    except Exception as exc:  # noqa: BLE001 - contract test
+        raised = exc
+    assert isinstance(raised, OcrChainError), f"expected OcrChainError, got {type(raised).__name__}"
+
+
+def test_engine_names_is_a_pure_config_check():
+    """Probing usable engines must not construct httpx clients."""
+    settings = _settings(mistral_api_key="")
+    chain = OcrChain(settings, clients={})
+    assert chain.engine_names() == ["softnix", "tesseract"]
+    assert chain.clients == {} and not chain._engines  # nothing was built

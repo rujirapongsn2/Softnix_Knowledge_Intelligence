@@ -14,7 +14,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from .config import get_settings
 from .ocr_chain import build_recognizer
 
 ProgressCallback = Callable[[str, int], None]

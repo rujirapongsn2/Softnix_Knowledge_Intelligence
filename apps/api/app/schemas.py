@@ -22,6 +22,7 @@ class KnowledgeBaseCreate(BaseModel):
     # from the display name when omitted, including for non-Latin names.
     code: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{1,118}[a-z0-9]$")
     description: str | None = None
+    icon: Literal["auto", "database", "book", "document", "policy", "legal", "court", "agency"] = "auto"
     default_language: str = "auto"
     entity_schema: dict[str, Any] = Field(default_factory=dict)
     relationship_schema: dict[str, Any] = Field(default_factory=dict)
@@ -32,9 +33,14 @@ class KnowledgeBaseOut(ORMModel):
     code: str
     name: str
     description: str | None
+    icon: str
     default_language: str
     status: str
     retrieval_config: dict[str, Any]
+
+
+class KnowledgeBaseIconUpdate(BaseModel):
+    icon: Literal["auto", "database", "book", "document", "policy", "legal", "court", "agency"]
 
 
 class RetrievalConfigUpdate(BaseModel):

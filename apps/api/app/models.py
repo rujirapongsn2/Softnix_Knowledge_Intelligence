@@ -33,6 +33,9 @@ class KnowledgeBase(Timestamped, Base):
     code: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # A small, allow-listed UI key.  The browser maps it to its own inline SVG
+    # rather than accepting user-supplied markup or external image URLs.
+    icon: Mapped[str] = mapped_column(String(40), default="auto")
     default_language: Mapped[str] = mapped_column(String(20), default="auto")
     status: Mapped[str] = mapped_column(String(20), default="draft")
     retrieval_config: Mapped[dict] = mapped_column(JSON, default=dict)

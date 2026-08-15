@@ -95,12 +95,31 @@ class LightRAGRetrievalEngine(RetrievalEngine):
             if self._client is None:
                 client.close()
 
+    @staticmethod
+    def _scoped_document_text(knowledge_base_id: str, text: str) -> str:
+        """Prefix the protected text with a Knowledge Base identity header.
+
+        LightRAG deduplicates inserted documents by a **global** content hash
+        that ignores ``file_source`` and any Knowledge Base identity. The same
+        document legitimately belongs to more than one Knowledge Base, and
+        without this header a re-ingest into a second Knowledge Base is
+        rejected as ``[DUPLICATE:content_hash]`` against the copy still living
+        under the first one. Scoping the hashed content per Knowledge Base
+        makes identical text in two Knowledge Bases hash differently, while a
+        true duplicate within a single Knowledge Base still collides and is
+        deduplicated exactly as before.
+        """
+        return f"[softnix-kb:{knowledge_base_id}]\n{protect_document_text(text)}"
+
     def ingest(self, document_id: str, knowledge_base_id: str, text: str, title: str) -> str | None:
         # LightRAG Server v1.5's InsertTextRequest accepts only text,
         # file_source, and optional chunking. LightRAG reduces this to its
         # basename in references, so keep platform identifiers in that basename.
         source_label = self._source_label(knowledge_base_id, document_id, title)
-        payload = {"text": protect_document_text(text), "file_source": f"skip/{knowledge_base_id}/{source_label}"}
+        payload = {
+            "text": self._scoped_document_text(knowledge_base_id, text),
+            "file_source": f"skip/{knowledge_base_id}/{source_label}",
+        }
         try:
             data = self._request("POST", "/documents/text", json=payload)
         except RuntimeError as exc:

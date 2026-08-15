@@ -151,13 +151,15 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
 ```
 
 **`status` ของเอกสาร** คือสิ่งที่ควรใช้ตัดสินว่างานจบหรือยัง — สถานะสุดท้ายคือ `completed`,
-`failed` หรือ `ocr_required` (ต้องตั้งค่า OCR แล้วสั่ง reprocess เอง ระบบจะไม่ retry ให้)
+`failed` หรือ `ocr_required` (เกิดเฉพาะเมื่อปิด OCR chain ทั้งหมด ให้ตั้งค่าแล้วสั่ง reprocess เอง
+ระบบจะไม่ retry ให้)
 ส่วน `queued`/`extracting` คือกำลังทำงานอยู่ และ `latest_job.stage`/`progress_percent` มีไว้แสดง
 ความคืบหน้าระหว่างทางเท่านั้น อย่าใช้เป็นเงื่อนไขว่างานเสร็จ
 
 `attempt_count` มากกว่า 1 หมายถึงงานถูก retry อัตโนมัติแบบ exponential backoff ยังไม่ถือว่าล้มเหลว
-เมื่อ `status` เป็น `failed` ให้ดู `error_code` ประกอบ เช่น `OCR_REQUIRED` (PDF เป็นภาพสแกน
-ต้องตั้งค่า OCR ก่อน) หรือ `TEXT_EXTRACTION_FAILED`
+เมื่อ `status` เป็น `failed` ให้ดู `error_code` ประกอบ เช่น `OCR_CHAIN_FAILED` (ทุก engine ใน
+chain ล้ม — ดู log ของ worker ว่า Softnix/Mistral/Tesseract ตัวไหนพร้อมใช้) `OCR_REQUIRED`
+(ปิด chain ไว้ทั้งหมด) หรือ `TEXT_EXTRACTION_FAILED`
 
 ### ประวัติ job ของเอกสาร
 
@@ -322,8 +324,11 @@ if (documentId) console.log(await waitFor(documentId));
 MIME type ที่ส่งมาต้องตรงกับนามสกุล (ส่ง `application/octet-stream` ได้ ระบบจะเดาจากนามสกุลให้)
 ขนาดสูงสุดกำหนดด้วย `MAX_FILE_SIZE_MB` (ค่าเริ่มต้น 100 MB)
 
-PDF ที่เป็นภาพสแกนต้องมี OCR — ถ้าไม่ได้ตั้งค่าไว้ เอกสารจะขึ้น `status: failed` พร้อม
-`error_code: OCR_REQUIRED` รายละเอียดดู [README](../README.md)
+PDF ที่เป็นภาพสแกน (หรือฟอนต์ไทยพัง) จะถูกส่งเข้า OCR chain อัตโนมัติ:
+**Softnix OCR → Mistral OCR → Tesseract (tha+eng)** ตามลำดับ — หน้าที่ engine แรก
+ล้มหรือค้างเกิน `SOFTNIX_OCR_STALL_SECONDS` (ค่าเริ่มต้น 45 วิ) จะตกไป engine ถัดไป
+ทันที ตั้งค่าผ่าน `SOFTNIX_OCR_*`, `MISTRAL_API_KEY` และ `OCR_CHAIN_ENGINES`
+รายละเอียดดู [README](../README.md)
 
 ## Rotate และ revoke
 

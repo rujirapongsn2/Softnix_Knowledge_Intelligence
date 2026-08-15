@@ -12,13 +12,11 @@ from bs4 import BeautifulSoup
 from docx import Document as WordDocument
 import httpx
 from markitdown import MarkItDown
-from pypdf import PdfReader
 from sqlalchemy import Text, and_, cast, func, or_
 from sqlalchemy.orm import Session, aliased
 
 from .config import get_settings
 from .db import SessionLocal
-from .external_ocr import ExternalOcrClient
 from .graph_store import Neo4jGraphStore
 from .legal_registry import AUTHORITY_LEVELS, classify_kind, normalize_family_key, parse_provision_refs, parse_thai_date, provision_number_matches, resolve_instrument_statuses
 from .legal_resolver import resolve_legal_context
@@ -51,7 +49,7 @@ DEFAULT_RETRIEVAL_CONFIG = {
 }
 TRANSIENT_PROCESSING_ERRORS = {
     "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY",
-    "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_TIMEOUT",
+    "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_TIMEOUT", "OCR_CHAIN_FAILED",
 }
 MAX_PROCESSING_ATTEMPTS = 3
 logger = logging.getLogger(__name__)
@@ -1853,11 +1851,10 @@ def _legacy_extract_text(path: Path) -> str:
     if ext == ".docx":
         return "\n".join(p.text for p in WordDocument(path).paragraphs)
     if ext == ".pdf":
-        reader = PdfReader(path)
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        if len(text.strip()) < 20:
-            raise RuntimeError("OCR_REQUIRED")
-        return text
+        # PDF extraction is owned by the anydoc pipeline (Rust + OCR chain).
+        # Without the wheel there is no safe local PDF fallback left: pypdf
+        # was removed with the legacy pipeline it served.
+        raise RuntimeError("ANYDOC_UNAVAILABLE")
     raise RuntimeError("FILE_TYPE_NOT_SUPPORTED")
 
 
@@ -1871,12 +1868,105 @@ def _has_meaningful_text(text: str) -> bool:
     return len(re.sub(r"[\W_]+", "", text, flags=re.UNICODE)) >= 20
 
 
+def _thai_ratio(text: str) -> float:
+    """Share of characters that are Thai. Mojibake of Thai text renders as
+    Latin/graphic glyphs, so a Thai document whose ratio is ~0 carries no
+    usable text layer even though it passes a bare character count."""
+    if not text:
+        return 0.0
+    thai = sum(1 for ch in text if "\u0e00" <= ch <= "\u0e7f")
+    return thai / len(text)
+
+
+def _non_ascii_ratio(text: str) -> float:
+    """Share of characters outside printable ASCII. Genuine English (or any
+    plain-ASCII) document stays near zero; Thai text read through a Latin
+    glyph table turns almost every character into an extended one."""
+    if not text:
+        return 0.0
+    plain = sum(1 for ch in text if 0x20 <= ord(ch) < 0x7f or ch in "\n\t")
+    return 1.0 - plain / len(text)
+
+
+# A Thai PDF whose text layer carries no Thai at all but plenty of extended
+# Latin glyphs is presumed garbled mojibake. Plain-ASCII documents (English)
+# are unaffected: they carry almost no extended characters. A short extract
+# (headers, page numbers) is too small to judge, so only longer layers are
+# checked.
+_MIN_TEXT_FOR_LANGUAGE_CHECK = 200
+_MAX_THAI_RATIO_FOR_GARBLED = 0.02
+_MIN_NON_ASCII_RATIO_FOR_GARBLED = 0.30
+
+# Broken PDF font mappings observed in the wild: TIS-620 bytes surfaced
+# through a mac-roman glyph table. Round-tripping the visible text through
+# that pair recovers the original deterministically, without OCR.
+_CODEC_RECOVERY_PAIRS: tuple[tuple[str, str], ...] = (
+    ("mac_roman", "tis-620"),
+    ("cp1252", "utf-8"),
+)
+
+
+def _try_codec_recovery(text: str) -> str | None:
+    """Repair mojibake by reversing a known wrong-decode, if one fits.
+
+    Returns the recovered text when a candidate pair yields a dramatically
+    higher Thai ratio than the input; ``None`` when nothing fits (caller
+    keeps the original or falls back to OCR).
+    """
+    original_ratio = _thai_ratio(text)
+    for source_codec, target_codec in _CODEC_RECOVERY_PAIRS:
+        try:
+            recovered = text.encode(source_codec, errors="strict").decode(target_codec, errors="strict")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        recovered_ratio = _thai_ratio(recovered)
+        # Only accept when the fix is decisive: the input carried no usable
+        # Thai and the round trip restores a substantial share of it.
+        if original_ratio < _MAX_THAI_RATIO_FOR_GARBLED and recovered_ratio > 0.15:
+            return recovered
+    return None
+
+
+def _repair_or_flag_pdf_text(text: str) -> str:
+    """Gate a PDF text layer: repair known mojibake, else demand OCR.
+
+    1. Deterministic codec recovery (e.g. TIS-620 read as mac-roman) when it
+       clearly restores Thai text.
+    2. Otherwise, when the layer is long, carries (almost) no Thai, and is
+       dominated by extended glyphs — the signature of Thai read through a
+       broken font mapping — it is garbled and OCR must produce the text.
+       Plain-ASCII layers (English documents) pass through untouched.
+    """
+    if len(text) < _MIN_TEXT_FOR_LANGUAGE_CHECK:
+        return text if _has_meaningful_text(text) else ""
+    recovered = _try_codec_recovery(text)
+    if recovered is not None:
+        return recovered
+    if _thai_ratio(text) < _MAX_THAI_RATIO_FOR_GARBLED and _non_ascii_ratio(text) >= _MIN_NON_ASCII_RATIO_FOR_GARBLED:
+        return ""
+    return text
+
+
 def extract_text(document: Document) -> str:
     path = Path(document.storage_path)
     ext = path.suffix.lower()
+    # anydoc fast path: Rust conversion + per-page OCR chain for scanned or
+    # garbled pages, then the Thai-repair gate. HTML family stays legacy
+    # (anydoc has no HTML parser); when the wheel is missing the legacy
+    # extractors still serve every other format as a safety net.
+    if ext not in {".html", ".htm"}:
+        try:
+            from .doc_extraction import extract_document_text
+            return extract_document_text(document)
+        except RuntimeError as exc:
+            if str(exc) != "ANYDOC_UNAVAILABLE":
+                raise  # OCR_CHAIN_FAILED / TEXT_EXTRACTION_EMPTY are terminal here.
+        # fall through to the legacy extractors when the wheel is missing
     try:
         text = _markitdown_extract(path)
-        if ext == ".pdf" and not _has_meaningful_text(text):
+        if ext == ".pdf":
+            text = _repair_or_flag_pdf_text(text)
+        if ext == ".pdf" and not text:
             raise RuntimeError("OCR_REQUIRED")
         if text:
             return text
@@ -1890,7 +1980,9 @@ def extract_text(document: Document) -> str:
     if ext in LEGACY_EXTRACTOR_EXTENSIONS:
         try:
             text = _legacy_extract_text(path)
-            if ext == ".pdf" and not _has_meaningful_text(text):
+            if ext == ".pdf":
+                text = _repair_or_flag_pdf_text(text)
+            if ext == ".pdf" and not text:
                 raise RuntimeError("OCR_REQUIRED")
             if text.strip():
                 return text
@@ -1899,18 +1991,6 @@ def extract_text(document: Document) -> str:
         except Exception as exc:
             raise RuntimeError("TEXT_EXTRACTION_FAILED") from exc
     raise RuntimeError("TEXT_EXTRACTION_FAILED") from primary_error
-
-
-def extract_scanned_pdf_with_external_ocr(document: Document, job: ProcessingJob, db: Session) -> str:
-    """Use the remote OCR service only after local PDF text-layer extraction fails."""
-    settings = get_settings()
-    client = ExternalOcrClient(settings)
-
-    def progress(stage: str, percent: int) -> None:
-        job.current_stage, job.progress_percent = stage, percent
-        db.commit()
-
-    return client.extract_markdown(Path(document.storage_path), progress)
 
 
 def split_text(text: str, chunk_size: int, overlap: int) -> list[tuple[int, int, str]]:
@@ -2097,14 +2177,10 @@ def process_next_job(db: Session) -> bool:
         if (reindex_only or legal_only) and doc.extracted_text:
             text = doc.extracted_text
         else:
-            try:
-                text = extract_text(doc)
-            except RuntimeError as exc:
-                if str(exc) != "OCR_REQUIRED" or not get_settings().ext_ocr_key:
-                    raise
-                job.current_stage, job.progress_percent = "external_ocr_submit", 12
-                db.commit()
-                text = extract_scanned_pdf_with_external_ocr(doc, job, db)
+            # anydoc path (extract_text) runs the OCR chain internally per
+            # page, so a scanned PDF never surfaces OCR_REQUIRED from here
+            # anymore; the code remains for the legacy MarkItDown fallback.
+            text = extract_text(doc)
         if not reindex_only:
             doc.extracted_text = text
         if legal_only:
@@ -2187,7 +2263,7 @@ def process_next_job(db: Session) -> bool:
                 ))
         job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
     except Exception as exc:
-        code = str(exc) if str(exc) in {"OCR_REQUIRED", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"} else "TEXT_EXTRACTION_FAILED"
+        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
         logger.exception("document processing failed", extra={"document_id": doc.id, "job_id": job.id, "error_code": code})
         message = "The document could not be processed."
         job.error_code, job.error_message = code, message

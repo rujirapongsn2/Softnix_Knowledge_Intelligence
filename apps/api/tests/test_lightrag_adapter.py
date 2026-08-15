@@ -12,7 +12,7 @@ def test_lightrag_adapter_ingests_and_maps_citations():
         requests.append(request)
         if request.url.path == "/documents/text":
             payload = json.loads(request.content)
-            assert payload == {"text": "Customer Portal is hosted on APP-01.", "file_source": "skip/kb-1/softnix-kb=kb-1__doc=doc-1__Architecture"}
+            assert payload == {"text": "[softnix-kb:kb-1]\nCustomer Portal is hosted on APP-01.", "file_source": "skip/kb-1/softnix-kb=kb-1__doc=doc-1__Architecture"}
             return httpx.Response(202, json={"track_id": "track-1"})
         return httpx.Response(200, json={"response": "Customer Portal is hosted on APP-01.", "references": [{
             "reference_id": "chunk-7", "file_path": "softnix-kb=kb-1__doc=doc-1__Architecture", "content": ["Customer Portal is hosted on APP-01."], "score": 0.94,

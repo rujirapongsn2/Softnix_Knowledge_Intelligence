@@ -48,14 +48,27 @@ class Settings(BaseSettings):
     openrouter_app_title: str = "Softnix Knowledge Intelligence Platform"
     reranker_enabled: bool = False
     retrieval_planner_timeout_seconds: int = 4
-    ext_ocr_base_url: str = "https://111.223.37.41:9001"
-    ext_ocr_key: str = ""
-    ext_ocr_verify_ssl: bool = False
-    ext_ocr_engine: str = "tesseract"
-    ext_ocr_image_size: int = 1800
-    ext_ocr_request_timeout_seconds: int = 60
-    ext_ocr_processing_timeout_seconds: int = 300
-    ext_ocr_poll_interval_seconds: int = 2
+    # --- OCR chain (anydoc pipeline) -------------------------------------
+    # SOFTNIX_OCR_* / MISTRAL_API_KEY / OCR_CHAIN_ENGINES configure the
+    # Softnix → Mistral → Tesseract fallback chain in app/ocr_chain.py.
+    softnix_ocr_base_url: str = ""
+    softnix_ocr_token: str = ""
+    softnix_ocr_insecure_tls: bool = False
+    # Per-page budget for the whole Softnix job (submit + poll + result).
+    # Kept short because the chain must fall through to Mistral quickly when
+    # the Softnix queue is degraded; a slow queue must not stall a document.
+    softnix_ocr_timeout_seconds: int = 120
+    # HTTP timeout for each individual request (submit/status/result).
+    softnix_ocr_request_timeout_seconds: int = 30
+    # Abort when the job reports no state/progress change for this long —
+    # the known failure mode is a job stuck in "queueing" that never
+    # reports progress and would otherwise burn the whole budget.
+    softnix_ocr_stall_seconds: float = 45.0
+    softnix_ocr_poll_interval_seconds: float = 2.0
+    mistral_api_key: str = ""
+    mistral_ocr_timeout_seconds: int = 60
+    tesseract_timeout_seconds: int = 120
+    ocr_chain_engines: str = "softnix,mistral,tesseract"
 
     @property
     def file_root(self) -> Path:

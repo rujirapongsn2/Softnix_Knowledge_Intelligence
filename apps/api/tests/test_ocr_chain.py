@@ -205,6 +205,39 @@ def test_build_recognizer_uses_global_settings():
     assert recognizer.engine_order[0] == "softnix"
 
 
+def test_engines_and_clients_are_reused_across_pages():
+    """Regression: the chain must not build a fresh engine/httpx client per
+    page — a hundred-page scan would leak a connection pool per page."""
+    chain = _chain(_settings())
+    softnix_first = chain._build_engine("softnix")
+    mistral_first = chain._build_engine("mistral")
+    assert chain._build_engine("softnix") is softnix_first
+    assert chain._build_engine("mistral") is mistral_first
+    # unconfigured engines stay cached as "not configured" too
+    unconfigured = OcrChain(_settings(mistral_api_key=""), clients={})
+    assert unconfigured._build_engine("mistral") is None
+    assert unconfigured._build_engine("mistral") is None
+
+
+def test_close_releases_clients_the_chain_created():
+    chain = OcrChain(_settings(), clients={})  # no external clients
+    softnix = chain._build_engine("softnix")
+    mistral = chain._build_engine("mistral")
+    external = httpx.Client(base_url="https://softnix.test")
+    chain_with_external = OcrChain(_settings(), clients={"softnix": external})
+    external_engine = chain_with_external._build_engine("softnix")
+
+    chain.close()
+    chain_with_external.close()
+
+    # owned clients are closed and dropped; the external one is untouched
+    assert "softnix" not in chain.clients and "mistral" not in chain.clients
+    softnix_client = getattr(softnix, "client")
+    mistral_client = getattr(mistral, "client")
+    assert softnix_client.is_closed and mistral_client.is_closed
+    assert not external.is_closed and getattr(external_engine, "client") is external
+
+
 def test_mistral_payload_is_base64_data_uri():
     seen: dict[str, str] = {}
 

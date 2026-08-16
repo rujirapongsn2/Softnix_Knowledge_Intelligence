@@ -15,6 +15,7 @@ import "./legal-registry.css";
 import "./knowledge-hub.css";
 import "./logging.css";
 import "./documents.css";
+import "./admin.css";
 import "./cloudflare-overrides.css";
 import {connectionHandles} from "./graph-geometry.mjs";
 import {LanguageProvider, useLanguage} from "./language.jsx";

@@ -172,7 +172,8 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
     response.set_cookie("skip_access", create_session_token(user, "access", timedelta(minutes=s.access_token_minutes)), httponly=True, secure=s.cookie_secure, samesite="lax", max_age=s.access_token_minutes * 60)
     response.set_cookie("skip_refresh", create_session_token(user, "refresh", timedelta(days=s.refresh_token_days)), httponly=True, secure=s.cookie_secure, samesite="lax", max_age=s.refresh_token_days * 86400)
     record_audit(db, "auth.login", user.id, "user", user.id); db.commit()
-    return {"status": "success", "user": {"id": user.id, "username": user.username}}
+    group = db.get(Group, user.group_id) if user.group_id else None
+    return {"status": "success", "user": {"id": user.id, "username": user.username, "display_name": user.display_name, "role": user.role, "group": {"id": group.id, "name": group.name} if group else None}}
 
 
 @app.post("/api/v1/auth/logout")

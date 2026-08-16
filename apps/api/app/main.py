@@ -20,16 +20,16 @@ from .audit import record_audit, record_mcp_error_trace, record_retrieval_execut
 from .db import Base, engine, get_db, SessionLocal
 from .graph_store import Neo4jGraphStore
 from .legal_registry import provision_number_matches, resolve_instrument_statuses
-from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, TokenKey, TraceRun, TraceSpan, User
+from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, Group, KbOwner, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, ROLE_ADMIN, ROLES, TokenKey, TraceRun, TraceSpan, User
 from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, custom_template_fields, list_templates, merge_profile_fields, metadata_search_text, resolve_template, template_code, validate_metadata_values
 from .observability import metrics, now
 from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
-from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
+from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
-from .security import INGEST_SCOPE, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, password_hash, refresh_admin, token_digest, verify_password
+from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
 from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
@@ -100,7 +100,9 @@ def bootstrap() -> None:
     from .db import SessionLocal
     with SessionLocal() as db:
         if not db.query(User).filter_by(username=settings.initial_admin_username).first():
-            db.add(User(username=settings.initial_admin_username, password_hash=password_hash(settings.initial_admin_password)))
+            db.add(User(username=settings.initial_admin_username,
+                        password_hash=password_hash(settings.initial_admin_password),
+                        role=ROLE_ADMIN))
             db.commit()
 
 
@@ -187,7 +189,118 @@ def refresh_session(response: Response, user: User = Depends(refresh_admin)):
 
 
 @app.get("/api/v1/auth/me")
-def me(user: User = Depends(current_admin)): return {"id": user.id, "username": user.username}
+def me(user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    group = db.get(Group, user.group_id) if user.group_id else None
+    return {"id": user.id, "username": user.username, "display_name": user.display_name,
+            "role": user.role, "group": {"id": group.id, "name": group.name} if group else None}
+
+
+@app.post("/api/v1/auth/change-password")
+def change_password(payload: PasswordChange, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    if not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(401, {"code": "AUTH_PASSWORD_INVALID", "message": "Current password is incorrect.", "retryable": False})
+    user.password_hash = password_hash(payload.new_password)
+    record_audit(db, "auth.password_changed", user.id, "user", user.id)
+    db.commit()
+    return {"status": "success"}
+
+
+@app.get("/api/v1/users", response_model=list[UserOut])
+def list_users(_: User = Depends(require_admin), db: Session = Depends(get_db)):
+    return db.query(User).order_by(User.created_at.asc()).all()
+
+
+@app.post("/api/v1/users", response_model=UserOut)
+def create_user(payload: UserCreate, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    if db.query(User.id).filter_by(username=payload.username).first():
+        raise HTTPException(409, {"code": "USER_EXISTS", "message": "Username already exists.", "retryable": False})
+    if payload.group_id and not db.get(Group, payload.group_id):
+        raise HTTPException(404, {"code": "GROUP_NOT_FOUND", "message": "Group not found.", "retryable": False})
+    row = User(username=payload.username, password_hash=password_hash(payload.password),
+               display_name=payload.display_name, role=payload.role, group_id=payload.group_id)
+    db.add(row)
+    record_audit(db, "user.create", user.id, "user", row.id, {"username": row.username, "role": row.role})
+    db.commit(); db.refresh(row)
+    return row
+
+
+@app.patch("/api/v1/users/{user_id}", response_model=UserOut)
+def update_user(user_id: str, payload: UserUpdate, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    row = db.get(User, user_id)
+    if not row:
+        raise HTTPException(404, "User not found")
+    if payload.group_id is not None and payload.group_id and not db.get(Group, payload.group_id):
+        raise HTTPException(404, {"code": "GROUP_NOT_FOUND", "message": "Group not found.", "retryable": False})
+    changes = payload.model_dump(exclude_unset=True)
+    # Last-admin guard: an admin may not demote or deactivate themselves —
+    # either would leave the system without a usable administrator.
+    if row.id == user.id and (("role" in changes and changes["role"] != ROLE_ADMIN) or ("is_active" in changes and changes["is_active"] is False)):
+        raise HTTPException(409, {"code": "LAST_ADMIN_GUARD", "message": "Admins cannot demote or deactivate their own account.", "retryable": False})
+    if "password" in changes:
+        del changes["password"]  # never via PATCH; use reset-password
+    for key, value in changes.items():
+        setattr(row, key, value)
+    record_audit(db, "user.update", user.id, "user", row.id, {"fields": sorted(changes)})
+    db.commit(); db.refresh(row)
+    return row
+
+
+@app.post("/api/v1/users/{user_id}/reset-password")
+def reset_password(user_id: str, payload: PasswordReset, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    row = db.get(User, user_id)
+    if not row:
+        raise HTTPException(404, "User not found")
+    row.password_hash = password_hash(payload.password)
+    record_audit(db, "user.password_reset", user.id, "user", row.id)
+    db.commit()
+    return {"status": "success"}
+
+
+@app.get("/api/v1/groups", response_model=list[GroupOut])
+def list_groups(_: User = Depends(require_admin), db: Session = Depends(get_db)):
+    return db.query(Group).order_by(Group.created_at.asc()).all()
+
+
+@app.post("/api/v1/groups", response_model=GroupOut)
+def create_group(payload: GroupCreate, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    if db.query(Group.id).filter_by(name=payload.name).first():
+        raise HTTPException(409, {"code": "GROUP_EXISTS", "message": "Group name already exists.", "retryable": False})
+    row = Group(name=payload.name, description=payload.description)
+    db.add(row)
+    record_audit(db, "group.create", user.id, "group", row.id, {"name": row.name})
+    db.commit(); db.refresh(row)
+    return row
+
+
+@app.patch("/api/v1/groups/{group_id}", response_model=GroupOut)
+def update_group(group_id: str, payload: GroupUpdate, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    row = db.get(Group, group_id)
+    if not row:
+        raise HTTPException(404, "Group not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if "name" in changes and changes["name"] != row.name and db.query(Group.id).filter_by(name=changes["name"]).first():
+        raise HTTPException(409, {"code": "GROUP_EXISTS", "message": "Group name already exists.", "retryable": False})
+    for key, value in changes.items():
+        setattr(row, key, value)
+    record_audit(db, "group.update", user.id, "group", row.id, {"fields": sorted(changes)})
+    db.commit(); db.refresh(row)
+    return row
+
+
+@app.delete("/api/v1/groups/{group_id}")
+def delete_group(group_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    row = db.get(Group, group_id)
+    if not row:
+        raise HTTPException(404, "Group not found")
+    if db.query(User.id).filter_by(group_id=group_id).first():
+        raise HTTPException(409, {"code": "GROUP_NOT_EMPTY", "message": "Move all members out of this group before deleting it.", "retryable": False})
+    if kb_ids_visible_to_group(db, group_id):
+        raise HTTPException(409, {"code": "GROUP_NOT_EMPTY", "message": "Group still owns Knowledge Bases; reassign them first.", "retryable": False})
+    record_audit(db, "group.delete", user.id, "group", row.id, {"name": row.name})
+    db.commit()
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted", "group_id": group_id}
 
 
 @app.post("/api/v1/knowledge-bases", response_model=KnowledgeBaseOut)
@@ -218,12 +331,17 @@ def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(current_admin),
             suffix += 1
     values = payload.model_dump(exclude={"code"})
     kb = KnowledgeBase(**values, code=code, retrieval_config=DEFAULT_RETRIEVAL_CONFIG.copy())
-    db.add(kb); db.flush(); record_audit(db, "knowledge_base.create", user.id, "knowledge_base", kb.id, {"code": kb.code}); db.commit(); db.refresh(kb); return kb
+    db.add(kb); db.flush()
+    # The creator owns the KB.  v1 writes a single owner row; the table is
+    # already many-to-many so sharing later is an INSERT, not a migration.
+    db.add(KbOwner(kb_id=kb.id, user_id=user.id))
+    record_audit(db, "knowledge_base.create", user.id, "knowledge_base", kb.id, {"code": kb.code}); db.commit(); db.refresh(kb); return kb
 
 
 @app.get("/api/v1/knowledge-bases", response_model=list[KnowledgeBaseOut])
-def list_kbs(_: User = Depends(current_admin), db: Session = Depends(get_db)):
-    return db.query(KnowledgeBase).filter(KnowledgeBase.deleted_at.is_(None)).all()
+def list_kbs(user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    visible = kb_ids_visible_to(db, user)
+    return db.query(KnowledgeBase).filter(KnowledgeBase.deleted_at.is_(None), KnowledgeBase.id.in_(visible)).all()
 
 
 @app.patch("/api/v1/knowledge-bases/{kb_id}/retrieval-config", response_model=KnowledgeBaseOut)
@@ -231,6 +349,7 @@ def update_retrieval_config(kb_id: str, payload: RetrievalConfigUpdate, user: Us
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     try:
         kb.retrieval_config = payload.merged(kb.retrieval_config or {})
     except ValueError as exc:
@@ -246,6 +365,7 @@ def update_kb_icon(kb_id: str, payload: KnowledgeBaseIconUpdate, user: User = De
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     kb.icon = payload.icon
     record_audit(db, "knowledge_base.icon.update", user.id, "knowledge_base", kb.id, {"icon": kb.icon})
     db.commit(); db.refresh(kb)
@@ -256,6 +376,7 @@ def update_kb_icon(kb_id: str, payload: KnowledgeBaseIconUpdate, user: User = De
 def activate_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at: raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     kb.status = "active"; record_audit(db, "knowledge_base.activate", user.id, "knowledge_base", kb.id); db.commit(); return {"status": "success"}
 
 
@@ -264,6 +385,7 @@ def disable_kb(kb_id: str, user: User = Depends(current_admin), db: Session = De
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     kb.status = "disabled"
     record_audit(db, "knowledge_base.disable", user.id, "knowledge_base", kb.id)
     db.commit()
@@ -275,18 +397,28 @@ def delete_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Dep
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     if db.query(Document.id).filter_by(knowledge_base_id=kb.id).filter(Document.deleted_at.is_(None)).first():
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_NOT_EMPTY", "message": "Delete or move all documents before deleting this Knowledge Base.", "retryable": False})
     kb.deleted_at, kb.status = datetime.utcnow(), "deleted"
-    record_audit(db, "knowledge_base.delete", user.id, "knowledge_base", kb.id)
+    # Tokens scoped (either axis) to a deleted KB are revoked immediately —
+    # leaving them active would grant access to a KB that no longer resolves.
+    revoked = 0
+    for token in db.query(TokenKey).filter(TokenKey.status == "active").all():
+        scopes_kb = kb.id in (token.allowed_knowledge_base_ids or []) or token.allowed_ingest_knowledge_base_id == kb.id
+        if scopes_kb:
+            token.status, token.revoked_at = "revoked", datetime.utcnow()
+            revoked += 1
+    record_audit(db, "knowledge_base.delete", user.id, "knowledge_base", kb.id, {"revoked_tokens": revoked})
     db.commit()
-    return {"status": "deleted", "knowledge_base_id": kb.id}
+    return {"status": "deleted", "knowledge_base_id": kb.id, "revoked_tokens": revoked}
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/document-templates", response_model=list[DocumentMetadataTemplateOut])
-def get_document_templates(kb_id: str, include_inactive: bool = False, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def get_document_templates(kb_id: str, include_inactive: bool = False, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     return list_templates(db, kb_id, include_inactive=include_inactive)
 
 
@@ -294,6 +426,7 @@ def get_document_templates(kb_id: str, include_inactive: bool = False, _: User =
 def create_document_template(kb_id: str, payload: DocumentMetadataTemplateCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     code = payload.code or template_code(payload.name)
     if code.casefold() in SYSTEM_TEMPLATE_CODES or db.query(DocumentMetadataTemplate.id).filter(
         DocumentMetadataTemplate.knowledge_base_id == kb_id,
@@ -379,6 +512,7 @@ def _upload_metadata(template_id: str | None, document_type: str, metadata_json:
 def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None), document_type: str = Form("general"), template_id: str | None = Form(None), metadata_json: str | None = Form(None), published_at: date | None = Form(None), user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at: raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     if kb.status == "disabled":
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_DISABLED", "message": "Activate this Knowledge Base before uploading documents.", "retryable": False})
     try:
@@ -403,6 +537,7 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     if kb.status == "disabled":
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_DISABLED", "message": "Activate this Knowledge Base before uploading documents.", "retryable": False})
     if not files:
@@ -440,10 +575,11 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
 def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, offset: int = 0,
                    search: str | None = None, status: str | None = None, document_type: str | None = None,
                    template_id: str | None = None,
-                   _: User = Depends(current_admin), db: Session = Depends(get_db)):
+                   user: User = Depends(current_admin), db: Session = Depends(get_db)):
     """Return a bounded Documents-page slice without changing the legacy list contract."""
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     if limit < 1 or limit > 100 or offset < 0:
         raise HTTPException(400, {"code": "DOCUMENT_PAGE_INVALID", "message": "limit must be 1-100 and offset must be non-negative.", "retryable": False})
     rows = db.query(Document).filter(Document.knowledge_base_id == kb_id)
@@ -509,7 +645,8 @@ def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, o
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/documents", response_model=list[DocumentOut])
-def list_documents(kb_id: str, include_deleted: bool = False, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def list_documents(kb_id: str, include_deleted: bool = False, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    assert_kb_access(db, user, kb_id)
     rows = db.query(Document).filter_by(knowledge_base_id=kb_id)
     if not include_deleted:
         rows = rows.filter(Document.deleted_at.is_(None))
@@ -537,15 +674,17 @@ def list_documents(kb_id: str, include_deleted: bool = False, _: User = Depends(
 def reindex_embeddings(kb_id: str, force: bool = False, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     count = queue_embedding_reindex(db, kb_id, force)
     record_audit(db, "document.embedding_reindex", user.id, "knowledge_base", kb_id, {"count": count, "force": force}); db.commit()
     return {"status": "queued", "count": count}
 
 
 @app.get("/api/v1/documents/{document_id}/text")
-def document_text(document_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def document_text(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
     if not doc: raise HTTPException(404, "Document not found")
+    assert_kb_access(db, user, doc.knowledge_base_id)
     return {"document_id": doc.id, "status": doc.status, "document_type": doc.document_type, "metadata_template_id": doc.metadata_template_id,
             "metadata_template_name": doc.metadata_template_name, "metadata_template_version": doc.metadata_template_version,
             "metadata_template_fields": doc.metadata_template_fields or [],
@@ -553,9 +692,11 @@ def document_text(document_id: str, _: User = Depends(current_admin), db: Sessio
 
 
 @app.get("/api/v1/documents/{document_id}/jobs")
-def document_jobs(document_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
-    if not db.get(Document, document_id):
+def document_jobs(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    doc = db.get(Document, document_id)
+    if not doc:
         raise HTTPException(404, "Document not found")
+    assert_kb_access(db, user, doc.knowledge_base_id)
     rows = db.query(ProcessingJob).filter_by(document_id=document_id).order_by(ProcessingJob.created_at.desc()).all()
     return [{"id": job.id, "type": job.job_type, "status": job.status, "stage": job.current_stage, "progress_percent": job.progress_percent,
              "attempt_count": job.attempt_count, "error_code": job.error_code, "error_message": job.error_message} for job in rows]
@@ -566,6 +707,7 @@ def extract_legal_metadata(document_id: str, user: User = Depends(current_admin)
     doc = db.get(Document, document_id)
     if not doc or doc.deleted_at:
         raise HTTPException(404, "Document not found")
+    assert_kb_access(db, user, doc.knowledge_base_id)
     if doc.status != "completed" or not doc.extracted_text:
         raise HTTPException(409, {"code": "DOCUMENT_NOT_READY", "message": "Process the document before legal extraction.", "retryable": False})
     active = db.query(ProcessingJob.id).filter(ProcessingJob.document_id == doc.id, ProcessingJob.job_type == "EXTRACT_LEGAL_METADATA", ProcessingJob.status.in_(["queued", "running"])).first()
@@ -581,6 +723,7 @@ def extract_legal_metadata(document_id: str, user: User = Depends(current_admin)
 @app.patch("/api/v1/documents/{document_id}/legal-metadata")
 def update_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
+    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or doc.deleted_at:
         raise HTTPException(404, "Document not found")
     current = doc.legal_metadata or {}
@@ -594,6 +737,7 @@ def update_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: 
 @app.patch("/api/v1/documents/{document_id}/metadata")
 def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
+    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or doc.deleted_at:
         raise HTTPException(404, "Document not found")
     if "published_at" in payload.model_fields_set:
@@ -634,6 +778,7 @@ def replace_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user:
 @app.delete("/api/v1/documents/{document_id}/legal-metadata")
 def delete_legal_metadata(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
+    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or doc.deleted_at:
         raise HTTPException(404, "Document not found")
     doc.legal_metadata = None
@@ -645,6 +790,7 @@ def delete_legal_metadata(document_id: str, user: User = Depends(current_admin),
 @app.post("/api/v1/documents/{document_id}/reprocess")
 def reprocess_document(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
+    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc:
         raise HTTPException(404, "Document not found")
     active = db.query(ProcessingJob).filter(
@@ -668,6 +814,7 @@ def reprocess_document(document_id: str, user: User = Depends(current_admin), db
 @app.delete("/api/v1/documents/{document_id}")
 def delete_document(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
+    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or doc.deleted_at:
         raise HTTPException(404, "Document not found")
     doc.deleted_at, doc.status = datetime.utcnow(), "deleted"
@@ -680,6 +827,7 @@ def delete_document(document_id: str, user: User = Depends(current_admin), db: S
 @app.post("/api/v1/documents/{document_id}/restore")
 def restore_document(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
+    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or not doc.deleted_at:
         raise HTTPException(404, "Deleted document not found")
     doc.deleted_at, doc.status = None, "queued"
@@ -706,6 +854,7 @@ def process_one(_: User = Depends(current_admin), db: Session = Depends(get_db))
 def add_entity(kb_id: str, payload: EntityCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     if payload.document_id:
         document = db.get(Document, payload.document_id)
         if not document or document.knowledge_base_id != kb_id:
@@ -716,7 +865,8 @@ def add_entity(kb_id: str, payload: EntityCreate, user: User = Depends(current_a
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/entities", response_model=list[EntityOut])
-def list_entities(kb_id: str, search: str = "", _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def list_entities(kb_id: str, search: str = "", user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    assert_kb_access(db, user, kb_id)
     rows = db.query(Entity).filter_by(knowledge_base_id=kb_id).filter(Entity.deleted_at.is_(None))
     if search:
         rows = rows.filter(Entity.name.ilike(f"%{search}%"))
@@ -726,6 +876,7 @@ def list_entities(kb_id: str, search: str = "", _: User = Depends(current_admin)
 @app.patch("/api/v1/entities/{entity_id}", response_model=EntityOut)
 def update_entity(entity_id: str, payload: EntityUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     entity = db.get(Entity, entity_id)
+    if entity: assert_kb_access(db, user, entity.knowledge_base_id)
     if not entity or entity.deleted_at:
         raise HTTPException(404, "Entity not found")
     values = payload.model_dump(exclude_unset=True)
@@ -740,6 +891,7 @@ def update_entity(entity_id: str, payload: EntityUpdate, user: User = Depends(cu
 @app.delete("/api/v1/entities/{entity_id}")
 def delete_entity(entity_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     entity = db.get(Entity, entity_id)
+    if entity: assert_kb_access(db, user, entity.knowledge_base_id)
     if not entity or entity.deleted_at:
         raise HTTPException(404, "Entity not found")
     entity.deleted_at = datetime.utcnow()
@@ -750,6 +902,7 @@ def delete_entity(entity_id: str, user: User = Depends(current_admin), db: Sessi
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/relationships", response_model=RelationshipOut)
 def add_relationship(kb_id: str, payload: RelationshipCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    assert_kb_access(db, user, kb_id)
     try:
         relationship = create_relationship(db, kb_id, payload)
         record_audit(db, "relationship.create", user.id, "relationship", relationship.id, {"knowledge_base_id": kb_id}); db.commit()
@@ -759,16 +912,18 @@ def add_relationship(kb_id: str, payload: RelationshipCreate, user: User = Depen
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/relationships", response_model=list[RelationshipOut])
-def list_relationships(kb_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def list_relationships(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    assert_kb_access(db, user, kb_id)
     return db.query(Relationship).filter_by(knowledge_base_id=kb_id).filter(Relationship.deleted_at.is_(None)).limit(200).all()
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/legal-graph")
-def get_legal_graph(kb_id: str, view: str = "verified", _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def get_legal_graph(kb_id: str, view: str = "verified", user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if view not in {"verified", "suggested", "manual", "all"}:
         raise HTTPException(400, {"code": "LEGAL_GRAPH_VIEW_INVALID", "message": "view must be verified, suggested, manual, or all", "retryable": False})
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     status_filter = {"verified": ["verified"], "suggested": ["suggested"], "all": ["verified", "suggested", "rejected"]}
     relationship_query = db.query(Relationship).filter(Relationship.knowledge_base_id == kb_id, Relationship.deleted_at.is_(None))
     if view == "manual":
@@ -808,13 +963,14 @@ def get_legal_graph(kb_id: str, view: str = "verified", _: User = Depends(curren
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/legal-map")
 def get_legal_map(kb_id: str, view: str = "verified", instrument_id: str | None = None,
-                  max_nodes: int = 80, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+                  max_nodes: int = 80, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     """Return a bounded, document-scoped legal graph projection for progressive disclosure.
 
     The full legal graph remains available through ``legal-graph`` for advanced users,
     while this endpoint is the human-facing overview: one card per legal instrument,
     followed by an explicitly selected instrument structure.
     """
+    assert_kb_access(db, user, kb_id)
     if view not in {"verified", "suggested", "all"}:
         raise HTTPException(400, {"code": "LEGAL_GRAPH_VIEW_INVALID", "message": "view must be verified, suggested, or all", "retryable": False})
     if max_nodes < 10 or max_nodes > 200:
@@ -976,6 +1132,7 @@ def get_legal_map(kb_id: str, view: str = "verified", instrument_id: str | None 
 def queue_legal_graph_rebuild(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     active = db.query(ProcessingJob).filter(
         ProcessingJob.knowledge_base_id == kb_id, ProcessingJob.job_type == "REBUILD_LEGAL_GRAPH",
         ProcessingJob.status.in_(["queued", "running"]),
@@ -990,7 +1147,8 @@ def queue_legal_graph_rebuild(kb_id: str, user: User = Depends(current_admin), d
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/legal-graph/rebuild")
-def legal_graph_rebuild_status(kb_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def legal_graph_rebuild_status(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    assert_kb_access(db, user, kb_id)
     job = db.query(ProcessingJob).filter_by(knowledge_base_id=kb_id, job_type="REBUILD_LEGAL_GRAPH").order_by(ProcessingJob.created_at.desc()).first()
     if not job:
         return {"status": "not_started", "job_id": None}
@@ -1001,6 +1159,7 @@ def legal_graph_rebuild_status(kb_id: str, _: User = Depends(current_admin), db:
 @app.patch("/api/v1/relationships/{relationship_id}/legal-review", response_model=RelationshipOut)
 def review_legal_relationship(relationship_id: str, payload: LegalRelationshipReview, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     relationship = db.get(Relationship, relationship_id)
+    if relationship: assert_kb_access(db, user, relationship.knowledge_base_id)
     if not relationship or relationship.deleted_at or not relationship.is_legal or relationship.origin != "ai_suggestion":
         raise HTTPException(404, "Suggested legal relationship not found")
     if relationship.review_status != "suggested":
@@ -1016,9 +1175,10 @@ def review_legal_relationship(relationship_id: str, payload: LegalRelationshipRe
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/legal-registry", response_model=list[LegalInstrumentOut])
 def list_legal_registry(kb_id: str, status: str | None = None, kind: str | None = None, family_id: str | None = None,
-                        document_id: str | None = None, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+                        document_id: str | None = None, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     rows = db.query(LegalInstrument).filter_by(knowledge_base_id=kb_id)
     if status:
         rows = rows.filter(LegalInstrument.status == status)
@@ -1032,10 +1192,11 @@ def list_legal_registry(kb_id: str, status: str | None = None, kind: str | None 
 
 
 @app.get("/api/v1/legal-instruments/{instrument_id}")
-def get_legal_instrument(instrument_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def get_legal_instrument(instrument_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     instrument = db.get(LegalInstrument, instrument_id)
     if not instrument:
         raise HTTPException(404, "Legal instrument not found")
+    assert_kb_access(db, user, instrument.knowledge_base_id)
     family_members = []
     if instrument.family_id:
         family_members = db.query(LegalInstrument).filter_by(
@@ -1058,6 +1219,7 @@ def get_legal_instrument(instrument_id: str, _: User = Depends(current_admin), d
 @app.patch("/api/v1/legal-instruments/{instrument_id}", response_model=LegalInstrumentOut)
 def update_legal_instrument(instrument_id: str, payload: LegalInstrumentUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     instrument = db.get(LegalInstrument, instrument_id)
+    if instrument: assert_kb_access(db, user, instrument.knowledge_base_id)
     if not instrument:
         raise HTTPException(404, "Legal instrument not found")
     if payload.family_id:
@@ -1078,7 +1240,8 @@ def update_legal_instrument(instrument_id: str, payload: LegalInstrumentUpdate, 
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/legal-registry/worklist")
-def legal_registry_worklist(kb_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def legal_registry_worklist(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    assert_kb_access(db, user, kb_id)
     """Return legal curation gaps instead of silently treating them as facts.
 
     The worklist is deliberately read-only and bounded.  It gives an operator
@@ -1129,6 +1292,7 @@ def legal_registry_worklist(kb_id: str, _: User = Depends(current_admin), db: Se
 def resolve_legal_registry(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     result = resolve_instrument_statuses(db, kb_id)
     record_audit(db, "legal_registry.resolve", user.id, "knowledge_base", kb_id, result)
     db.commit()
@@ -1139,6 +1303,7 @@ def resolve_legal_registry(kb_id: str, user: User = Depends(current_admin), db: 
 def sync_knowledge_base_graph(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
     totals = {"entities": 0, "relationships": 0}
     documents = db.query(Document).filter_by(knowledge_base_id=kb_id, status="completed").filter(Document.deleted_at.is_(None)).all()
     for document in documents:
@@ -1156,6 +1321,7 @@ def sync_knowledge_base_graph(kb_id: str, user: User = Depends(current_admin), d
 @app.patch("/api/v1/relationships/{relationship_id}", response_model=RelationshipOut)
 def update_relationship(relationship_id: str, payload: RelationshipUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     relationship = db.get(Relationship, relationship_id)
+    if relationship: assert_kb_access(db, user, relationship.knowledge_base_id)
     if not relationship or relationship.deleted_at:
         raise HTTPException(404, "Relationship not found")
     values = payload.model_dump(exclude_unset=True)
@@ -1167,6 +1333,7 @@ def update_relationship(relationship_id: str, payload: RelationshipUpdate, user:
 @app.delete("/api/v1/relationships/{relationship_id}")
 def delete_relationship(relationship_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     relationship = db.get(Relationship, relationship_id)
+    if relationship: assert_kb_access(db, user, relationship.knowledge_base_id)
     if not relationship or relationship.deleted_at:
         raise HTTPException(404, "Relationship not found")
     relationship.deleted_at = datetime.utcnow(); record_audit(db, "relationship.delete", user.id, "relationship", relationship.id); db.commit()
@@ -1174,13 +1341,15 @@ def delete_relationship(relationship_id: str, user: User = Depends(current_admin
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/graph-layout")
-def graph_layout(kb_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def graph_layout(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    assert_kb_access(db, user, kb_id)
     rows = db.query(GraphNodeLayout).filter_by(knowledge_base_id=kb_id).all()
     return {"items": [{"entity_id": row.entity_id, "x": row.position_x, "y": row.position_y} for row in rows]}
 
 
 @app.put("/api/v1/knowledge-bases/{kb_id}/graph-layout")
 def save_graph_layout(kb_id: str, payload: GraphLayoutUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    assert_kb_access(db, user, kb_id)
     valid = {row[0] for row in db.query(Entity.id).filter_by(knowledge_base_id=kb_id).filter(Entity.deleted_at.is_(None)).all()}
     if any(item.entity_id not in valid for item in payload.items):
         raise HTTPException(400, "Layout contains an entity outside this knowledge base")
@@ -1193,21 +1362,30 @@ def save_graph_layout(kb_id: str, payload: GraphLayoutUpdate, user: User = Depen
 
 
 @app.get("/api/v1/entities/{entity_id}/graph")
-def get_entity_graph(entity_id: str, depth: int = 1, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def get_entity_graph(entity_id: str, depth: int = 1, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     entity = db.get(Entity, entity_id)
     if not entity:
         raise HTTPException(404, "Entity not found")
+    assert_kb_access(db, user, entity.knowledge_base_id)
     return entity_graph(db, entity, max(1, min(depth, 3)))
 
 
 @app.get("/api/v1/entities/{entity_id}/sources")
-def get_entity_sources(entity_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def get_entity_sources(entity_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    entity = db.get(Entity, entity_id)
+    if not entity:
+        raise HTTPException(404, "Entity not found")
+    assert_kb_access(db, user, entity.knowledge_base_id)
     rows = db.query(EntitySource, Document).join(Document, Document.id == EntitySource.document_id).filter(EntitySource.entity_id == entity_id).all()
     return {"entity_id": entity_id, "sources": [{"document_id": document.id, "title": document.title, "excerpt": source.excerpt} for source, document in rows]}
 
 
 @app.get("/api/v1/entities/{entity_id}/inspector")
-def get_entity_inspector(entity_id: str, depth: int = 1, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def get_entity_inspector(entity_id: str, depth: int = 1, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    entity = db.get(Entity, entity_id)
+    if not entity:
+        raise HTTPException(404, "Entity not found")
+    assert_kb_access(db, user, entity.knowledge_base_id)
     """Return the evidence-backed context used by the graph inspector.
 
     The graph payload intentionally stays lightweight.  This endpoint is lazy
@@ -1294,7 +1472,10 @@ def get_entity_inspector(entity_id: str, depth: int = 1, _: User = Depends(curre
 
 
 @app.post("/api/v1/query/impact")
-def query_impact(payload: ImpactRequest, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def query_impact(payload: ImpactRequest, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    visible = kb_ids_visible_to(db, user)
+    if payload.knowledge_base_ids and not set(payload.knowledge_base_ids).issubset(visible):
+        raise HTTPException(404, "Knowledge base not found")
     return analyze_impact(db, payload.subject, payload.knowledge_base_ids, payload.max_depth, payload.include_indirect, payload.entity_id)
 
 
@@ -1365,25 +1546,33 @@ def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: 
     # dangling allowed_ingest_knowledge_base_id first.
     if not payload.allowed_tools and INGEST_SCOPE not in payload.allowed_scopes:
         raise HTTPException(400, {"code": "TOKEN_NO_CAPABILITY", "message": "Token must be granted at least one MCP tool or Ingest write access.", "retryable": False})
+    # RBAC: a token may never grant more Knowledge Base reach than its issuer
+    # can see.  Applies to both axes — the MCP read list and the single ingest KB.
+    visible = kb_ids_visible_to(db, user)
+    requested_kb = set(payload.allowed_knowledge_base_ids) | ({payload.allowed_ingest_knowledge_base_id} if payload.allowed_ingest_knowledge_base_id else set())
+    if not requested_kb.issubset(visible):
+        raise HTTPException(403, {"code": "TOKEN_SCOPE_EXCEEDS_ROLE", "message": "Token scope may not exceed the Knowledge Bases available to your account.", "retryable": False})
     secret = create_token_secret()
     token = TokenKey(name=payload.name, description=payload.description, token_prefix=secret[:16], token_hash=token_digest(secret),
                      allowed_knowledge_base_ids=payload.allowed_knowledge_base_ids, allowed_tools=payload.allowed_tools,
                      allowed_scopes=payload.allowed_scopes, allowed_ingest_knowledge_base_id=payload.allowed_ingest_knowledge_base_id,
                      expires_at=payload.expires_at, requests_per_minute=payload.requests_per_minute,
-                     max_concurrent_requests=payload.max_concurrent_requests, query_timeout_seconds=payload.query_timeout_seconds)
+                     max_concurrent_requests=payload.max_concurrent_requests, query_timeout_seconds=payload.query_timeout_seconds,
+                     created_by=user.id)
     db.add(token); db.flush(); record_audit(db, "token.create", user.id, "token", token.id, {"name": token.name}); db.commit(); db.refresh(token)
     return {**TokenOut.model_validate(token).model_dump(), "token": secret}
 
 
 @app.get("/api/v1/tokens", response_model=list[TokenOut])
-def list_tokens(_: User = Depends(current_admin), db: Session = Depends(get_db)):
-    return db.query(TokenKey).order_by(TokenKey.created_at.desc()).all()
+def list_tokens(user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    rows = db.query(TokenKey).order_by(TokenKey.created_at.desc()).all()
+    return [row for row in rows if token_visible_to(db, user, row)]
 
 
 @app.post("/api/v1/tokens/{token_id}/disable")
 def disable_token(token_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     token = db.get(TokenKey, token_id)
-    if not token:
+    if not token or not token_visible_to(db, user, token):
         raise HTTPException(404, "Token not found")
     if token.status == "revoked":
         raise HTTPException(409, "A revoked token cannot be enabled or disabled")
@@ -1395,7 +1584,7 @@ def disable_token(token_id: str, user: User = Depends(current_admin), db: Sessio
 @app.post("/api/v1/tokens/{token_id}/enable")
 def enable_token(token_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     token = db.get(TokenKey, token_id)
-    if not token:
+    if not token or not token_visible_to(db, user, token):
         raise HTTPException(404, "Token not found")
     if token.status == "revoked":
         raise HTTPException(409, "A revoked token cannot be enabled")
@@ -1407,7 +1596,7 @@ def enable_token(token_id: str, user: User = Depends(current_admin), db: Session
 @app.post("/api/v1/tokens/{token_id}/revoke")
 def revoke_token(token_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     token = db.get(TokenKey, token_id)
-    if not token:
+    if not token or not token_visible_to(db, user, token):
         raise HTTPException(404, "Token not found")
     token.status = "revoked"
     token.revoked_at = datetime.utcnow()
@@ -1424,7 +1613,7 @@ def rotate_token(token_id: str, user: User = Depends(current_admin), db: Session
     secret exactly once in the response.
     """
     previous = db.get(TokenKey, token_id)
-    if not previous:
+    if not previous or not token_visible_to(db, user, previous):
         raise HTTPException(404, "Token not found")
     if previous.status == "revoked":
         raise HTTPException(409, {"code": "TOKEN_ALREADY_REVOKED", "message": "A revoked token cannot be rotated.", "retryable": False})
@@ -1469,6 +1658,7 @@ def rotate_token(token_id: str, user: User = Depends(current_admin), db: Session
         # Preserve a disabled credential's safety posture. Rotating a key must
         # not be a way to bypass an administrator's Disable action.
         status=previous.status,
+        created_by=previous.created_by or user.id,
     )
     previous.status, previous.revoked_at = "revoked", datetime.utcnow()
     db.add(replacement); db.flush()
@@ -1525,6 +1715,15 @@ def active_mcp_knowledge_base_ids(db: Session, kb_ids: list[str]) -> list[str]:
 
 @app.post("/api/v1/query")
 def admin_query(payload: QueryRequest, request: Request, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    visible = kb_ids_visible_to(db, user)
+    if payload.knowledge_base_ids:
+        if not set(payload.knowledge_base_ids).issubset(visible):
+            raise HTTPException(404, "Knowledge base not found")
+    else:
+        # Unscoped searches stay within the caller's visible Knowledge Bases.
+        payload = payload.model_copy(update={"knowledge_base_ids": sorted(visible)})
+        if not payload.knowledge_base_ids:
+            raise HTTPException(404, {"code": "KNOWLEDGE_BASE_NOT_VISIBLE", "message": "No Knowledge Base is available to this account yet.", "retryable": False})
     result = authorized_query(payload, None, db)
     record_retrieval_execution(db, request.state.request_id, result, actor_id=user.id)
     db.commit()
@@ -1572,8 +1771,13 @@ def observability_cleanup(user: User = Depends(current_admin), db: Session = Dep
 
 
 @app.get("/api/v1/audit-logs")
-def list_audit_logs(limit: int = 100, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def list_audit_logs(limit: int = 100, user: User = Depends(require_manager), db: Session = Depends(get_db)):
     rows = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(min(max(limit, 1), 500)).all()
+    # Managers see group-relevant rows only (target KB in their group, or their
+    # own actions); admins see everything.
+    if user.role != ROLE_ADMIN:
+        group_kbs = kb_ids_visible_to(db, user)
+        rows = [row for row in rows if (row.target_type == "knowledge_base" and row.target_id in group_kbs) or row.actor_user_id == user.id]
     return [{"id": row.id, "action": row.action, "actor_user_id": row.actor_user_id, "target_type": row.target_type,
              "target_id": row.target_id, "metadata": row.metadata_json, "created_at": row.created_at} for row in rows]
 
@@ -1581,7 +1785,7 @@ def list_audit_logs(limit: int = 100, _: User = Depends(current_admin), db: Sess
 @app.get("/api/v1/logs/transactions")
 def list_request_transactions(limit: int = 100, cursor: str | None = None, from_ts: str | None = None,
                               to_ts: str | None = None, method: str | None = None, status_code: int | None = None,
-                              paginate: bool = False, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+                              paginate: bool = False, user: User = Depends(require_manager), db: Session = Depends(get_db)):
     """Return recent request transactions for the operator UI.
 
     Records contain only request metadata collected by the middleware. Request
@@ -1687,7 +1891,7 @@ def _parse_log_cursor(value: str | None) -> datetime | None:
 def list_retrieval_traces(limit: int = 100, transport: str | None = None, status: str | None = None,
                           tool: str | None = None, search: str | None = None, cursor: str | None = None,
                           from_ts: str | None = None, to_ts: str | None = None, paginate: bool = False,
-                          _: User = Depends(current_admin), db: Session = Depends(get_db)):
+                          user: User = Depends(require_manager), db: Session = Depends(get_db)):
     """List safe RetrievalExecutor trace summaries for the Trace Explorer."""
     bounded_limit = min(max(limit, 1), 200)
     query = db.query(TraceRun).order_by(TraceRun.created_at.desc(), TraceRun.id.desc())
@@ -1713,7 +1917,7 @@ def list_retrieval_traces(limit: int = 100, transport: str | None = None, status
 
 
 @app.get("/api/v1/traces/{trace_id}")
-def get_retrieval_trace(trace_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def get_retrieval_trace(trace_id: str, user: User = Depends(require_manager), db: Session = Depends(get_db)):
     """Return a root span and safe child spans for one retrieval execution."""
     run = db.get(TraceRun, trace_id)
     if run:

@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 import redis
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from .config import get_settings
@@ -287,6 +287,25 @@ def update_group(group_id: str, payload: GroupUpdate, user: User = Depends(requi
     record_audit(db, "group.update", user.id, "group", row.id, {"fields": sorted(changes)})
     db.commit(); db.refresh(row)
     return row
+
+
+@app.delete("/api/v1/users/{user_id}")
+def delete_user(user_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    if user_id == user.id:
+        raise HTTPException(400, {"code": "USER_SELF_DELETE", "message": "Cannot delete your own account.", "retryable": False})
+    row = db.get(User, user_id)
+    if not row:
+        raise HTTPException(404, "User not found")
+    if row.username == "admin":
+        raise HTTPException(400, {"code": "USER_PROTECTED", "message": "The primary admin account cannot be deleted.", "retryable": False})
+    # release ownership and audit references instead of hard-failing
+    db.query(KbOwner).filter(KbOwner.user_id == user_id).delete()
+    db.query(TokenKey).filter(TokenKey.created_by == user_id).update({"created_by": None})
+    db.execute(text("UPDATE audit_logs SET actor_user_id = NULL WHERE actor_user_id = :uid"), {"uid": user_id})
+    record_audit(db, "user.delete", user.id, "user", user_id, {"username": row.username})
+    db.delete(row)
+    db.commit()
+    return {"status": "success"}
 
 
 @app.delete("/api/v1/groups/{group_id}")

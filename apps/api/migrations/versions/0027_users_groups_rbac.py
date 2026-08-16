@@ -69,7 +69,7 @@ def upgrade() -> None:
     # already had full rights — so this preserves behaviour exactly.  (If real
     # multi-user rows somehow exist, making them admins is still the least
     # surprising outcome for a deploy that predates roles.)
-    op.execute("UPDATE users SET role = 'admin' WHERE role IS NULL OR role = ''")
+    op.execute("UPDATE users SET role = 'admin'")
     # Legacy tokens predate created_by; attribute them to the oldest admin so
     # they remain manageable instead of becoming invisible to everyone.
     op.execute(

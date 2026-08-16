@@ -26,3 +26,23 @@
 .kb-hub-create-icon{font-size:1.6rem;font-weight:800;width:42px;height:42px;border-radius:50%;border:2px dashed #0d6874;display:flex;align-items:center;justify-content:center;line-height:1}
 .kb-hub-create.open{border-style:solid;text-align:left}
 .kb-hub-create-actions{display:flex;gap:.5rem;justify-content:flex-end}
+
+/* ---- Table view (added alongside card view) ---- */
+.kb-hub-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:1rem}
+.kb-hub-heading-text{text-align:left}
+.kb-hub-heading-text h2{display:inline-block;margin:0 0 .55rem;font-size:1.3rem;padding-bottom:.5rem;border-bottom:3px solid #0d6874}
+.kb-hub-heading-text p{margin:0;color:var(--color-text-secondary);font-size:.85rem}
+.kb-hub-view-toggle{display:inline-flex;border:1px solid var(--color-border);border-radius:10px;overflow:hidden;background:var(--color-background-surface);flex-shrink:0}
+.kb-hub-view-toggle button{display:inline-flex;align-items:center;gap:.4rem;padding:.5rem .85rem;border:none;background:transparent;color:var(--color-text-secondary);font-size:.82rem;font-weight:600;cursor:pointer;transition:background .15s ease,color .15s ease}
+.kb-hub-view-toggle button:hover{background:rgba(13,104,116,.08);color:#0d6874}
+.kb-hub-view-toggle button.selected{background:#0d6874;color:#fff}
+.kb-hub-table-wrap{margin:0 0 1.5rem}
+.kb-hub-table{width:100%}
+.kb-hub-table tbody tr{transition:background .12s ease}
+.kb-hub-table tbody tr:hover{background:rgba(13,104,116,.06)}
+.kb-hub-table tbody tr.selected{background:rgba(13,104,116,.1)}
+.kb-hub-table-name{display:inline-flex;align-items:center;gap:.55rem;border:none;background:transparent;font-weight:600;color:inherit;cursor:pointer;padding:.35rem .5rem;margin:-.35rem -.5rem;border-radius:8px;font-size:.92rem;text-align:left}
+.kb-hub-table-name:hover{color:#0d6874}
+.kb-hub-table-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem;color:var(--color-text-secondary)}
+.kb-hub-table-desc{color:var(--color-text-secondary);font-size:.85rem;max-width:32ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (max-width:900px){.kb-hub-heading{flex-direction:column;align-items:flex-start}.kb-hub-table-desc{max-width:18ch}}

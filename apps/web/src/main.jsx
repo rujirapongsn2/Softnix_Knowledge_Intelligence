@@ -1,7 +1,7 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {Theme, AppShell, Badge, Button, Card, CheckboxInput, CommandPalette, EmptyState, FileInput, ProgressBar, SideNav, SideNavHeading, SideNavItem, SideNavSection, Selector, TextArea, TextInput, Toast, TopNav, TopNavHeading, useDialogFocus} from "./ui.jsx";
-import {AppWindow, BookOpen, Buildings, ChartLineUp, CirclesThree, Cloud, Compass, Database, FileText, Gavel, GitBranch, HardDrives, Key, Lightbulb, MagnifyingGlass, Scales, ShieldCheck, User, Users, UsersThree} from "@phosphor-icons/react";
+import {AppWindow, BookOpen, Buildings, ChartLineUp, CirclesThree, Cloud, Compass, Database, FileText, Gavel, GitBranch, HardDrives, Key, Lightbulb, MagnifyingGlass, Rows, Scales, ShieldCheck, SquaresFour, User, Users, UsersThree} from "@phosphor-icons/react";
 import {Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow, ReactFlowProvider, useEdgesState, useNodesState, useReactFlow} from "@xyflow/react";
 import "./kumo.css";
 import "@xyflow/react/dist/style.css";
@@ -860,6 +860,7 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [isCreating, setIsCreating] = useState(false);
+  const [hubView, setHubView] = useState("cards");
   const normalizedSearch = searchTerm.trim().toLocaleLowerCase();
   const visibleKnowledgeBases = kbs.filter(kb => {
     const matchesSearch = !normalizedSearch || `${kb.name} ${kb.code}`.toLocaleLowerCase().includes(normalizedSearch);
@@ -877,8 +878,37 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
         <label className="native-field">{t("common.status")}<select value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><option value="all">{t("common.allStatuses")}</option><option value="active">{t("common.active")}</option><option value="draft">{t("kb.status.draft")}</option><option value="disabled">{t("status.disabled.label")}</option></select></label>
       </div>
     </section>
-    <div className="kb-hub-heading"><h2>{t("kb.hub.heading")}</h2><p>{kbs.length ? t("kb.hub.shownCount", {shown: visibleKnowledgeBases.length, total: kbs.length}) : t("kb.hub.createFirst")}</p></div>
-    <section className="kb-hub-grid">
+    <div className="kb-hub-heading"><div className="kb-hub-heading-text"><h2>{t("kb.hub.heading")}</h2><p>{kbs.length ? t("kb.hub.shownCount", {shown: visibleKnowledgeBases.length, total: kbs.length}) : t("kb.hub.createFirst")}</p></div><div className="kb-hub-view-toggle" role="group" aria-label={t("kb.hub.viewToggleLabel")}>
+      <button type="button" className={hubView === "cards" ? "selected" : ""} aria-pressed={hubView === "cards"} onClick={() => setHubView("cards")}><SquaresFour weight="regular" size={16}/><span>{t("kb.hub.view.cards")}</span></button>
+      <button type="button" className={hubView === "table" ? "selected" : ""} aria-pressed={hubView === "table"} onClick={() => setHubView("table")}><Rows weight="regular" size={16}/><span>{t("kb.hub.view.table")}</span></button>
+    </div></div>
+    {hubView === "table" && visibleKnowledgeBases.length > 0 && <section className="kb-hub-table-wrap" aria-label={t("kb.hub.heading")}>
+      <div className="table-scroll">
+        <table className="data-table kb-hub-table">
+          <thead><tr>
+            <th>{t("kb.hub.table.name")}</th>
+            <th>{t("kb.hub.table.code")}</th>
+            <th>{t("kb.hub.table.description")}</th>
+            <th>{t("common.status")}</th>
+            <th>{t("kb.hub.table.actions")}</th>
+          </tr></thead>
+          <tbody>
+            {visibleKnowledgeBases.map(kb => <tr className={kb.id === selectedKbId ? "selected" : ""} key={kb.id}>
+              <td><button type="button" className="kb-hub-table-name" onClick={() => openKnowledgeBase(kb)}><span className="kb-hub-avatar"><KnowledgeBaseIcon knowledgeBase={kb} size={18}/></span>{kb.name}</button></td>
+              <td className="kb-hub-table-code">{kb.code}</td>
+              <td className="kb-hub-table-desc">{kb.description || "—"}</td>
+              <td><StatusBadge status={kb.status}/></td>
+              <td><div className="row-actions">
+                <Button label={t("kb.hub.open") } size="sm" variant="ghost" onClick={() => openKnowledgeBase(kb)}/>
+                {kb.status === "active" ? <Button label={t("common.disable")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "disable")}/> : <Button label={t("common.activate")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "activate")}/>}
+                <Button label={t("common.delete")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "delete")}/>
+              </div></td>
+            </tr>)}
+          </tbody>
+        </table>
+      </div>
+    </section>}
+    <section className="kb-hub-grid" hidden={hubView === "table"}>
       {visibleKnowledgeBases.map(kb => <article className={`kb-hub-card ${kb.id === selectedKbId ? "selected" : ""}`} key={kb.id}>
         <button type="button" className="kb-hub-open" onClick={() => openKnowledgeBase(kb)}>
           <span className="kb-hub-avatar"><KnowledgeBaseIcon knowledgeBase={kb} size={22}/></span>

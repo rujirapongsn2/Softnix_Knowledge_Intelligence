@@ -809,10 +809,18 @@ function WorkflowNavigation({activeView, selectedKb, hasCompletedDocuments, view
 const STATUS_KEYS = ["queued", "extracting", "indexing", "completed", "failed", "ocr_required", "disabled"];
 const STATUS_HELP_KEYS = ["queued", "extracting", "indexing", "failed", "ocr_required"];
 const statusHelp = (t, status) => STATUS_HELP_KEYS.includes(status) ? t(`status.${status}.help`) : null;
+const KB_STATUS_KEYS = ["active", "draft", "disabled"];
+const KB_STATUS_VARIANTS = {active: "success", draft: "warning", disabled: "neutral"};
+const KB_STATUS_DOTS = {active: "●", draft: "●", disabled: "○"};
 const StatusBadge = ({status}) => {
   const {t} = useLanguage();
   const label = STATUS_KEYS.includes(status) ? t(`status.${status}.label`) : status.replace(/_/g, " ");
   return <Badge label={label} variant={status === "completed" ? "success" : status === "failed" || status === "ocr_required" ? "error" : status === "queued" || status === "extracting" || status === "indexing" ? "warning" : "neutral"}/>;
+};
+const KbStatusBadge = ({status}) => {
+  const {t} = useLanguage();
+  const label = KB_STATUS_KEYS.includes(status) ? t(`kb.status.${status}`) : status.replace(/_/g, " ");
+  return <Badge label={KB_STATUS_DOTS[status] ? `${KB_STATUS_DOTS[status]} ${label}` : label} variant={KB_STATUS_VARIANTS[status] || "neutral"}/>;
 };
 const Metric = ({value, label, detail}) => <Card padding={3}><p className="metric-value">{value}</p><p className="metric-label">{label}</p>{detail && <p className="metric-detail">{detail}</p>}</Card>;
 
@@ -894,11 +902,11 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
             <th>{t("kb.hub.table.actions")}</th>
           </tr></thead>
           <tbody>
-            {visibleKnowledgeBases.map(kb => <tr className={kb.id === selectedKbId ? "selected" : ""} key={kb.id}>
+            {visibleKnowledgeBases.map(kb => <tr className={`${kb.id === selectedKbId ? "selected" : ""} kb-status-${kb.status}`} key={kb.id}>
               <td><button type="button" className="kb-hub-table-name" onClick={() => openKnowledgeBase(kb)}><span className="kb-hub-avatar"><KnowledgeBaseIcon knowledgeBase={kb} size={18}/></span>{kb.name}</button></td>
               <td className="kb-hub-table-code">{kb.code}</td>
               <td className="kb-hub-table-desc">{kb.description || "—"}</td>
-              <td><StatusBadge status={kb.status}/></td>
+              <td><KbStatusBadge status={kb.status}/></td>
               <td><div className="row-actions">
                 <Button label={t("kb.hub.open") } size="sm" variant="ghost" onClick={() => openKnowledgeBase(kb)}/>
                 {kb.status === "active" ? <Button label={t("common.disable")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "disable")}/> : <Button label={t("common.activate")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "activate")}/>}
@@ -910,12 +918,12 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
       </div>
     </section>}
     <section className="kb-hub-grid" hidden={hubView === "table"}>
-      {visibleKnowledgeBases.map(kb => <article className={`kb-hub-card ${kb.id === selectedKbId ? "selected" : ""}`} key={kb.id}>
+      {visibleKnowledgeBases.map(kb => <article className={`kb-hub-card ${kb.id === selectedKbId ? "selected" : ""} kb-hub-card-${kb.status}`} key={kb.id}>
         <button type="button" className="kb-hub-open" onClick={() => openKnowledgeBase(kb)}>
           <span className="kb-hub-avatar"><KnowledgeBaseIcon knowledgeBase={kb} size={22}/></span>
           <span className="kb-hub-title">{kb.name}</span>
           <span className="kb-hub-code">{kb.code}</span>
-          <StatusBadge status={kb.status}/>
+          <KbStatusBadge status={kb.status}/>
           <span className="kb-hub-link">{t("kb.hub.open")}</span>
         </button>
         <div className="kb-hub-actions">

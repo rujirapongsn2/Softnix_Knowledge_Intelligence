@@ -46,3 +46,10 @@
 .kb-hub-table-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem;color:var(--color-text-secondary)}
 .kb-hub-table-desc{color:var(--color-text-secondary);font-size:.85rem;max-width:32ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media (max-width:900px){.kb-hub-heading{flex-direction:column;align-items:flex-start}.kb-hub-table-desc{max-width:18ch}}
+
+/* ---- Status clarity: badge variants + row/card signals ---- */
+.kb-hub-card.kb-hub-card-disabled{opacity:.62}
+.kb-hub-card.kb-hub-card-disabled .kb-hub-title{color:var(--color-text-secondary)}
+.kb-hub-table tbody tr.kb-status-disabled td{opacity:.62}
+.kb-hub-table tbody tr.kb-status-disabled .kb-hub-table-name{color:var(--color-text-secondary)}
+.snx-badge-neutral{background:#ececec;color:#5f6b74}

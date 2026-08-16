@@ -18,6 +18,12 @@ class Timestamped:
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+ROLE_USER = "user"
+ROLE_MANAGER = "manager"
+ROLE_ADMIN = "admin"
+ROLES = (ROLE_USER, ROLE_MANAGER, ROLE_ADMIN)
+
+
 class User(Timestamped, Base):
     __tablename__ = "users"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
@@ -25,6 +31,31 @@ class User(Timestamped, Base):
     password_hash: Mapped[str] = mapped_column(String(500))
     display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # RBAC: 'user' | 'manager' | 'admin'.  Bootstrap admin gets 'admin' from
+    # migration 0027 / bootstrap(); every other account starts as 'user'.
+    role: Mapped[str] = mapped_column(String(20), default=ROLE_USER, server_default=ROLE_USER, index=True)
+    # v1: single group per user (see plan — junction table only if multi-group
+    # is ever needed).  NULL = unassigned (visible to admins only).
+    group_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("groups.id"), nullable=True)
+    credentials_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+
+
+class Group(Timestamped, Base):
+    __tablename__ = "groups"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
+    name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class KbOwner(Base):
+    """Many-to-many Knowledge Base ↔ owner.
+
+    v1 writes exactly one row per KB (the creator).  The table is already
+    many-to-many so sharing a KB later is an INSERT, not a migration.
+    """
+    __tablename__ = "kb_owners"
+    kb_id: Mapped[str] = mapped_column(String(36), ForeignKey("knowledge_bases.id"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), primary_key=True, index=True)
 
 
 class KnowledgeBase(Timestamped, Base):
@@ -372,6 +403,10 @@ class TokenKey(Timestamped, Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # RBAC: who issued this token.  Legacy rows are backfilled to the bootstrap
+    # admin by migration 0027; visibility rules use this (creator, or creator's
+    # group for managers) — never a wildcard.
+    created_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
 
 
 class QueryResult(Base):

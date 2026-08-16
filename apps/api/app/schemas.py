@@ -16,6 +16,57 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=8, max_length=256)
 
 
+class PasswordChange(BaseModel):
+    current_password: str = Field(min_length=8, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class PasswordReset(BaseModel):
+    password: str = Field(min_length=8, max_length=256)
+
+
+class UserOut(ORMModel):
+    id: str
+    username: str
+    display_name: str | None = None
+    role: str
+    group_id: str | None = None
+    is_active: bool
+    created_at: datetime
+
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=8, max_length=256)
+    display_name: str | None = Field(default=None, max_length=200)
+    role: Literal["user", "manager", "admin"] = "user"
+    group_id: str | None = None
+
+
+class UserUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=200)
+    role: Literal["user", "manager", "admin"] | None = None
+    group_id: str | None = None
+    is_active: bool | None = None
+
+
+class GroupOut(ORMModel):
+    id: str
+    name: str
+    description: str | None = None
+    created_at: datetime
+
+
+class GroupCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class GroupUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+
+
 class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     # Optional for UI/API callers.  The service derives a collision-safe code

@@ -1950,6 +1950,10 @@ def _repair_or_flag_pdf_text(text: str) -> str:
 def extract_text(document: Document) -> str:
     path = Path(document.storage_path)
     ext = path.suffix.lower()
+    # Plain-text family never needs conversion: anydoc has no format for
+    # .txt/.md/.csv/.json, so read them directly.
+    if ext in {".txt", ".md", ".csv", ".json"}:
+        return _legacy_extract_text(path)
     # anydoc fast path: Rust conversion + per-page OCR chain for scanned or
     # garbled pages, then the Thai-repair gate. HTML family stays legacy
     # (anydoc has no HTML parser); when the wheel is missing the legacy

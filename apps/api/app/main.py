@@ -28,6 +28,7 @@ from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
 from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut
+from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, password_hash, refresh_admin, token_digest, verify_password
 from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
@@ -2083,6 +2084,47 @@ def ingest_upload_document(kb_id: str, file: UploadFile = File(...), title: str 
     # create_document_job() already committed the document; the audit row is
     # best-effort observability and must never turn an already-queued upload
     # into a lost document_id if this second commit fails.
+    try:
+        record_ingest_audit(db, token, doc, kb_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+    return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type,
+            "template_id": doc.metadata_template_id}
+
+
+class IngestTextRequest(BaseModel):
+    """Pre-extracted text payload for JSON-only senders (InsightDOC Custom API).
+
+    The text is stored as a Markdown document and continues through the
+    regular processing pipeline; no OCR runs because the layer is the text.
+    """
+    title: str = Field(min_length=1, max_length=255)
+    text: str = Field(min_length=1)
+    document_type: str = "general"
+    template_id: str | None = None
+    metadata_json: str | None = None
+    published_at: date | None = None
+
+
+@app.post("/api/v1/ingest/knowledge-bases/{kb_id}/documents/text", status_code=202)
+def ingest_upload_document_text(kb_id: str, body: IngestTextRequest,
+                                token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    """Queue pre-extracted text (OCR/LLM output) as a Markdown document.
+
+    Distinct error semantics from the file path: ``FILE_DUPLICATE`` remains
+    a 409 so retrying senders can recognise "already sent", everything else
+    about validation maps onto the same codes.
+    """
+    from .ingest_text import create_text_document_job
+    ingest_knowledge_base(db, token, kb_id)
+    try:
+        template, profile, metadata = _upload_metadata(body.template_id, body.document_type, body.metadata_json, db, kb_id)
+        doc, job = create_text_document_job(db, kb_id, body.title, body.text, profile, body.published_at,
+                                            template, metadata)
+    except ValueError as exc:
+        record_ingest_rejection(db, token, kb_id, body.title, str(exc))
+        raise ingest_upload_error(exc)
     try:
         record_ingest_audit(db, token, doc, kb_id)
         db.commit()

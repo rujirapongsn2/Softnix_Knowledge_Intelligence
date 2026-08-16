@@ -200,6 +200,7 @@ def change_password(payload: PasswordChange, user: User = Depends(current_admin)
     if not verify_password(payload.current_password, user.password_hash):
         raise HTTPException(401, {"code": "AUTH_PASSWORD_INVALID", "message": "Current password is incorrect.", "retryable": False})
     user.password_hash = password_hash(payload.new_password)
+    user.credentials_version = (user.credentials_version or 0) + 1
     record_audit(db, "auth.password_changed", user.id, "user", user.id)
     db.commit()
     return {"status": "success"}
@@ -251,6 +252,7 @@ def reset_password(user_id: str, payload: PasswordReset, user: User = Depends(re
     if not row:
         raise HTTPException(404, "User not found")
     row.password_hash = password_hash(payload.password)
+    row.credentials_version = (row.credentials_version or 0) + 1
     record_audit(db, "user.password_reset", user.id, "user", row.id)
     db.commit()
     return {"status": "success"}

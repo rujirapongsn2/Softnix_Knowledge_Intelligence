@@ -1,0 +1,20 @@
+# E2E RBAC test stack — separate project/ports/volumes from production.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.e2e.yml -p ski-e2e up -d --build
+services:
+  postgres:
+    ports: !override []
+  migrate:
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      INITIAL_ADMIN_USERNAME: e2e-admin
+      INITIAL_ADMIN_PASSWORD: E2EAdminPass123!
+  api:
+    ports: !override ["18001:8000"]
+    environment:
+      APP_ENV: development
+      INITIAL_ADMIN_USERNAME: e2e-admin
+      INITIAL_ADMIN_PASSWORD: E2EAdminPass123!
+      SESSION_TTL_MINUTES: "120"
+  web:
+    ports: !override ["18081:80"]

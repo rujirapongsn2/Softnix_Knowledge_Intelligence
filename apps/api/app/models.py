@@ -37,6 +37,7 @@ class User(Timestamped, Base):
     # v1: single group per user (see plan — junction table only if multi-group
     # is ever needed).  NULL = unassigned (visible to admins only).
     group_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("groups.id"), nullable=True)
+    credentials_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
 
 
 class Group(Timestamped, Base):

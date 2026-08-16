@@ -34,7 +34,7 @@ def verify_password(value: str, encoded: str) -> bool:
 
 def create_session_token(user: User, kind: str, ttl: timedelta) -> str:
     settings = get_settings()
-    payload = {"sub": user.id, "kind": kind, "exp": datetime.now(timezone.utc) + ttl}
+    payload = {"sub": user.id, "kind": kind, "exp": datetime.now(timezone.utc) + ttl, "cv": user.credentials_version or 0}
     return jwt.encode(payload, settings.app_secret_key, algorithm="HS256")
 
 
@@ -62,7 +62,7 @@ def current_admin(request: Request, db: Session = Depends(get_db)) -> User:
     except jwt.PyJWTError:
         error("AUTH_TOKEN_INVALID", "Invalid session")
     user = db.get(User, payload["sub"])
-    if not user or not user.is_active:
+    if not user or not user.is_active or payload.get("cv", 0) != (user.credentials_version or 0):
         error("AUTH_TOKEN_INVALID", "Invalid session")
     return user
 
@@ -78,7 +78,7 @@ def refresh_admin(request: Request, db: Session = Depends(get_db)) -> User:
     except jwt.PyJWTError:
         error("AUTH_REFRESH_INVALID", "Refresh session is invalid")
     user = db.get(User, payload["sub"])
-    if not user or not user.is_active:
+    if not user or not user.is_active or payload.get("cv", 0) != (user.credentials_version or 0):
         error("AUTH_REFRESH_INVALID", "Refresh session is invalid")
     return user
 

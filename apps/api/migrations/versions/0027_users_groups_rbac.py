@@ -45,9 +45,11 @@ def upgrade() -> None:
         op.create_index("ix_kb_owners_user", "kb_owners", ["user_id"])
 
     user_columns = {column["name"] for column in inspector.get_columns("users")}
+    user_indexes = {index["name"] for index in inspector.get_indexes("users")}
     if "role" not in user_columns:
         op.add_column("users", sa.Column("role", sa.String(length=20), nullable=False, server_default="user"))
-    op.create_index("ix_users_role", "users", ["role"], unique=False)
+    if "ix_users_role" not in user_indexes:
+        op.create_index("ix_users_role", "users", ["role"], unique=False)
     if "group_id" not in user_columns:
         op.add_column(
             "users",

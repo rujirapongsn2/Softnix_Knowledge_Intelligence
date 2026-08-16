@@ -860,7 +860,8 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [isCreating, setIsCreating] = useState(false);
-  const [hubView, setHubView] = useState("cards");
+  const [hubView, setHubView] = useState(() => { try { return window.localStorage.getItem("kb.hub.view") === "table" ? "table" : "cards"; } catch { return "cards"; } });
+  const changeHubView = view => { setHubView(view); try { window.localStorage.setItem("kb.hub.view", view); } catch { /* private mode etc. — view still works, just not persisted */ } };
   const normalizedSearch = searchTerm.trim().toLocaleLowerCase();
   const visibleKnowledgeBases = kbs.filter(kb => {
     const matchesSearch = !normalizedSearch || `${kb.name} ${kb.code}`.toLocaleLowerCase().includes(normalizedSearch);
@@ -879,8 +880,8 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
       </div>
     </section>
     <div className="kb-hub-heading"><div className="kb-hub-heading-text"><h2>{t("kb.hub.heading")}</h2><p>{kbs.length ? t("kb.hub.shownCount", {shown: visibleKnowledgeBases.length, total: kbs.length}) : t("kb.hub.createFirst")}</p></div><div className="kb-hub-view-toggle" role="group" aria-label={t("kb.hub.viewToggleLabel")}>
-      <button type="button" className={hubView === "cards" ? "selected" : ""} aria-pressed={hubView === "cards"} onClick={() => setHubView("cards")}><SquaresFour weight="regular" size={16}/><span>{t("kb.hub.view.cards")}</span></button>
-      <button type="button" className={hubView === "table" ? "selected" : ""} aria-pressed={hubView === "table"} onClick={() => setHubView("table")}><Rows weight="regular" size={16}/><span>{t("kb.hub.view.table")}</span></button>
+      <button type="button" className={hubView === "cards" ? "selected" : ""} aria-pressed={hubView === "cards"} onClick={() => changeHubView("cards")}><SquaresFour weight="regular" size={16}/><span>{t("kb.hub.view.cards")}</span></button>
+      <button type="button" className={hubView === "table" ? "selected" : ""} aria-pressed={hubView === "table"} onClick={() => changeHubView("table")}><Rows weight="regular" size={16}/><span>{t("kb.hub.view.table")}</span></button>
     </div></div>
     {hubView === "table" && visibleKnowledgeBases.length > 0 && <section className="kb-hub-table-wrap" aria-label={t("kb.hub.heading")}>
       <div className="table-scroll">

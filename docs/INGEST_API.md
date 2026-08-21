@@ -121,6 +121,44 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
 }
 ```
 
+## นำเข้าข้อความโดยตรง (JSON Payload)
+
+`POST /api/v1/ingest/knowledge-bases/{kb_id}/documents/text` — `application/json`
+
+สำหรับระบบ Machine-to-Machine ที่ทำการสกัดข้อความ (OCR/LLM) มาแล้ว เช่น InsightDOC Custom API หรือ pipeline ภายนอก โดยไม่ต้องส่งไฟล์ไบนารี ข้อความจะถูกจัดเก็บเป็น Markdown document และเข้าสู่ pipeline ปกติ (chunk, embed, index)
+
+| Field | ต้องมี | คำอธิบาย |
+|---|---|---|
+| `title` | ✓ | ชื่อเอกสาร |
+| `text` | ✓ | ข้อความเนื้อหาเอกสาร (Markdown / Plain Text) |
+| `document_type` | | `general` (ค่าเริ่มต้น), `legal`, `regulation`, `contract` |
+| `template_id` | | id ของ Metadata Template (ทางเลือก) |
+| `metadata_json` | | JSON string ของ metadata (ทางเลือก) |
+| `published_at` | | วันที่ประกาศใช้ รูปแบบ `YYYY-MM-DD` (ทางเลือก) |
+
+```bash
+curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documents/text" \
+  -H "Authorization: Bearer $SOFTNIX_INGEST_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "สัญญาจัดซื้อ 2569",
+    "text": "# สัญญาจัดซื้อ 2569\nรายละเอียดข้อตกลงและเงื่อนไข...",
+    "document_type": "contract"
+  }'
+```
+
+ตอบ **`202 Accepted`** โครงสร้างผลลัพธ์เหมือนกับการอัปโหลดไฟล์:
+
+```json
+{
+  "status": "queued",
+  "document_id": "6f2c...",
+  "job_id": "a91d...",
+  "document_type": "contract",
+  "template_id": null
+}
+```
+
 ## ติดตามสถานะ
 
 ### สถานะเอกสารรายฉบับ

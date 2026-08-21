@@ -122,12 +122,16 @@ def prometheus_metrics():
     return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
-@app.get("/ready")
-def ready(db: Session = Depends(get_db)):
+def _probe_dependencies(db: Session) -> tuple[dict, dict]:
+    """Probe every backend dependency; return (ready, failed) service maps.
+
+    A service left unconfigured (empty env) appears in NEITHER map, so callers
+    can tell "down" apart from "not in use".
+    """
     settings = get_settings()
     dependencies, failures = {}, {}
     try:
-        db.execute(__import__("sqlalchemy").text("SELECT 1")); dependencies["database"] = "ready"
+        db.execute(text("SELECT 1")); dependencies["database"] = "ready"
     except Exception: failures["database"] = "unavailable"
     if settings.redis_url:
         try:
@@ -152,6 +156,12 @@ def ready(db: Session = Depends(get_db)):
             dependencies["ocr_chain"] = "ready"
         except (httpx.HTTPError, OSError):
             failures["ocr_chain"] = "unavailable"
+    return dependencies, failures
+
+
+@app.get("/ready")
+def ready(db: Session = Depends(get_db)):
+    dependencies, failures = _probe_dependencies(db)
     if failures:
         raise HTTPException(503, {"code": "DEPENDENCY_UNAVAILABLE", "message": "One or more dependencies are unavailable", "retryable": True, "details": failures})
     return {"status": "ready", "dependencies": dependencies}
@@ -161,6 +171,126 @@ def ready(db: Session = Depends(get_db)):
 def system_status(_: User = Depends(current_admin), db: Session = Depends(get_db)):
     """Authenticated dependency status for the administrator operations view."""
     return ready(db)
+
+
+@app.get("/api/v1/system/dashboard")
+def system_dashboard(user: User = Depends(require_manager), db: Session = Depends(get_db)):
+    """Comprehensive system status, service health, and ingestion metrics.
+
+    Every aggregate is scoped to the caller's visible Knowledge Bases (admin
+    sees every non-deleted KB) so a manager never observes another group's
+    documents, jobs, or ingest activity.
+    """
+    dependencies, failures = _probe_dependencies(db)
+
+    visible_kb_ids = kb_ids_visible_to(db, user)
+
+    doc_q = db.query(Document).filter(Document.knowledge_base_id.in_(visible_kb_ids))
+    doc_status_counts = {
+        str(row[0]): int(row[1])
+        for row in doc_q.with_entities(Document.status, func.count(Document.id)).group_by(Document.status).all()
+    }
+    # "Total documents" means live documents — soft-deleted rows are tracked
+    # separately in documents_by_status but must not inflate the headline.
+    total_docs = sum(v for k, v in doc_status_counts.items() if k != "deleted")
+
+    job_q = db.query(ProcessingJob).filter(ProcessingJob.knowledge_base_id.in_(visible_kb_ids))
+    job_status_counts = {
+        str(row[0]): int(row[1])
+        for row in job_q.with_entities(ProcessingJob.status, func.count(ProcessingJob.id)).group_by(ProcessingJob.status).all()
+    }
+
+    error_breakdown_raw = (
+        job_q.filter(ProcessingJob.error_code.isnot(None))
+        .with_entities(ProcessingJob.error_code, func.count(ProcessingJob.id))
+        .group_by(ProcessingJob.error_code)
+        .order_by(func.count(ProcessingJob.id).desc())
+        .limit(10)
+        .all()
+    )
+    error_breakdown = [{"error_code": code, "count": count} for code, count in error_breakdown_raw]
+
+    rej_q = db.query(AuditLog).filter(AuditLog.action == "document.ingest.rejected")
+    rej_q = rej_q.filter(AuditLog.metadata_json["knowledge_base_id"].as_string().in_(visible_kb_ids))
+    recent_rejections_raw = rej_q.order_by(AuditLog.created_at.desc()).limit(10).all()
+    rejections = [
+        {
+            "id": r.id,
+            "filename": (r.metadata_json or {}).get("filename"),
+            "error_code": (r.metadata_json or {}).get("error_code"),
+            "token_name": (r.metadata_json or {}).get("token_name"),
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in recent_rejections_raw
+    ]
+
+    active_jobs_raw = (
+        job_q.filter(ProcessingJob.status.in_(["queued", "running"]))
+        .order_by(ProcessingJob.created_at.asc())
+        .limit(20)
+        .all()
+    )
+    active_jobs = [
+        {
+            "id": j.id,
+            "document_id": j.document_id,
+            "knowledge_base_id": j.knowledge_base_id,
+            "job_type": j.job_type,
+            "status": j.status,
+            "current_stage": j.current_stage,
+            "progress_percent": j.progress_percent,
+            "attempt_count": j.attempt_count,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+        }
+        for j in active_jobs_raw
+    ]
+
+    recent_jobs_raw = (
+        job_q.order_by(ProcessingJob.created_at.desc())
+        .limit(15)
+        .all()
+    )
+    recent_jobs = [
+        {
+            "id": j.id,
+            "document_id": j.document_id,
+            "knowledge_base_id": j.knowledge_base_id,
+            "job_type": j.job_type,
+            "status": j.status,
+            "current_stage": j.current_stage,
+            "progress_percent": j.progress_percent,
+            "attempt_count": j.attempt_count,
+            "error_code": j.error_code,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+        }
+        for j in recent_jobs_raw
+    ]
+
+    kb_map = {
+        kb.id: kb.name
+        for kb in db.query(KnowledgeBase).filter(KnowledgeBase.id.in_(visible_kb_ids)).all()
+    }
+
+    return {
+        "status": "ready" if not failures else "degraded",
+        "services": {
+            "dependencies": dependencies,
+            "failures": failures,
+        },
+        "ingest_metrics": {
+            "total_documents": total_docs,
+            "documents_by_status": doc_status_counts,
+            "jobs_by_status": job_status_counts,
+            "in_queue_count": job_status_counts.get("queued", 0) + job_status_counts.get("running", 0),
+            "completed_count": doc_status_counts.get("completed", 0),
+            "failed_count": doc_status_counts.get("failed", 0),
+            "error_breakdown": error_breakdown,
+            "rejections": rejections,
+            "active_jobs": active_jobs,
+            "recent_jobs": recent_jobs,
+            "knowledge_bases": kb_map,
+        },
+    }
 
 
 @app.post("/api/v1/auth/login")

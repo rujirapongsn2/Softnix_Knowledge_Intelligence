@@ -26,6 +26,17 @@
 .document-type-drawer-close { width: 2rem; height: 2rem; border: 0; border-radius: 8px; background: transparent; color: var(--color-text-secondary); font-size: 1.4rem; line-height: 1; cursor: pointer; }
 .document-type-drawer-close:hover, .document-type-drawer-close:focus-visible { background: #eaf5f6; color: #0d6874; outline: 3px solid #147d8935; }
 
+/* System Status Dashboard */
+.service-status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-top: 1rem; }
+.service-status-card { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.25rem; border: 1px solid #d7e4e7; border-radius: .8rem; background: #fbfdfd; }
+.service-status-info { display: flex; align-items: center; gap: .75rem; }
+.service-status-info div { display: grid; gap: .1rem; }
+.service-status-info b { font-size: .92rem; color: var(--color-text-primary); }
+.service-status-info span { font-size: .78rem; color: #5d737a; }
+.status-dot.ready, .status-dot.online { background: #21a66b; box-shadow: 0 0 0 4px #21a66b1f; }
+.status-dot.unavailable, .status-dot.failed { background: #d93d42; box-shadow: 0 0 0 4px #d93d421f; }
+.status-dot.degraded, .status-dot.warning { background: #e69138; box-shadow: 0 0 0 4px #e691381f; }
+
 @media (max-width: 700px) {
   .users-toolbar { justify-content: flex-start; }
   .data-table th, .data-table td { padding: .6rem .65rem; font-size: .82rem; }

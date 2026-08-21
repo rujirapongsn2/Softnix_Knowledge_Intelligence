@@ -24,7 +24,7 @@ import {legalLabels} from "./translations.js";
 const ACCEPTED_FILES = ".pdf,.docx,.pptx,.xlsx,.xls,.txt,.md,.html,.htm,.csv,.json";
 const MAX_FILE_SIZE_MB = Math.max(1, Number(import.meta.env.VITE_MAX_FILE_SIZE_MB || 100));
 const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
-const WORKSPACE_VIEWS = new Set(["knowledge-bases", "documents", "search", "explore", "mcp-tokens", "ingest-tokens", "logs", "users", "groups", "profile"]);
+const WORKSPACE_VIEWS = new Set(["knowledge-bases", "documents", "search", "explore", "mcp-tokens", "ingest-tokens", "system-status", "logs", "users", "groups", "profile"]);
 const ROLE_LEVEL = {user: 0, manager: 1, admin: 2};
 const isActiveProcessingJob = job => ["queued", "running"].includes(job?.status);
 const DOCUMENT_TYPE_OPTIONS = [
@@ -577,12 +577,12 @@ function App() {
       <SideNavItem icon={<MagnifyingGlass weight="regular"/>} label={t("workflow.search")} isSelected={activeView === "search"} onClick={() => switchView("search")}/>
       <SideNavItem icon={<Compass weight="regular"/>} label={t("workflow.explore")} isSelected={activeView === "explore"} onClick={() => switchView("explore")}/>
     </SideNavSection>
-    <SideNavSection title={t("sideNav.category.administration")} subtitle={t("sideNav.category.administration.subtitle")} className="side-nav-category"><SideNavItem icon={<Key weight="regular"/>} label={t("workflow.mcpTokens")} isSelected={activeView === "mcp-tokens"} onClick={() => switchView("mcp-tokens")}/><SideNavItem icon={<BookOpen weight="regular"/>} label={t("workflow.ingestTokens")} isSelected={activeView === "ingest-tokens"} onClick={() => switchView("ingest-tokens")}/>{userRoleLevel >= ROLE_LEVEL.manager && <SideNavItem icon={<ChartLineUp weight="regular"/>} label={t("workflow.logs")} isSelected={activeView === "logs"} onClick={() => switchView("logs")}/>}{userRoleLevel >= ROLE_LEVEL.admin && <><SideNavItem icon={<Users weight="regular"/>} label={t("workflow.users")} isSelected={activeView === "users"} onClick={() => switchView("users")}/><SideNavItem icon={<UsersThree weight="regular"/>} label={t("workflow.groups")} isSelected={activeView === "groups"} onClick={() => switchView("groups")}/></>}</SideNavSection>
+    <SideNavSection title={t("sideNav.category.administration")} subtitle={t("sideNav.category.administration.subtitle")} className="side-nav-category"><SideNavItem icon={<Key weight="regular"/>} label={t("workflow.mcpTokens")} isSelected={activeView === "mcp-tokens"} onClick={() => switchView("mcp-tokens")}/><SideNavItem icon={<BookOpen weight="regular"/>} label={t("workflow.ingestTokens")} isSelected={activeView === "ingest-tokens"} onClick={() => switchView("ingest-tokens")}/>{userRoleLevel >= ROLE_LEVEL.manager && <><SideNavItem icon={<HardDrives weight="regular"/>} label={t("workflow.systemStatus")} isSelected={activeView === "system-status"} onClick={() => switchView("system-status")}/><SideNavItem icon={<ChartLineUp weight="regular"/>} label={t("workflow.logs")} isSelected={activeView === "logs"} onClick={() => switchView("logs")}/></>}{userRoleLevel >= ROLE_LEVEL.admin && <><SideNavItem icon={<Users weight="regular"/>} label={t("workflow.users")} isSelected={activeView === "users"} onClick={() => switchView("users")}/><SideNavItem icon={<UsersThree weight="regular"/>} label={t("workflow.groups")} isSelected={activeView === "groups"} onClick={() => switchView("groups")}/></>}</SideNavSection>
   </SideNav>;
   const topNav = <TopNav label={t("app.workspaceNavAriaLabel")} menuLabel={t("ui.openNavigation")} commandLabel={t("ui.openCommandPalette")} heading={<TopNavHeading heading={selectedKb?.name || t("app.workspaceTitle")}/>} endContent={<div className="topnav-user"><Button label={language === "th" ? "EN" : "TH"} size="sm" variant="ghost" onClick={() => setLanguage(language === "th" ? "en" : "th")} aria-label={t("app.toggleLanguage")}/><span className="status-indicator"/> <button type="button" className="topnav-profile-button" onClick={() => switchView("profile")} title={t("workflow.profile")}>{user.username}</button></div>}/>;
   const commandItems = [
     ["knowledge-bases", Database, t("workflow.knowledgeBases")], ["documents", FileText, t("workflow.documents")], ["search", MagnifyingGlass, t("workflow.search")], ["explore", Compass, t("workflow.explore")], ["mcp-tokens", Key, t("workflow.mcpTokens")], ["ingest-tokens", BookOpen, t("workflow.ingestTokens")],
-    ...(userRoleLevel >= ROLE_LEVEL.manager ? [["logs", ChartLineUp, t("workflow.logs")]] : []),
+    ...(userRoleLevel >= ROLE_LEVEL.manager ? [["system-status", HardDrives, t("workflow.systemStatus")], ["logs", ChartLineUp, t("workflow.logs")]] : []),
     ...(userRoleLevel >= ROLE_LEVEL.admin ? [["users", Users, t("workflow.users")], ["groups", UsersThree, t("workflow.groups")]] : []),
     ["profile", User, t("workflow.profile")],
   ].map(([id, Icon, label]) => ({id, label, icon: <Icon size={16}/>, group: t("app.workspaceTitle"), onSelect: () => switchView(id)}));
@@ -614,9 +614,247 @@ function App() {
       )}
       {activeView === "mcp-tokens" && <McpTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
       {activeView === "ingest-tokens" && <IngestTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
+      {activeView === "system-status" && <SystemStatusView />}
       {activeView === "logs" && <LoggingView transactions={transactionLogs} traces={traceLogs} loadTransactions={loadTransactionLogs} loadTraces={loadTraceLogs} hasMoreTransactions={Boolean(transactionCursor)} hasMoreTraces={Boolean(traceCursor)}/>}
     </div>
   </AppShell></Theme>;
+}
+
+function SystemStatusView() {
+  const {t} = useLanguage();
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [autoRefresh, setAutoRefresh] = useState(true);
+
+  const loadStatus = useCallback(async () => {
+    try {
+      const res = await api("/v1/system/dashboard");
+      setData(res);
+      setError("");
+    } catch (err) {
+      setError(err.message || t("systemStatus.loading"));
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
+  useEffect(() => {
+    loadStatus();
+  }, [loadStatus]);
+
+  useEffect(() => {
+    if (!autoRefresh) return undefined;
+    const timer = window.setInterval(loadStatus, 10000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, loadStatus]);
+
+  const metrics = data?.ingest_metrics || {};
+  const services = data?.services?.dependencies || {};
+  const failures = data?.services?.failures || {};
+  const isAllReady = data?.status === "ready";
+
+  // Service cards are derived from what the backend actually probed, so a new
+  // dependency appears automatically and an unconfigured one (absent from both
+  // maps) never shows a misleading "Configuring..." card. Labels are localized;
+  // unknown services fall back to their raw key.
+  const serviceLabels = {
+    database: t("systemStatus.service.database"),
+    redis: t("systemStatus.service.redis"),
+    neo4j: t("systemStatus.service.neo4j"),
+    lightrag: t("systemStatus.service.lightrag"),
+    ocr_chain: t("systemStatus.service.ocr_chain"),
+  };
+  const serviceKeys = Array.from(new Set([...Object.keys(services), ...Object.keys(failures)]));
+
+  return <>
+    <PageHeading
+      eyebrow={t("systemStatus.eyebrow")}
+      title={t("systemStatus.title")}
+      description={t("systemStatus.description")}
+      actions={<>
+        <label className="log-auto-refresh">
+          <input type="checkbox" checked={autoRefresh} onChange={event => setAutoRefresh(event.target.checked)}/> {t("systemStatus.autoRefresh")}
+        </label>
+        <Button label={t("systemStatus.refresh")} variant="secondary" onClick={loadStatus} isLoading={loading}/>
+      </>}
+    />
+
+    {error && <p className="inline-error access-error" role="alert">{error}</p>}
+
+    <section className="content-section">
+      <div className="section-title">
+        <div>
+          <h2>{t("systemStatus.servicesTitle")}</h2>
+          <p className="section-copy">{t("systemStatus.servicesHelp")}</p>
+        </div>
+        <Badge
+          label={isAllReady ? t("systemStatus.allReady") : t("systemStatus.degraded")}
+          variant={isAllReady ? "success" : "warning"}
+        />
+      </div>
+
+      <div className="service-status-grid">
+        {serviceKeys.map(key => {
+          const name = serviceLabels[key] || key;
+          const isReady = services[key] === "ready";
+          const isFailed = Boolean(failures[key]);
+          const status = isReady ? "ready" : isFailed ? "unavailable" : "checking";
+          return (
+            <div key={key} className="service-status-card">
+              <div className="service-status-info">
+                <span className={`status-dot ${status}`}/>
+                <div>
+                  <b>{name}</b>
+                  <span>{isReady ? "Ready / Online" : isFailed ? "Unavailable" : "Configuring..."}</span>
+                </div>
+              </div>
+              <Badge label={isReady ? "UP" : isFailed ? "DOWN" : "N/A"} variant={isReady ? "success" : isFailed ? "error" : "neutral"}/>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+
+    <section className="content-section">
+      <div className="section-title">
+        <div>
+          <h2>{t("systemStatus.metricsTitle")}</h2>
+        </div>
+      </div>
+      <div className="metric-grid">
+        <Metric
+          value={metrics.total_documents ?? "—"}
+          label={t("systemStatus.totalDocs")}
+          detail={t("systemStatus.totalDocsDetail")}
+        />
+        <Metric
+          value={metrics.in_queue_count ?? "—"}
+          label={t("systemStatus.inQueue")}
+          detail={t("systemStatus.inQueueDetail")}
+        />
+        <Metric
+          value={metrics.completed_count ?? "—"}
+          label={t("systemStatus.completed")}
+          detail={t("systemStatus.completedDetail")}
+        />
+        <Metric
+          value={metrics.failed_count ?? "—"}
+          label={t("systemStatus.failed")}
+          detail={t("systemStatus.failedDetail")}
+        />
+      </div>
+    </section>
+
+    <section className="content-section two-column">
+      <Card padding={4}>
+        <div className="section-title">
+          <div>
+            <h2>{t("systemStatus.errorsTitle")}</h2>
+            <p className="section-copy">{t("systemStatus.errorsHelp")}</p>
+          </div>
+        </div>
+        {metrics.error_breakdown?.length ? (
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>{t("systemStatus.errorCol")}</th>
+                  <th>{t("systemStatus.countCol")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {metrics.error_breakdown.map(err => (
+                  <tr key={err.error_code}>
+                    <td><code>{err.error_code}</code></td>
+                    <td><b>{err.count}</b></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <EmptyState isCompact title={t("systemStatus.noErrors")} description=""/>
+        )}
+      </Card>
+
+      <Card padding={4}>
+        <div className="section-title">
+          <div>
+            <h2>{t("systemStatus.rejectionsTitle")}</h2>
+            <p className="section-copy">{t("systemStatus.rejectionsHelp")}</p>
+          </div>
+        </div>
+        {metrics.rejections?.length ? (
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>File / Title</th>
+                  <th>Error Code</th>
+                  <th>Token</th>
+                  <th>Time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {metrics.rejections.map(rej => (
+                  <tr key={rej.id}>
+                    <td><b>{rej.filename || "—"}</b></td>
+                    <td><code>{rej.error_code}</code></td>
+                    <td>{rej.token_name || "—"}</td>
+                    <td><small>{rej.created_at ? new Date(rej.created_at).toLocaleTimeString() : "—"}</small></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <EmptyState isCompact title={t("systemStatus.noRejections")} description=""/>
+        )}
+      </Card>
+    </section>
+
+    <section className="content-section">
+      <Card padding={4}>
+        <div className="section-title">
+          <div>
+            <h2>{t("systemStatus.activeJobsTitle")}</h2>
+            <p className="section-copy">{t("systemStatus.activeJobsHelp")}</p>
+          </div>
+        </div>
+        {metrics.active_jobs?.length ? (
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Job ID</th>
+                  <th>Knowledge Base</th>
+                  <th>Job Type</th>
+                  <th>Stage</th>
+                  <th>Progress</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {metrics.active_jobs.map(job => (
+                  <tr key={job.id}>
+                    <td><code>{job.id.slice(0, 8)}…</code></td>
+                    <td>{metrics.knowledge_bases?.[job.knowledge_base_id] || job.knowledge_base_id || "—"}</td>
+                    <td><b>{job.job_type}</b></td>
+                    <td>{job.current_stage || "queued"}</td>
+                    <td>{job.progress_percent}%</td>
+                    <td><StatusBadge status={job.status}/></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <EmptyState isCompact title={t("systemStatus.noActiveJobs")} description=""/>
+        )}
+      </Card>
+    </section>
+  </>;
 }
 
 function LoggingView({transactions, traces, loadTransactions, loadTraces, hasMoreTransactions, hasMoreTraces}) {
@@ -757,9 +995,10 @@ const WORKFLOW_KEYS = {
   explore: "workflow.explore",
   "mcp-tokens": "workflow.mcpTokens",
   "ingest-tokens": "workflow.ingestTokens",
+  "system-status": "workflow.systemStatus",
   logs: "workflow.logs",
 };
-const isAdministrationView = view => view === "mcp-tokens" || view === "ingest-tokens" || view === "logs";
+const isAdministrationView = view => view === "mcp-tokens" || view === "ingest-tokens" || view === "system-status" || view === "logs";
 // Bound how far "Back" can retrace: enough to undo a few steps without the
 // history growing without limit as the user bounces between views.
 const MAX_VIEW_TRAIL = 4;
@@ -784,7 +1023,8 @@ function WorkflowNavigation({activeView, selectedKb, hasCompletedDocuments, view
     : activeView === "documents" && hasCompletedDocuments ? "search"
       : activeView === "search" && hasCompletedDocuments ? "explore"
         : activeView === "mcp-tokens" ? "ingest-tokens"
-          : activeView === "ingest-tokens" ? "logs" : null;
+          : activeView === "ingest-tokens" ? "system-status"
+            : activeView === "system-status" ? "logs" : null;
   const nextLabel = nextView ? workflowLabel(nextView) : null;
   const canNavigateNext = nextView && (nextView !== "documents" || Boolean(selectedKb)) && (nextView !== "search" && nextView !== "explore" || Boolean(selectedKb && hasCompletedDocuments));
   const backLabel = previousLabel ? t("nav.backTo", {label: previousLabel}) : t("nav.back");
@@ -1748,25 +1988,35 @@ ${buildAgentSkillRules()}`;
 function buildIngestCurl({apiBase, kbId, token}) {
   return `# 0. List the Knowledge Base this token can write to (0 or 1 item)
 curl "${apiBase}/ingest/knowledge-bases" \\
-  -H "Authorization: Bearer ${token}"
+  -H "Authorization: Bearer ***"
 
-# 1. Upload a single document (202 = queued for processing)
+# 1. Upload a single document file (202 = queued for processing)
 curl -X POST "${apiBase}/ingest/knowledge-bases/${kbId}/documents" \\
-  -H "Authorization: Bearer ${token}" \\
+  -H "Authorization: Bearer ***" \\
   -F "file=@./contract.pdf" \\
   -F "title=Supply agreement 2026" \\
   -F "document_type=contract"
 
-# 2. Upload up to 20 documents in one request (per-file results)
+# 2. Ingest pre-extracted text / JSON payload (OCR/LLM / InsightDOC Custom API)
+curl -X POST "${apiBase}/ingest/knowledge-bases/${kbId}/documents/text" \\
+  -H "Authorization: Bearer ***" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "title": "Supply agreement 2026",
+    "text": "# Supply agreement 2026\\nContract terms and details...",
+    "document_type": "contract"
+  }'
+
+# 3. Upload up to 20 documents in one request (per-file results)
 curl -X POST "${apiBase}/ingest/knowledge-bases/${kbId}/documents/batch" \\
-  -H "Authorization: Bearer ${token}" \\
+  -H "Authorization: Bearer ***" \\
   -F "files=@./a.pdf" \\
   -F "files=@./b.docx" \\
   -F "document_type=general"
 
-# 3. Poll one document until it leaves the queue
+# 4. Poll one document until it leaves the queue
 curl "${apiBase}/ingest/documents/DOCUMENT_ID" \\
-  -H "Authorization: Bearer ${token}"`;
+  -H "Authorization: Bearer ***"`;
 }
 
 function buildIngestPython({apiBase, kbId, token}) {
@@ -1800,6 +2050,23 @@ def upload(path, document_type="general", title=None):
     return response.json()["document_id"]
 
 
+def upload_text(title, text, document_type="general", metadata_json=None):
+    """Ingest pre-extracted text/Markdown directly via JSON body (e.g. OCR/InsightDOC)."""
+    payload = {"title": title, "text": text, "document_type": document_type}
+    if metadata_json:
+        payload["metadata_json"] = metadata_json
+    response = requests.post(
+        f"{API_BASE}/ingest/knowledge-bases/{KB_ID}/documents/text",
+        headers=HEADERS,
+        json=payload,
+        timeout=120,
+    )
+    if response.status_code == 409:
+        return None  # FILE_DUPLICATE: already ingested, nothing to do
+    response.raise_for_status()
+    return response.json()["document_id"]
+
+
 def wait_for(document_id, interval=5, max_interval=60):
     while True:
         document = requests.get(f"{API_BASE}/ingest/documents/{document_id}",
@@ -1810,7 +2077,12 @@ def wait_for(document_id, interval=5, max_interval=60):
         interval = min(interval * 2, max_interval)  # back off on long documents
 
 
+# Option A: Upload file
 document_id = upload("./contract.pdf", "contract", "Supply agreement 2026")
+
+# Option B: Ingest pre-extracted text / JSON
+# document_id = upload_text("Supply agreement 2026", "# Section 1\\nTerms...", "contract")
+
 if document_id:
     print(wait_for(document_id))`;
 }
@@ -1841,6 +2113,19 @@ async function upload(path, documentType = "general", title) {
   return (await response.json()).document_id;
 }
 
+async function uploadText(title, text, documentType = "general", metadataJson = null) {
+  const payload = {title, text, document_type: documentType};
+  if (metadataJson) payload.metadata_json = metadataJson;
+  const response = await fetch(\`\${API_BASE}/ingest/knowledge-bases/\${KB_ID}/documents/text\`, {
+    method: "POST",
+    headers: {...HEADERS, "Content-Type": "application/json"},
+    body: JSON.stringify(payload),
+  });
+  if (response.status === 409) return null; // FILE_DUPLICATE: already ingested
+  if (!response.ok) throw new Error(JSON.stringify(await response.json()));
+  return (await response.json()).document_id;
+}
+
 async function waitFor(documentId, interval = 5000, maxInterval = 60000) {
   for (;;) {
     const response = await fetch(\`\${API_BASE}/ingest/documents/\${documentId}\`, {headers: HEADERS});
@@ -1851,7 +2136,12 @@ async function waitFor(documentId, interval = 5000, maxInterval = 60000) {
   }
 }
 
+// Option A: Upload file
 const documentId = await upload("./contract.pdf", "contract", "Supply agreement 2026");
+
+// Option B: Ingest pre-extracted text / JSON
+// const documentId = await uploadText("Supply agreement 2026", "# Section 1\\nTerms...", "contract");
+
 if (documentId) console.log(await waitFor(documentId));`;
 }
 
@@ -1866,6 +2156,7 @@ const isIngestToken = token => Boolean(token.allowed_scopes?.includes(INGEST_SCO
 const INGEST_ENDPOINTS = [
   {method: "GET", path: "/ingest/knowledge-bases", descriptionKey: "ingestTokens.endpoints.listKb"},
   {method: "POST", path: "/ingest/knowledge-bases/{kb_id}/documents", descriptionKey: "ingestTokens.endpoints.uploadOne"},
+  {method: "POST", path: "/ingest/knowledge-bases/{kb_id}/documents/text", descriptionKey: "ingestTokens.endpoints.uploadText"},
   {method: "POST", path: "/ingest/knowledge-bases/{kb_id}/documents/batch", descriptionKey: "ingestTokens.endpoints.uploadBatch"},
   {method: "GET", path: "/ingest/knowledge-bases/{kb_id}/documents", descriptionKey: "ingestTokens.endpoints.listDocuments"},
   {method: "GET", path: "/ingest/documents/{document_id}", descriptionKey: "ingestTokens.endpoints.getDocument"},

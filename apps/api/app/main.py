@@ -20,7 +20,7 @@ from .audit import record_audit, record_mcp_error_trace, record_retrieval_execut
 from .db import Base, engine, get_db, SessionLocal
 from .graph_store import Neo4jGraphStore
 from .legal_registry import provision_number_matches, resolve_instrument_statuses
-from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, Group, KbOwner, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, ROLE_ADMIN, ROLES, TokenKey, TraceRun, TraceSpan, User
+from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, Group, KbOwner, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, ROLE_ADMIN, TokenKey, TraceRun, TraceSpan, User
 from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, custom_template_fields, list_templates, merge_profile_fields, metadata_search_text, resolve_template, template_code, validate_metadata_values
 from .observability import metrics, now
 from .openrouter import OpenRouterClient
@@ -122,12 +122,26 @@ def prometheus_metrics():
     return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
+import time as _time
+
+# TTL cache for dependency probes: a manager's 10s auto-refresh must not re-run
+# synchronous httpx probes (redis/neo4j/lightrag/ocr, 2-5s timeouts each) on
+# every request. 6s keeps the dashboard reactive while capping probe load.
+_PROBE_CACHE: dict[str, tuple[float, tuple[dict, dict]]] = {}
+_PROBE_CACHE_TTL_SECONDS = 6.0
+
+
 def _probe_dependencies(db: Session) -> tuple[dict, dict]:
     """Probe every backend dependency; return (ready, failed) service maps.
 
     A service left unconfigured (empty env) appears in NEITHER map, so callers
-    can tell "down" apart from "not in use".
+    can tell "down" apart from "not in use". Results are cached for
+    _PROBE_CACHE_TTL_SECONDS to keep the dashboard's auto-refresh cheap.
     """
+    now = _time.monotonic()
+    cached = _PROBE_CACHE.get("result")
+    if cached and now - cached[0] < _PROBE_CACHE_TTL_SECONDS:
+        return cached[1]
     settings = get_settings()
     dependencies, failures = {}, {}
     try:
@@ -156,6 +170,7 @@ def _probe_dependencies(db: Session) -> tuple[dict, dict]:
             dependencies["ocr_chain"] = "ready"
         except (httpx.HTTPError, OSError):
             failures["ocr_chain"] = "unavailable"
+    _PROBE_CACHE["result"] = (now, (dependencies, failures))
     return dependencies, failures
 
 
@@ -219,7 +234,7 @@ def system_dashboard(user: User = Depends(require_manager), db: Session = Depend
             "filename": (r.metadata_json or {}).get("filename"),
             "error_code": (r.metadata_json or {}).get("error_code"),
             "token_name": (r.metadata_json or {}).get("token_name"),
-            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
         }
         for r in recent_rejections_raw
     ]
@@ -240,7 +255,7 @@ def system_dashboard(user: User = Depends(require_manager), db: Session = Depend
             "current_stage": j.current_stage,
             "progress_percent": j.progress_percent,
             "attempt_count": j.attempt_count,
-            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "created_at": j.created_at.isoformat() + "Z" if j.created_at else None,
         }
         for j in active_jobs_raw
     ]
@@ -261,7 +276,7 @@ def system_dashboard(user: User = Depends(require_manager), db: Session = Depend
             "progress_percent": j.progress_percent,
             "attempt_count": j.attempt_count,
             "error_code": j.error_code,
-            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "created_at": j.created_at.isoformat() + "Z" if j.created_at else None,
         }
         for j in recent_jobs_raw
     ]

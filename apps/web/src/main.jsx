@@ -614,7 +614,7 @@ function App() {
       )}
       {activeView === "mcp-tokens" && <McpTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
       {activeView === "ingest-tokens" && <IngestTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
-      {activeView === "system-status" && <SystemStatusView />}
+      {activeView === "system-status" && userRoleLevel >= ROLE_LEVEL.manager && <SystemStatusView />}
       {activeView === "logs" && <LoggingView transactions={transactionLogs} traces={traceLogs} loadTransactions={loadTransactionLogs} loadTraces={loadTraceLogs} hasMoreTransactions={Boolean(transactionCursor)} hasMoreTraces={Boolean(traceCursor)}/>}
     </div>
   </AppShell></Theme>;
@@ -626,15 +626,19 @@ function SystemStatusView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const inFlightRef = useRef(null);
 
   const loadStatus = useCallback(async () => {
+    if (inFlightRef.current) return; // a slow poll must not overlap requests
+    inFlightRef.current = true;
     try {
       const res = await api("/v1/system/dashboard");
       setData(res);
       setError("");
     } catch (err) {
-      setError(err.message || t("systemStatus.loading"));
+      setError(err.message || t("systemStatus.loadError"));
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   }, [t]);
@@ -676,7 +680,7 @@ function SystemStatusView() {
         <label className="log-auto-refresh">
           <input type="checkbox" checked={autoRefresh} onChange={event => setAutoRefresh(event.target.checked)}/> {t("systemStatus.autoRefresh")}
         </label>
-        <Button label={t("systemStatus.refresh")} variant="secondary" onClick={loadStatus} isLoading={loading}/>
+        <Button label={t("systemStatus.refresh")} variant="secondary" onClick={() => { setLoading(true); loadStatus(); }} isLoading={loading}/>
       </>}
     />
 
@@ -699,17 +703,16 @@ function SystemStatusView() {
           const name = serviceLabels[key] || key;
           const isReady = services[key] === "ready";
           const isFailed = Boolean(failures[key]);
-          const status = isReady ? "ready" : isFailed ? "unavailable" : "checking";
           return (
             <div key={key} className="service-status-card">
               <div className="service-status-info">
-                <span className={`status-dot ${status}`}/>
+                <span className={`status-dot ${isReady ? "ready" : "unavailable"}`}/>
                 <div>
                   <b>{name}</b>
-                  <span>{isReady ? "Ready / Online" : isFailed ? "Unavailable" : "Configuring..."}</span>
+                  <span>{isReady ? t("systemStatus.serviceReady") : t("systemStatus.serviceUnavailable")}</span>
                 </div>
               </div>
-              <Badge label={isReady ? "UP" : isFailed ? "DOWN" : "N/A"} variant={isReady ? "success" : isFailed ? "error" : "neutral"}/>
+              <Badge label={isReady ? t("systemStatus.up") : t("systemStatus.down")} variant={isReady ? "success" : "error"}/>
             </div>
           );
         })}
@@ -790,10 +793,10 @@ function SystemStatusView() {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>File / Title</th>
-                  <th>Error Code</th>
-                  <th>Token</th>
-                  <th>Time</th>
+                  <th>{t("systemStatus.colFileTitle")}</th>
+                  <th>{t("systemStatus.colErrorCode")}</th>
+                  <th>{t("systemStatus.colToken")}</th>
+                  <th>{t("systemStatus.colTime")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -827,12 +830,12 @@ function SystemStatusView() {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>Job ID</th>
-                  <th>Knowledge Base</th>
-                  <th>Job Type</th>
-                  <th>Stage</th>
-                  <th>Progress</th>
-                  <th>Status</th>
+                  <th>{t("systemStatus.colJobId")}</th>
+                  <th>{t("systemStatus.colKnowledgeBase")}</th>
+                  <th>{t("systemStatus.colJobType")}</th>
+                  <th>{t("systemStatus.colStage")}</th>
+                  <th>{t("systemStatus.colProgress")}</th>
+                  <th>{t("systemStatus.colStatus")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -851,6 +854,47 @@ function SystemStatusView() {
           </div>
         ) : (
           <EmptyState isCompact title={t("systemStatus.noActiveJobs")} description=""/>
+        )}
+      </Card>
+    </section>
+
+    <section className="content-section">
+      <Card padding={4}>
+        <div className="section-title">
+          <div>
+            <h2>{t("systemStatus.recentJobsTitle")}</h2>
+            <p className="section-copy">{t("systemStatus.recentJobsHelp")}</p>
+          </div>
+        </div>
+        {metrics.recent_jobs?.length ? (
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>{t("systemStatus.colJobId")}</th>
+                  <th>{t("systemStatus.colKnowledgeBase")}</th>
+                  <th>{t("systemStatus.colJobType")}</th>
+                  <th>{t("systemStatus.colStatus")}</th>
+                  <th>{t("systemStatus.colErrorCode")}</th>
+                  <th>{t("systemStatus.colTime")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {metrics.recent_jobs.map(job => (
+                  <tr key={job.id}>
+                    <td><code>{job.id.slice(0, 8)}…</code></td>
+                    <td>{metrics.knowledge_bases?.[job.knowledge_base_id] || job.knowledge_base_id || "—"}</td>
+                    <td><b>{job.job_type}</b></td>
+                    <td><StatusBadge status={job.status}/></td>
+                    <td>{job.error_code ? <code>{job.error_code}</code> : "—"}</td>
+                    <td><small>{job.created_at ? new Date(job.created_at).toLocaleString() : "—"}</small></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <EmptyState isCompact title={t("systemStatus.noRecentJobs")} description=""/>
         )}
       </Card>
     </section>
@@ -1988,39 +2032,39 @@ ${buildAgentSkillRules()}`;
 function buildIngestCurl({apiBase, kbId, token}) {
   return `# 0. List the Knowledge Base this token can write to (0 or 1 item)
 curl "${apiBase}/ingest/knowledge-bases" \\
-  -H "Authorization: Bearer ***"
+  -H "Authorization: Bearer ${token}"
 
-# 1. Upload a single document file (202 = queued for processing)
+# 1. Upload a single document (202 = queued for processing)
 curl -X POST "${apiBase}/ingest/knowledge-bases/${kbId}/documents" \\
-  -H "Authorization: Bearer ***" \\
+  -H "Authorization: Bearer ${token}" \\
   -F "file=@./contract.pdf" \\
   -F "title=Supply agreement 2026" \\
   -F "document_type=contract"
 
 # 2. Ingest pre-extracted text / JSON payload (OCR/LLM / InsightDOC Custom API)
-curl -X POST "${apiBase}/ingest/knowledge-bases/${kbId}/documents/text" \\
-  -H "Authorization: Bearer ***" \\
-  -H "Content-Type: application/json" \\
+curl -X POST "${apiBase}/ingest/knowledge-bases/${kbId}/documents/text" \
+  -H "Authorization: Bearer ${token}" \
+  -H "Content-Type: application/json" \
   -d '{
     "title": "Supply agreement 2026",
-    "text": "# Supply agreement 2026\\nContract terms and details...",
+    "text": "# Supply agreement 2026\nContract terms and details...",
     "document_type": "contract"
   }'
 
 # 3. Upload up to 20 documents in one request (per-file results)
 curl -X POST "${apiBase}/ingest/knowledge-bases/${kbId}/documents/batch" \\
-  -H "Authorization: Bearer ***" \\
+  -H "Authorization: Bearer ${token}" \\
   -F "files=@./a.pdf" \\
   -F "files=@./b.docx" \\
   -F "document_type=general"
 
 # 4. Poll one document until it leaves the queue
 curl "${apiBase}/ingest/documents/DOCUMENT_ID" \\
-  -H "Authorization: Bearer ***"`;
+  -H "Authorization: Bearer ${token}"`;
 }
 
 function buildIngestPython({apiBase, kbId, token}) {
-  return `import os, time, requests
+  return `import json, os, time, requests
 
 API_BASE = "${apiBase}"
 KB_ID = "${kbId}"
@@ -2050,11 +2094,15 @@ def upload(path, document_type="general", title=None):
     return response.json()["document_id"]
 
 
-def upload_text(title, text, document_type="general", metadata_json=None):
-    """Ingest pre-extracted text/Markdown directly via JSON body (e.g. OCR/InsightDOC)."""
+def upload_text(title, text, document_type="general", metadata=None):
+    """Ingest pre-extracted text/Markdown directly via JSON body (e.g. OCR/InsightDOC).
+
+    metadata is a plain dict; the API expects metadata_json as a JSON *string*,
+    so it is json.dumps()-ed here.
+    """
     payload = {"title": title, "text": text, "document_type": document_type}
-    if metadata_json:
-        payload["metadata_json"] = metadata_json
+    if metadata:
+        payload["metadata_json"] = json.dumps(metadata)
     response = requests.post(
         f"{API_BASE}/ingest/knowledge-bases/{KB_ID}/documents/text",
         headers=HEADERS,

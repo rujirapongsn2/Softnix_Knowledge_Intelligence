@@ -67,15 +67,37 @@ class LightRAGRetrievalEngine(RetrievalEngine):
 
     @staticmethod
     def _source_label(knowledge_base_id: str, document_id: str, title: str) -> str:
-        """Return a source basename that survives LightRAG path normalisation."""
-        return f"softnix-kb={knowledge_base_id}__doc={document_id}__{title}"
+        """Return a source basename that survives LightRAG path normalisation.
+
+        LightRAG reduces ``file_source`` to its basename, and that basename is
+        later re-split on ``/`` by path normalisation.  A title containing a
+        slash (e.g. "RFC 2616 HTTP/1.1") therefore corrupted the identity
+        suffix.  The title is flattened before it is embedded; the identity
+        markers themselves contain no slash.
+        """
+        safe_title = title.replace("/", "_")
+        return f"softnix-kb={knowledge_base_id}__doc={document_id}__{safe_title}"
 
     @staticmethod
     def _decode_source_label(file_path: str) -> tuple[str, str, str] | None:
-        parts = file_path.rsplit("/", 1)[-1].split("__", 2)
-        if len(parts) != 3 or not parts[0].startswith("softnix-kb=") or not parts[1].startswith("doc="):
+        # LightRAG reports either a basename or the full file_source.  Work
+        # from the identity marker so a title slash (historically truncated
+        # into a bogus basename "1.1") cannot hide the identity prefix: the
+        # /documents registry still carries the full label, and recovering
+        # those rows keeps "Process again" idempotent for sources ingested
+        # before the sanitisation above.
+        marker = "softnix-kb="
+        # The marker must start a path segment (string start or after "/"):
+        # a foreign path that merely contains the marker mid-string must not
+        # decode as ours (review info), while a full file_source such as
+        # "skip/<kb>/softnix-kb=...__<title with slash>" still decodes.
+        idx = file_path.find(marker)
+        if idx == -1 or (idx > 0 and file_path[idx - 1] != "/"):
             return None
-        return parts[0].removeprefix("softnix-kb="), parts[1].removeprefix("doc="), parts[2]
+        parts = file_path[idx + len(marker):].split("__", 2)
+        if len(parts) != 3 or not parts[1].startswith("doc="):
+            return None
+        return parts[0], parts[1].removeprefix("doc="), parts[2]
 
     def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self.enabled:
@@ -180,15 +202,23 @@ class LightRAGRetrievalEngine(RetrievalEngine):
     def ingest_document(self, document_id: str, text: str) -> None:
         self.ingest(document_id, "default", text, document_id)
 
-    def track_status(self, track_id: str) -> str:
-        """Return pending, processed, or failed for a LightRAG ingestion track."""
+    def track_status(self, track_id: str) -> dict:
+        """Return ``{"status": "pending|processed|failed", "error": str | None}`` for a LightRAG track.
+
+        The remote ``error_msg`` travels alongside the status so the worker can
+        classify a failure as transient (e.g. upstream 402 in-flight budget
+        exhausted) instead of collapsing every track failure into one terminal
+        error code (F1).
+        """
         data = self._request("GET", f"/documents/track_status/{quote(track_id, safe='')}")
-        statuses = [item.get("status", "").upper() for item in data.get("documents", [])]
+        documents = data.get("documents", [])
+        statuses = [item.get("status", "").upper() for item in documents]
         if any(status in {"FAILED", "ERROR"} for status in statuses):
-            return "failed"
+            errors = [str(item.get("error_msg") or "").strip() for item in documents]
+            return {"status": "failed", "error": next((error for error in errors if error), None)}
         if statuses and all(status == "PROCESSED" for status in statuses):
-            return "processed"
-        return "pending"
+            return {"status": "processed", "error": None}
+        return {"status": "pending", "error": None}
 
     def delete_document(self, document_id: str) -> None:
         # Deletion behavior is version-specific; use the document API once a

@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import uuid
 from datetime import date
-from pathlib import Path
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session

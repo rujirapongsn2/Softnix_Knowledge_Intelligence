@@ -243,7 +243,6 @@ def resolve_legal_context(db: Session, query: str, kb_ids: list[str], plan: Retr
                 excluded_document_ids.add(row.document_id)
 
     if preferred_document_ids and matched_instruments:
-        preferred_set = set(preferred_document_ids)
         for row in instruments:
             if row.family_id in matched_family_ids and not _is_valid(row, as_of):
                 excluded_document_ids.add(row.document_id)

@@ -203,7 +203,7 @@ def test_scenario_4_regression_general_document_type_query_is_unaffected():
     test_client = next(client())
     kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Legal regression fixture", "code": "legal-regression-fixture"}).json()
     text = (FIXTURES_DIR / "faq.md").read_text(encoding="utf-8")
-    uploaded = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={
+    test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={
         "file": ("faq.md", text.encode("utf-8"), "text/markdown"),
     }).json()
     assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True

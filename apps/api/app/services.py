@@ -7,6 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import BoundedSemaphore
 
 from bs4 import BeautifulSoup
 from docx import Document as WordDocument
@@ -49,9 +50,23 @@ DEFAULT_RETRIEVAL_CONFIG = {
 }
 TRANSIENT_PROCESSING_ERRORS = {
     "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY",
-    "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_TIMEOUT", "OCR_CHAIN_FAILED",
+    "RETRIEVAL_ENGINE_TIMEOUT", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "OPENROUTER_UNAVAILABLE", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_TIMEOUT", "OCR_CHAIN_FAILED",
 }
 MAX_PROCESSING_ATTEMPTS = 3
+# Budget exhaustion outlives the normal retry window (the shared provider
+# account frees in-flight quota on the scale of minutes), so those tracks
+# earn extra attempts instead of failing the document permanently (F1).
+MAX_BUDGET_PROCESSING_ATTEMPTS = 6
+# Cap on how many documents one worker may push into the remote indexing
+# pipeline at the same time.  LightRAG fans every insert out into upstream LLM
+# calls; 13 parallel ingests exhausted the shared OpenRouter in-flight budget
+# (402) and failed the whole batch (F1).
+INDEXING_CONCURRENCY_LIMIT = 2
+# A budget-exhausted track is retried on the same exponential schedule as the
+# other transient errors, but with a longer floor: the account's in-flight
+# quota frees up on the scale of minutes, not seconds.
+BUDGET_RETRY_DELAY_FLOOR_SECONDS = 60
+_indexing_semaphore = BoundedSemaphore(INDEXING_CONCURRENCY_LIMIT)
 logger = logging.getLogger(__name__)
 
 
@@ -1110,7 +1125,6 @@ def build_legal_metadata_result(db: Session, query: str, kb_ids: list[str], toke
     matches = rows.order_by(LegalInstrument.version_date.desc(), Document.created_at.desc()).all()
     sources = [_legal_metadata_source(document, instrument) for document, instrument in matches[:1]]
     if sources:
-        source = sources[0]
         document, instrument = matches[0]
         date_text = instrument.version_date.isoformat() if instrument.version_date else "ไม่ระบุวันที่ในผัง"
         if requested:
@@ -1947,6 +1961,32 @@ def _repair_or_flag_pdf_text(text: str) -> str:
     return text
 
 
+def _extract_html_flavored_xls(path: Path) -> str:
+    """Recover an HTML-flavoured ``.xls`` (SpreadsheetML/MIME-HTML) as text.
+
+    Thai government systems routinely export ".xls" files that are actually
+    HTML tables with an Excel namespace.  Neither anydoc (``MalformedError``)
+    nor MarkItDown parses that combination, so extract the tables directly
+    with the same BeautifulSoup toolchain the .html path already uses (F3).
+    """
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    head = raw.lstrip()[:256].casefold()
+    if not head.startswith(("<html", "<table", "<!doctype")):
+        # A genuine binary .xls must keep its original failure path.
+        raise RuntimeError("FILE_TYPE_NOT_SUPPORTED")
+    soup = BeautifulSoup(raw, "html.parser")
+    tables = soup.find_all("table")
+    if not tables:
+        return soup.get_text(" ", strip=True)
+    lines: list[str] = []
+    for table in tables:
+        for row in table.find_all("tr"):
+            cells = [" ".join(cell.get_text(" ", strip=True).split()) for cell in row.find_all(["td", "th"])]
+            if any(cell for cell in cells):
+                lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
 def extract_text(document: Document) -> str:
     path = Path(document.storage_path)
     ext = path.suffix.lower()
@@ -1958,6 +1998,7 @@ def extract_text(document: Document) -> str:
     # garbled pages, then the Thai-repair gate. HTML family stays legacy
     # (anydoc has no HTML parser); when the wheel is missing the legacy
     # extractors still serve every other format as a safety net.
+    primary_error: Exception | None = None  # first converter failure, used by the terminal raise (review info)
     if ext not in {".html", ".htm"}:
         try:
             from .doc_extraction import extract_document_text
@@ -1965,6 +2006,11 @@ def extract_text(document: Document) -> str:
         except RuntimeError as exc:
             if str(exc) != "ANYDOC_UNAVAILABLE":
                 raise  # OCR_CHAIN_FAILED / TEXT_EXTRACTION_EMPTY are terminal here.
+        except Exception as exc:
+            # anydoc signals an unreadable workbook (e.g. an HTML-flavoured
+            # ".xls") with MalformedError, not RuntimeError.  Keep the rest of
+            # the fallback chain alive instead of failing the document.
+            primary_error = exc
         # fall through to the legacy extractors when the wheel is missing
     try:
         text = _markitdown_extract(path)
@@ -1994,6 +2040,13 @@ def extract_text(document: Document) -> str:
             raise
         except Exception as exc:
             raise RuntimeError("TEXT_EXTRACTION_FAILED") from exc
+    # Last resort for a ".xls" that is really HTML (Thai government exports,
+    # F3): both real converters rejected it, but the bytes are a parseable
+    # HTML table.
+    if ext == ".xls":
+        text = _extract_html_flavored_xls(path)
+        if text.strip():
+            return text
     raise RuntimeError("TEXT_EXTRACTION_FAILED") from primary_error
 
 
@@ -2145,8 +2198,37 @@ def queue_embedding_reindex(db: Session, knowledge_base_id: str, force: bool = F
     return queued
 
 
+# Upstream provider failures that mean "retry later with fewer parallel
+# calls", observed inside LightRAG track error messages.  Matched
+# case-insensitively because the remote relays provider text verbatim.
+_BUDGET_EXHAUSTED_MARKERS = ("in_flight_budget_exhausted", "in-flight budget", "payment required", "insufficient credits", "402")
+
+
+def classify_track_failure(error_detail: str | None) -> str:
+    """Map a failed LightRAG track onto a platform error code.
+
+    ``RETRIEVAL_ENGINE_BUDGET_EXHAUSTED`` is transient: the shared provider
+    account frees in-flight quota on the scale of minutes, so the worker's
+    retry backoff can recover it without operator action (F1).  Everything
+    else keeps the existing terminal ``RETRIEVAL_ENGINE_REJECTED``.
+    """
+    detail = (error_detail or "").casefold()
+    if any(marker in detail for marker in _BUDGET_EXHAUSTED_MARKERS):
+        return "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
+    return "RETRIEVAL_ENGINE_REJECTED"
+
+
+# Follow-up stages run after a document is already searchable and are cheap;
+# running them before new full pipelines keeps a legal document's registry
+# extraction from queueing minutes behind freshly uploaded bulk work (F4).
+_FOLLOW_UP_JOB_TYPES = ("EXTRACT_LEGAL_METADATA", "REINDEX_EMBEDDINGS")
+
+
 def process_next_job(db: Session) -> bool:
     job = db.query(ProcessingJob).filter(
+        ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow(),
+        ProcessingJob.job_type.in_(_FOLLOW_UP_JOB_TYPES),
+    ).order_by(ProcessingJob.created_at).first() or db.query(ProcessingJob).filter(
         ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow()
     ).order_by(ProcessingJob.created_at).first()
     if not job:
@@ -2241,23 +2323,32 @@ def process_next_job(db: Session) -> bool:
         if engine.enabled and not reindex_only:
             job.current_stage, job.progress_percent = "indexing", 70
             db.commit()
-            doc.external_engine_id = engine.ingest(doc.id, doc.knowledge_base_id, text, doc.title or doc.original_filename)
-            if doc.external_engine_id:
-                deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
-                while time.monotonic() < deadline:
-                    status = engine.track_status(doc.external_engine_id)
-                    if status == "processed":
-                        break
-                    if status == "failed":
-                        raise RuntimeError("RETRIEVAL_ENGINE_REJECTED")
-                    job.progress_percent = 85
-                    db.commit()
-                    time.sleep(2)
-                else:
-                    raise RuntimeError("RETRIEVAL_ENGINE_TIMEOUT")
+            # Bounded parallelism into the remote pipeline (F1): without this
+            # cap a bulk upload fans out into enough concurrent upstream LLM
+            # calls to exhaust the shared provider budget.
+            with _indexing_semaphore:
+                doc.external_engine_id = engine.ingest(doc.id, doc.knowledge_base_id, text, doc.title or doc.original_filename)
+                track_id = doc.external_engine_id
+                if track_id:
+                    deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
+                    while time.monotonic() < deadline:
+                        track = engine.track_status(track_id)
+                        if track["status"] == "processed":
+                            break
+                        if track["status"] == "failed":
+                            raise RuntimeError(classify_track_failure(track.get("error")))
+                        job.progress_percent = 85
+                        db.commit()
+                        time.sleep(2)
+                    else:
+                        raise RuntimeError("RETRIEVAL_ENGINE_TIMEOUT")
             sync_lightrag_document_graph(db, doc)
         if not reindex_only and not legal_only:
             doc.status = "completed"; doc.indexed_at = datetime.utcnow()
+            # A retry that finally succeeded must not keep the failure it
+            # recovered from — the document view would show an error code on a
+            # healthy document (F2).
+            doc.error_code, doc.error_message = None, None
             if doc.document_type in LEGAL_DOCUMENT_TYPES:
                 db.add(ProcessingJob(
                     document_id=doc.id,
@@ -2266,14 +2357,24 @@ def process_next_job(db: Session) -> bool:
                     current_stage="queued",
                 ))
         job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
+        # Review M2: a retried job must not keep the failure code it recovered
+        # from — clear the job-level error the same way the document view does
+        # (doc-level clear above covers F2's user-visible case).
+        job.error_code, job.error_message = None, None
     except Exception as exc:
-        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
+        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
         logger.exception("document processing failed", extra={"document_id": doc.id, "job_id": job.id, "error_code": code})
         message = "The document could not be processed."
+        if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED":
+            message = "Upstream indexing budget temporarily exhausted; retry scheduled."
         job.error_code, job.error_message = code, message
-        if code in TRANSIENT_PROCESSING_ERRORS and job.attempt_count < MAX_PROCESSING_ATTEMPTS:
+        attempt_ceiling = MAX_BUDGET_PROCESSING_ATTEMPTS if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED" else MAX_PROCESSING_ATTEMPTS
+        if code in TRANSIENT_PROCESSING_ERRORS and job.attempt_count < attempt_ceiling:
+            delay = processing_retry_delay(job.attempt_count)
+            if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED":
+                delay = max(delay, BUDGET_RETRY_DELAY_FLOOR_SECONDS)
             job.status, job.current_stage = "queued", "retry_wait"
-            job.next_attempt_at = datetime.utcnow() + timedelta(seconds=processing_retry_delay(job.attempt_count))
+            job.next_attempt_at = datetime.utcnow() + timedelta(seconds=delay)
             doc.status, doc.error_code, doc.error_message = "queued", code, "Temporary dependency failure; retry scheduled."
         else:
             if legal_only:
@@ -3204,8 +3305,16 @@ def _decorate_sources_with_legal_metadata(sources: list[dict], instruments_by_do
         source["provenance"] = {"origin": "legal_registry", "review_status": instrument.review_status,
                                  "document_id": instrument.document_id, "source_uri": instrument.source_uri,
                                  "source_reference": instrument.source_reference}
-        parts = [instrument.official_title or source.get("title"),
-                f"สถานะ: {_LEGAL_STATUS_LABELS_TH.get(instrument.status, instrument.status)}"]
+        # An unconfirmed status is informational (F6): the document is indexed
+        # and its content is evidence.  Only a *known* adverse status belongs
+        # in the answer prompt; "ไม่ทราบสถานะ" made the generator refuse to
+        # answer and the fail-closed citation check then dropped every source.
+        status = instrument.status
+        if status == "unknown":
+            status = None
+        parts = [instrument.official_title or source.get("title")]
+        if status:
+            parts.append(f"สถานะ: {_LEGAL_STATUS_LABELS_TH.get(status, status)}")
         if source.get("section_label"):
             parts.append(source["section_label"])
         if instrument.effective_from:

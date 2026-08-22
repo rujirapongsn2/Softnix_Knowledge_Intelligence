@@ -35,7 +35,9 @@ def test_lightrag_adapter_reads_processing_track_status():
         return httpx.Response(200, json={"documents": [{"status": "PROCESSED"}]})
 
     engine = LightRAGRetrievalEngine(base_url="http://lightrag.test", client=httpx.Client(transport=httpx.MockTransport(handler)))
-    assert engine.track_status("track-1") == "processed"
+    track = engine.track_status("track-1")
+    assert track["status"] == "processed"
+    assert track["error"] is None
 
 
 def test_lightrag_adapter_replaces_failed_source_before_retrying():

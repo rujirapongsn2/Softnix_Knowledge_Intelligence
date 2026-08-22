@@ -20,7 +20,7 @@ os.environ["APP_ENV"] = "test"
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.models import KbOwner, KnowledgeBase, User
+from app.models import KbOwner, User
 
 
 def client():

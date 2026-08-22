@@ -1,7 +1,6 @@
 import os
 import tempfile
 from io import BytesIO
-from pathlib import Path
 from types import SimpleNamespace
 
 _TEST_ROOT = tempfile.mkdtemp()
@@ -14,13 +13,10 @@ os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["EXT_OCR_KEY"] = ""
 
 from fastapi.testclient import TestClient
-import httpx
 from openpyxl import Workbook
 from pptx import Presentation
 from app import services
-from app.config import Settings
 from app.db import SessionLocal
-from app.ocr_chain import OcrChain  # legacy ExternalOcrClient replaced by the chain
 from app.main import app
 from app.models import Document, DocumentChunk, KnowledgeBase, LegalInstrument, LegalInstrumentRelation
 

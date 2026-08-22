@@ -117,6 +117,14 @@ services:
       EMBEDDING_MODEL: ${OPENROUTER_EMBEDDING_MODEL:-openai/text-embedding-3-small}
       EMBEDDING_DIM: ${OPENROUTER_EMBEDDING_DIMENSION:-1536}
       ENTITY_EXTRACTION_USE_JSON: "true"
+      # Cap LightRAG's internal fan-out so one large document cannot exhaust
+      # the upstream LLM provider's in-flight request budget (402 observed
+      # when 13 docs ingested in parallel: internal parallelism multiplies
+      # to >40 in-flight calls). Review M1: process-local semaphore in the
+      # SKI worker cannot control this; the lever is here.
+      LIGHTRAG_MAX_PARALLEL_INSERT: "1"
+      LLM_MODEL_MAX_ASYNC: "2"
+      EMBEDDING_FUNC_MAX_ASYNC: "4"
       LIGHTRAG_PARSER: "*:native-teP,*:legacy-R"
       VLM_PROCESS_ENABLE: "false"
     volumes: [lightrag:/app/data]

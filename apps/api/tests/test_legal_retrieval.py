@@ -14,6 +14,7 @@ os.environ.setdefault("EXT_OCR_KEY", "")
 from fastapi.testclient import TestClient
 
 from app import services
+from app.services import compose_cited_answer
 from app.db import Base, SessionLocal, engine
 from app.legal_resolver import resolve_legal_context
 from app.main import app
@@ -283,8 +284,13 @@ def test_answer_citations_drop_unused_candidates_and_fail_closed_on_missing_cita
     invalid = RetrievalEvidence([{**source("doc-a", "c1"), "citation_id": "S1"}], [], [], [], "คำตอบไม่มีการอ้างอิง")
     warnings = []
     services._validate_answer_citations(invalid, warnings)
-    assert invalid.sources == []
+    # F6: the unverifiable answer is dropped, but the evidence is KEPT — the
+    # composed answer falls back to listing it instead of denying everything.
+    assert invalid.answer is None
+    assert [item["citation_id"] for item in invalid.sources] == ["S1"]
     assert any(item["code"] == "ANSWER_CITATIONS_MISSING" for item in warnings)
+    fallback = compose_cited_answer(invalid, warnings)
+    assert "พบหลักฐานที่เกี่ยวข้อง [S1]" in fallback
 
 
 # --- fuse_evidence weighting ------------------------------------------------

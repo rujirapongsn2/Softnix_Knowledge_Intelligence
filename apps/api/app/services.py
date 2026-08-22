@@ -2508,7 +2508,7 @@ def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources
                 (RetrievalChannel.LIGHTRAG, policy.enable_lightrag),
             ) if enabled]
             value = OpenRouterClient().plan_retrieval(query, available, decision.plan.max_sources, policy.maximum_graph_depth)
-            decision = apply_llm_plan(decision, value, policy, max_sources)
+            decision = apply_llm_plan(decision, value, policy, max_sources, query=query)
         except (RuntimeError, ValueError, TypeError) as exc:
             decision.plan = decision.plan.model_copy(update={"planner_source": "rules_fallback", "fallback_reason": str(exc)})
     started_at = time.monotonic()
@@ -3381,7 +3381,11 @@ def _validate_answer_citations(evidence: RetrievalEvidence, warnings: list[dict]
 
     Retrieval returns a candidate pool, while the answer is the user-visible
     claim set.  Persisting all candidates as claim citations made unrelated
-    chunks look like proof.  A missing/unknown citation is fail-closed.
+    chunks look like proof.  A missing/unknown citation is fail-closed on the
+    CLAIMS: the generated answer is dropped because none of it is verifiable,
+    but the retrieved evidence itself is kept (F6) — the answer engine simply
+    falling back to the evidence listing, the same path an unavailable LLM
+    already takes, instead of discarding real evidence the user asked for.
     """
     answer = (evidence.answer or "").strip()
     if not answer:
@@ -3398,7 +3402,6 @@ def _validate_answer_citations(evidence: RetrievalEvidence, warnings: list[dict]
                 "unknown_citation_ids": unknown_ids,
             })
         evidence.answer = None
-        evidence.sources = []
         return
     if unknown_ids:
         if warnings is not None:
@@ -3407,8 +3410,11 @@ def _validate_answer_citations(evidence: RetrievalEvidence, warnings: list[dict]
                 "detail": "The generated answer referenced an evidence ID that was not supplied.",
                 "unknown_citation_ids": unknown_ids,
             })
+        # Fail-closed on claims (answer dropped), but keep the evidence the
+        # generator DID verify: citing [S1] + hallucinated [S99] narrows the
+        # pool to S1 rather than re-listing every retrieved candidate (M1).
         evidence.answer = None
-        evidence.sources = []
+        evidence.sources = [available[citation_id] for citation_id in sorted(valid_ids, key=lambda value: int(value[1:]))]
         return
     evidence.sources = [available[citation_id] for citation_id in sorted(valid_ids, key=lambda value: int(value[1:]))]
 
@@ -3430,17 +3436,20 @@ def _render_citation_details(sources: list[dict]) -> str:
 def compose_cited_answer(evidence: RetrievalEvidence, warnings: list[dict] | None = None) -> str:
     if warnings and any(item.get("code") == "AMBIGUOUS_LEGAL_CONTEXT" for item in warnings):
         return "ยังไม่สามารถตอบได้อย่างปลอดภัย เนื่องจากพบหลายฉบับที่อาจตรงกับมาตราที่ระบุ โปรดระบุชื่อฉบับกฎหมายหรือวันที่มีผลบังคับใช้ให้ชัดเจน"
-    if warnings and any(item.get("code") in {"ANSWER_CITATIONS_MISSING", "ANSWER_CITATION_ID_INVALID"} for item in warnings):
-        return "ยังไม่สามารถสร้างคำตอบที่มีหลักฐานอ้างอิงที่ตรวจสอบได้จากคำขอนี้"
+    # F6: an answer dropped by the citation gate still has its evidence — the
+    # empty-answer path below lists it instead of denying everything.
     if not evidence.sources:
         return "ไม่พบหลักฐานที่เพียงพอในคลังความรู้ที่เลือก จึงไม่ควรสรุปข้อเท็จจริงเพิ่มเติมจากคำขอนี้"
     citations = " ".join(f"[{source['citation_id']}]" for source in evidence.sources)
     answer = (evidence.answer or "").strip()
     details = _render_citation_details(evidence.sources)
     latest_assumption = any(source.get("version_role") == "latest_consolidated" for source in evidence.sources)
-    prefix = "คำตอบนี้อ้างอิงฉบับปรับปรุงล่าสุดที่มีผลบังคับใช้ในคลังข้อมูล\n" if latest_assumption else ""
+    # The consolidated-version prefix asserts THIS ANSWER follows the latest
+    # in-force text — only meaningful with a generated answer present (info#1).
+    prefix = ("คำตอบนี้อ้างอิงฉบับปรับปรุงล่าสุดที่มีผลบังคับใช้ในคลังข้อมูล\n"
+              if latest_assumption and answer else "")
     if not answer:
-        return f"{prefix}พบหลักฐานที่เกี่ยวข้อง {citations}\n\nแหล่งอ้างอิง:\n{details}"
+        return f"พบหลักฐานที่เกี่ยวข้อง {citations}\n\nแหล่งอ้างอิง:\n{details}"
     if not re.search(r"\[S\d+\]", answer):
         answer = f"{answer}\n\nแหล่งอ้างอิง: {citations}"
     return f"{prefix}{answer}\n\nรายละเอียดแหล่งอ้างอิง:\n{details}"

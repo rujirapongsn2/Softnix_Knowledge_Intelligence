@@ -225,10 +225,17 @@ def rule_plan(query: str, policy: RetrievalPolicy, max_sources: int | None = Non
 
 
 def apply_llm_plan(decision: PlannerDecision, value: dict[str, Any], policy: RetrievalPolicy,
-                   max_sources: int | None = None) -> PlannerDecision:
+                   max_sources: int | None = None, query: str = "") -> PlannerDecision:
     """Constrain a fallback plan while preserving deterministic extracted fields."""
     allowed = {channel.value for channel in _enabled(policy, *list(RetrievalChannel))}
     requested = [channel for channel in value.get("channels", []) if channel in allowed]
+    # Postgres full-text search cannot tokenize unspaced Thai text (no default
+    # Thai dictionary), so an LLM plan that drops the vector channel for a Thai
+    # query strands it on a channel that returns zero rows even when the KB
+    # holds the answer. Keep the semantic channel in that case.
+    thai = sum(1 for ch in query if "\u0e00" <= ch <= "\u0e7f") / max(len(query), 1)
+    if thai >= 0.2 and "vector" in allowed and "vector" not in requested:
+        requested.append("vector")
     max_allowed_sources = min(max_sources or policy.default_top_k, policy.maximum_top_k)
     plan = decision.plan.model_copy(update={
         "intent": str(value.get("intent") or decision.plan.intent)[:80],

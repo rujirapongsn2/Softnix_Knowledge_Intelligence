@@ -70,3 +70,20 @@ def test_auto_retrieval_contract_for_expected_questions(query, intent, channels,
     assert plan.published_from == published_from
     if published_from:
         assert plan.published_to == date(2026, 7, 1)
+
+
+def test_llm_plan_keeps_vector_channel_for_thai_queries():
+    """Postgres FTS cannot tokenize unspaced Thai; an LLM plan that drops the
+    vector channel for a Thai query must be corrected (E2E finding)."""
+    policy = RetrievalPolicy(enable_vector=True, enable_fulltext=True, enable_graph=False, enable_lightrag=False)
+    initial = rule_plan("ปริมาณน้ำฝนกรุงเทพ", policy, 10)
+    assert initial.ambiguous is True
+    decision = apply_llm_plan(initial, {"intent": "semantic_hybrid", "channels": ["full_text"]}, policy, 10, query="ปริมาณน้ำฝนกรุงเทพ")
+    assert RetrievalChannel.VECTOR in decision.plan.channels
+
+
+def test_llm_plan_respects_dropped_vector_for_english_queries():
+    policy = RetrievalPolicy(enable_vector=True, enable_fulltext=True, enable_graph=False, enable_lightrag=False)
+    initial = rule_plan("explain the platform tradeoffs", policy, 10)
+    decision = apply_llm_plan(initial, {"intent": "semantic_hybrid", "channels": ["full_text"]}, policy, 10, query="explain the platform tradeoffs")
+    assert RetrievalChannel.VECTOR not in decision.plan.channels

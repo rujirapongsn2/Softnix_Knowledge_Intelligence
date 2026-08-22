@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 from pgvector.sqlalchemy import Vector
@@ -100,7 +100,16 @@ class DocumentMetadataTemplate(Timestamped, Base):
 
 class Document(Timestamped, Base):
     __tablename__ = "documents"
-    __table_args__ = (UniqueConstraint("knowledge_base_id", "checksum_sha256", name="uq_document_checksum"),)
+    __table_args__ = (
+        # F8: partial unique — soft-deleted rows must not block re-uploads of
+        # the same file (they stay queryable for audit until purged).
+        # sqlite_where exists for the unit-test (SQLite) schema only; the
+        # canonical DDL is migration 0030's postgresql_where (review info).
+        Index("uq_document_checksum_live", "knowledge_base_id", "checksum_sha256",
+              unique=True,
+              sqlite_where=text("deleted_at IS NULL"),
+              postgresql_where=text("deleted_at IS NULL")),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
     original_filename: Mapped[str] = mapped_column(String(500))

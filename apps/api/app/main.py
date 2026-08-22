@@ -986,9 +986,15 @@ def delete_document(document_id: str, user: User = Depends(current_admin), db: S
         raise HTTPException(404, "Document not found")
     doc.deleted_at, doc.status = datetime.utcnow(), "deleted"
     db.query(ProcessingJob).filter(ProcessingJob.document_id == doc.id, ProcessingJob.status.in_(["queued", "running"])).update({"status": "cancelled"}, synchronize_session=False)
+    # 4b: cascade the delete into the remote retrieval index asynchronously —
+    # ghost sources in LightRAG keep occupying the content-hash namespace and
+    # block legitimate re-ingests. Best-effort by design: a failed purge job
+    # is visible in the jobs list and retryable.
+    purge = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type="PURGE_REMOTE_INDEX")
+    db.add(purge)
     record_audit(db, "document.delete", user.id, "document", doc.id, {"knowledge_base_id": doc.knowledge_base_id})
     db.commit()
-    return {"status": "deleted", "document_id": doc.id}
+    return {"status": "deleted", "document_id": doc.id, "purge_job_id": purge.id}
 
 
 @app.post("/api/v1/documents/{document_id}/restore")

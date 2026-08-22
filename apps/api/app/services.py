@@ -14,6 +14,7 @@ from docx import Document as WordDocument
 import httpx
 from markitdown import MarkItDown
 from sqlalchemy import Text, and_, cast, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
 from .config import get_settings
@@ -1850,7 +1851,23 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
                    metadata_template_fields=fields,
                    document_metadata=values,
                    metadata_search_text=metadata_search_text(fields, values))
-    db.add(doc); db.flush()
+    db.add(doc)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        # F8 race guard: two concurrent uploads of the same file — the
+        # partial unique index is the real guard; surface the same 409 the
+        # non-concurrent path returns (the text path already did this).
+        # Only a unique-checksum violation maps to FILE_DUPLICATE; any other
+        # integrity failure (FK, NOT NULL) must surface as itself (review M1).
+        # str(exc) carries the constraint/column name on both SQLite and
+        # Postgres (constraint_name lives in exc.orig.diag on PG only).
+        detail = str(exc)
+        if "uq_document_checksum" not in detail and "checksum_sha256" not in detail:
+            raise
+        db.rollback()
+        Path(path).unlink(missing_ok=True)
+        raise ValueError("FILE_DUPLICATE") from None
     job = ProcessingJob(document_id=doc.id, knowledge_base_id=knowledge_base_id)
     db.add(job); db.commit(); db.refresh(doc); db.refresh(job)
     return doc, job
@@ -2225,14 +2242,48 @@ _FOLLOW_UP_JOB_TYPES = ("EXTRACT_LEGAL_METADATA", "REINDEX_EMBEDDINGS")
 
 
 def process_next_job(db: Session) -> bool:
+    # Cleanup work (remote-index purges) yields to user-facing jobs: a purge
+    # sitting in the queue must not consume a worker slot (or a one-shot
+    # /internal/process-next tick) while real documents wait.
     job = db.query(ProcessingJob).filter(
         ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow(),
         ProcessingJob.job_type.in_(_FOLLOW_UP_JOB_TYPES),
+    ).order_by(ProcessingJob.created_at).first() or db.query(ProcessingJob).filter(
+        ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow(),
+        ProcessingJob.job_type != "PURGE_REMOTE_INDEX",
     ).order_by(ProcessingJob.created_at).first() or db.query(ProcessingJob).filter(
         ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow()
     ).order_by(ProcessingJob.created_at).first()
     if not job:
         return False
+    if job.job_type == "PURGE_REMOTE_INDEX":
+        # 4b: cascade a platform soft-delete into the remote retrieval index
+        # so ghost sources stop occupying LightRAG's content-hash namespace.
+        # Runs BEFORE the generic cancelled-because-deleted branch below.
+        job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "purging_remote_index", 10, job.attempt_count + 1
+        db.commit()
+        try:
+            doc = db.get(Document, job.document_id)
+            if not doc:
+                raise RuntimeError("DOCUMENT_NOT_FOUND")
+            engine = LightRAGRetrievalEngine()
+            if engine.enabled:
+                remote = engine.find_document(doc.id, doc.knowledge_base_id)
+                if remote:
+                    engine.delete_remote_document(remote["id"])
+            job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
+        except Exception as exc:
+            logger.exception("remote index purge failed", extra={"job_id": job.id, "document_id": job.document_id})
+            code = str(exc) if str(exc).startswith("RETRIEVAL_ENGINE_") else "REMOTE_INDEX_PURGE_FAILED"
+            # Transient engine states (BUSY/TIMEOUT) retry like document
+            # processing — a busy remote must not strand a ghost (review info).
+            if code in {"RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT"} and job.attempt_count < MAX_PROCESSING_ATTEMPTS:
+                job.status, job.error_code, job.error_message = "queued", code, "Remote engine busy; purge retry scheduled."
+                job.next_attempt_at = datetime.utcnow() + timedelta(seconds=processing_retry_delay(job.attempt_count))
+            else:
+                job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "REMOTE_INDEX_PURGE_FAILED", str(exc)[:2000]
+        db.commit()
+        return True
     if job.job_type == "REBUILD_LEGAL_GRAPH":
         job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "rebuilding_legal_graph", 10, job.attempt_count + 1
         db.commit()

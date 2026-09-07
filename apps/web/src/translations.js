@@ -2,6 +2,7 @@ export const translations = {
   en: {
     "app.workspaceTitle": "Knowledge workspace",
     "app.toggleLanguage": "Switch language",
+    "app.logout": "Log out",
     "app.sessionLoading.title": "Restoring your session…",
     "app.sessionLoading.body": "Checking your secure sign-in.",
     "app.workspaceNavAriaLabel": "Workspace navigation",
@@ -918,6 +919,7 @@ export const translations = {
   th: {
     "app.workspaceTitle": "พื้นที่ทำงานความรู้",
     "app.toggleLanguage": "สลับภาษา",
+    "app.logout": "ออกจากระบบ",
     "app.sessionLoading.title": "กำลังตรวจสอบการเข้าสู่ระบบ…",
     "app.sessionLoading.body": "กำลังตรวจสอบข้อมูลการเข้าสู่ระบบ",
     "app.workspaceNavAriaLabel": "การนำทางพื้นที่ทำงาน",

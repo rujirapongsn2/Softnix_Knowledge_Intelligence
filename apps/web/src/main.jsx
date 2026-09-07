@@ -547,6 +547,18 @@ function App() {
     try { await api(`/v1/query/results/${resultId}/feedback`, {method: "POST", body: JSON.stringify({rating})}); notify(t("app.notify.feedbackRecorded")); }
     catch (error) { showError(error); }
   };
+  // Best-effort: the cookies are httpOnly, so even if the request fails
+  // (network drop, already-expired session) we still drop client state and
+  // return to the login screen — staying logged in locally is worse than a
+  // server-side session outliving the UI by a few seconds.
+  const logout = async () => {
+    try { await api("/v1/auth/logout", {method: "POST"}); }
+    catch { /* ignore: we clear local state below regardless */ }
+    finally {
+      setUser(null); setKbs([]); setSelectedKbId(""); setActiveView("knowledge-bases");
+      setViewTrail(["knowledge-bases"]); setDocumentPreview(null);
+    }
+  };
 
   if (isSessionLoading) return <main className="login-page"><section className="login-card session-loading"><img className="login-logo" src="/logo-softnix.png" alt="Softnix"/><p className="eyebrow">{t("login.brand")}</p><h1>{t("app.sessionLoading.title")}</h1><p className="login-copy">{t("app.sessionLoading.body")}</p></section></main>;
   if (!user) return <Login onLogin={data => setUser(data.user)}/>;
@@ -579,7 +591,7 @@ function App() {
     </SideNavSection>
     <SideNavSection title={t("sideNav.category.administration")} subtitle={t("sideNav.category.administration.subtitle")} className="side-nav-category"><SideNavItem icon={<Key weight="regular"/>} label={t("workflow.mcpTokens")} isSelected={activeView === "mcp-tokens"} onClick={() => switchView("mcp-tokens")}/><SideNavItem icon={<BookOpen weight="regular"/>} label={t("workflow.ingestTokens")} isSelected={activeView === "ingest-tokens"} onClick={() => switchView("ingest-tokens")}/>{userRoleLevel >= ROLE_LEVEL.manager && <><SideNavItem icon={<HardDrives weight="regular"/>} label={t("workflow.systemStatus")} isSelected={activeView === "system-status"} onClick={() => switchView("system-status")}/><SideNavItem icon={<ChartLineUp weight="regular"/>} label={t("workflow.logs")} isSelected={activeView === "logs"} onClick={() => switchView("logs")}/></>}{userRoleLevel >= ROLE_LEVEL.admin && <><SideNavItem icon={<Users weight="regular"/>} label={t("workflow.users")} isSelected={activeView === "users"} onClick={() => switchView("users")}/><SideNavItem icon={<UsersThree weight="regular"/>} label={t("workflow.groups")} isSelected={activeView === "groups"} onClick={() => switchView("groups")}/></>}</SideNavSection>
   </SideNav>;
-  const topNav = <TopNav label={t("app.workspaceNavAriaLabel")} menuLabel={t("ui.openNavigation")} commandLabel={t("ui.openCommandPalette")} heading={<TopNavHeading heading={selectedKb?.name || t("app.workspaceTitle")}/>} endContent={<div className="topnav-user"><Button label={language === "th" ? "EN" : "TH"} size="sm" variant="ghost" onClick={() => setLanguage(language === "th" ? "en" : "th")} aria-label={t("app.toggleLanguage")}/><span className="status-indicator"/> <button type="button" className="topnav-profile-button" onClick={() => switchView("profile")} title={t("workflow.profile")}>{user.username}</button></div>}/>;
+  const topNav = <TopNav label={t("app.workspaceNavAriaLabel")} menuLabel={t("ui.openNavigation")} commandLabel={t("ui.openCommandPalette")} heading={<TopNavHeading heading={selectedKb?.name || t("app.workspaceTitle")}/>} endContent={<div className="topnav-user"><Button label={language === "th" ? "EN" : "TH"} size="sm" variant="ghost" onClick={() => setLanguage(language === "th" ? "en" : "th")} aria-label={t("app.toggleLanguage")}/><span className="status-indicator"/> <button type="button" className="topnav-profile-button" onClick={() => switchView("profile")} title={t("workflow.profile")}>{user.username}</button><Button label={t("app.logout")} size="sm" variant="ghost" onClick={logout} aria-label={t("app.logout")}/></div>}/>;
   const commandItems = [
     ["knowledge-bases", Database, t("workflow.knowledgeBases")], ["documents", FileText, t("workflow.documents")], ["search", MagnifyingGlass, t("workflow.search")], ["explore", Compass, t("workflow.explore")], ["mcp-tokens", Key, t("workflow.mcpTokens")], ["ingest-tokens", BookOpen, t("workflow.ingestTokens")],
     ...(userRoleLevel >= ROLE_LEVEL.manager ? [["system-status", HardDrives, t("workflow.systemStatus")], ["logs", ChartLineUp, t("workflow.logs")]] : []),
@@ -610,7 +622,7 @@ function App() {
         <GroupsView groups={groups} users={users} loadGroups={loadGroups} notify={notify} showError={showError}/>
       )}
       {activeView === "profile" && (
-        <ProfileView me={user} notify={notify} showError={showError}/>
+        <ProfileView me={user} notify={notify} showError={showError} onLogout={logout}/>
       )}
       {activeView === "mcp-tokens" && <McpTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
       {activeView === "ingest-tokens" && <IngestTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
@@ -2543,7 +2555,7 @@ function GroupsView({groups, users, loadGroups, notify, showError}) {
 }
 
 
-function ProfileView({me, notify, showError}) {
+function ProfileView({me, notify, showError, onLogout}) {
   const {t} = useLanguage();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -2563,7 +2575,8 @@ function ProfileView({me, notify, showError}) {
     finally { setIsSaving(false); }
   };
 
-  return <><PageHeading eyebrow={t("profile.eyebrow")} title={t("profile.title")} description={t("profile.description")}/>
+  return <><PageHeading eyebrow={t("profile.eyebrow")} title={t("profile.title")} description={t("profile.description")}
+    actions={<Button label={t("app.logout")} variant="destructive" onClick={onLogout}/>}/>
   <Card padding={4} variant="blue">
     <div className="profile-summary">
       <div><p className="eyebrow">{t("users.table.username")}</p><h3>{me?.username}</h3></div>

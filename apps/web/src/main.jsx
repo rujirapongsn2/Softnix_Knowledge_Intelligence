@@ -1559,6 +1559,33 @@ function RenameTemplateDialog({template, onClose, onSave, onPurge}) {
   </div>;
 }
 
+function DocumentRowOverflowMenu({document: doc, processing, onReprocess, onDelete, t}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = event => {
+      if (!rootRef.current?.contains(event.target)) setOpen(false);
+    };
+    const onKeyDown = event => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.document.addEventListener("mousedown", onPointerDown);
+    window.document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.document.removeEventListener("mousedown", onPointerDown);
+      window.document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+  return <div className="document-overflow" ref={rootRef}>
+    <button type="button" className="document-overflow-trigger" aria-label={t("documents.action.moreMenu")} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(value => !value)}>⋯</button>
+    {open && <div className="document-overflow-menu" role="menu">
+      <button type="button" role="menuitem" disabled={processing} onClick={() => { setOpen(false); onReprocess(doc); }}>{t("documents.action.processAgain")}</button>
+      <button type="button" role="menuitem" className="document-overflow-destructive" onClick={() => { setOpen(false); onDelete(doc); }}>{t("common.delete")}</button>
+    </div>}
+  </div>;
+}
+
 function Documents({selectedKb, documents, documentTotal, documentOffset, setDocumentOffset, documentSearch, setDocumentSearch, documentStatusFilter, setDocumentStatusFilter, documentTypeFilter, setDocumentTypeFilter, documentsLoading, hasCompletedDocuments, showDeletedDocuments, setShowDeletedDocuments, uploadFile, setUploadFile, uploadTitle, setUploadTitle, uploadDocumentType, setUploadDocumentType, documentTemplates, uploadTemplateId, setUploadTemplateId, uploadMetadata, setUploadMetadata, createDocumentTemplate, updateDocumentTemplate, deactivateDocumentTemplate, activateDocumentTemplate, renameDocumentTemplate, duplicateDocumentTemplate, purgeDocumentTemplate, uploadDocument, isUploading, openDocument, extractLegalMetadata, saveLegalMetadata, deleteLegalMetadata, reprocessDocument, deleteDocument, restoreDocument, downloadOriginalDocument, previewOriginalDocument, pdfPreview, onClosePdfPreview, reindexEmbeddings, refreshDocuments, documentPreview, documentJobs, documentJobPolling, documentJobPollError, legalInstruments, resolveLegalRegistry, updateLegalInstrument, entities, relationships, addEntity, addRelationship, impact, analyzeImpact, syncGraphFromDocuments, refreshGraph, isLegalGraph, legalGraphView, setLegalGraphView, queueLegalGraphRebuild, legalRebuildStatus, reviewLegalRelationship, onClosePreview, onCreateKb, onSearch, onExplore}) {
   const {t} = useLanguage();
   const [isTypeDrawerOpen, setIsTypeDrawerOpen] = useState(false);
@@ -1621,8 +1648,36 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
     {isUploadDrawerOpen && <div className="document-type-drawer-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) closeUploadDrawer(); }}><aside ref={uploadDrawerRef} className="document-type-drawer upload-drawer" role="dialog" aria-modal="true" aria-labelledby="upload-drawer-title" onMouseDown={event => event.stopPropagation()}><header className="document-type-drawer-header"><div><p className="eyebrow">{t("documents.pageHeading.eyebrow")}</p><h2 id="upload-drawer-title" tabIndex={-1} ref={uploadDrawerHeadingRef}>{t("documents.upload.addDocuments")}</h2><p>{t("documents.upload.formatNote")}</p></div><button type="button" className="drawer-close" onClick={closeUploadDrawer} aria-label={t("documentPreview.closeAriaLabel")}>×</button></header>{uploadForm}</aside></div>}
     {legalInstruments?.length > 0 && <div className="log-tabs" role="tablist"><button role="tab" aria-selected={libraryTab === "files"} className={libraryTab === "files" ? "selected" : ""} onClick={() => setLibraryTab("files")}>{t("documents.tabs.files")}</button><button role="tab" aria-selected={libraryTab === "legal"} className={libraryTab === "legal" ? "selected" : ""} onClick={() => setLibraryTab("legal")}>{t("documents.tabs.legal")}</button></div>}
     {(libraryTab === "files" || !(legalInstruments?.length > 0)) && <section className="content-section"><div className="section-title"><div><h2>{showDeletedDocuments ? t("documents.library.allTitle") : t("documents.library.title")}</h2><p>{documentTotal ? t(documentTotal === 1 ? "documents.library.showingCountOne" : "documents.library.showingCountOther", {start: pageStart, end: pageEnd, total: documentTotal}) : t("documents.library.empty")}</p></div>{documents.some(document => ["queued", "extracting", "indexing"].includes(document.status) || ["queued", "running"].includes(document.processing_job_status)) && <span className="live-status" role="status">{t("documents.library.updatingLive")}</span>}</div>
-      <div className="document-filter-bar"><TextInput label={t("documents.filter.findLabel")} value={documentSearch} onChange={value => { setDocumentOffset(0); setDocumentSearch(value); }} placeholder={t("documents.filter.findPlaceholder")}/><Selector label={t("common.status")} value={documentStatusFilter} onChange={value => { setDocumentOffset(0); setDocumentStatusFilter(value); }} options={[{value: "all", label: t("common.allStatuses")}, {value: "metadata_review", label: t("autoMetadata.needs_review")}, ...STATUS_KEYS.filter(key => key !== "disabled").map(key => ({value: key, label: t(`status.${key}.label`)})), {value: "deleted", label: t("documents.filter.status.deleted")}]}/><Selector label={t("documents.upload.documentType")} value={documentTypeFilter} onChange={value => { setDocumentOffset(0); setDocumentTypeFilter(value); }} options={[{value: "all", label: t("common.allTypes")}, ...DOCUMENT_TYPE_OPTIONS.map(option => ({value: option.value, label: t(option.labelKey)})), ...documentTemplates.filter(template => !template.is_system).map(template => ({value: template.id, label: template.name}))]}/></div>
-    {documentsLoading && !documents.length ? <p className="section-copy" role="status">{t("documents.loading")}</p> : documents.length ? <div className="document-table">{documents.map(document => { const activeStatus = processingStatus(document); const processing = ["queued", "extracting", "indexing"].includes(document.status) || (document.processing_job_type !== "EXTRACT_DOCUMENT_METADATA" && ["queued", "running"].includes(document.processing_job_status)); const failed = ["failed", "ocr_required"].includes(document.status) || (document.processing_job_type !== "EXTRACT_DOCUMENT_METADATA" && document.processing_job_status === "failed"); return <article key={document.id} className="document-item"><div className="document-main"><button type="button" className="document-title" onClick={event => openDocumentFromLibrary(document, event)}>{document.title || document.original_filename}</button><p>{document.original_filename} · {Math.ceil(document.file_size / 1024)} KB · {document.metadata_template_name || documentTypeLabel(t, document.document_type)}</p>{processing && <><ProgressBar label={`${document.title || document.original_filename} processing`} value={document.processing_job_progress_percent ?? 0} variant="warning" isIndeterminate={document.processing_job_progress_percent == null}/><p className="document-status-help">{statusHelp(t, activeStatus) || document.processing_job_stage || t("documents.status.processing")}</p></>}{failed && <p className="document-status-help document-status-warning">{statusHelp(t, document.status) || t("status.failed.help")}{document.error_code ? ` (${document.error_code})` : ""}</p>}</div><div className="document-status-badges"><StatusBadge status={document.status}/>{document.metadata_status !== "not_started" && <span className="metadata-status">{t(`autoMetadata.${document.metadata_status}`)}</span>}</div><div className="document-actions"><Button label={t("documents.action.openDetails")} variant="ghost" size="sm" onClick={event => openDocumentFromLibrary(document, event)}/>{document.deleted_at ? <Button label={t("common.restore")} variant="secondary" size="sm" onClick={() => restoreDocument(document)}/> : <><Button label={t("documents.action.downloadOriginal")} variant="ghost" size="sm" onClick={() => downloadOriginalDocument(document)}/>{isPdfDocument(document) && <Button label={t("documents.action.preview")} variant="ghost" size="sm" onClick={() => previewOriginalDocument(document)}/>}<Button label={t("documents.action.processAgain")} variant="secondary" size="sm" isDisabled={processing} onClick={() => reprocessDocument(document)}/><Button label={t("common.delete")} variant="destructive" size="sm" onClick={() => deleteDocument(document)}/></>}</div></article>; })}</div> : <EmptyState title={documentTotal ? t("documents.empty.noMatch.title") : t("documents.empty.readyTitle")} description={documentTotal ? t("documents.empty.noMatch.description") : t("documents.empty.readyDescription")}/>}
+      <div className="document-filter-bar">
+        <TextInput label={t("documents.filter.findLabel")} value={documentSearch} onChange={value => { setDocumentOffset(0); setDocumentSearch(value); }} placeholder={t("documents.filter.findPlaceholder")}/>
+        <Selector label={t("common.status")} value={documentStatusFilter} onChange={value => { setDocumentOffset(0); setDocumentStatusFilter(value); }} options={[{value: "all", label: t("common.allStatuses")}, {value: "metadata_review", label: t("autoMetadata.needs_review")}, ...STATUS_KEYS.filter(key => key !== "disabled").map(key => ({value: key, label: t(`status.${key}.label`)})), {value: "deleted", label: t("documents.filter.status.deleted")}]}/>
+        <Selector label={t("documents.upload.documentType")} value={documentTypeFilter} onChange={value => { setDocumentOffset(0); setDocumentTypeFilter(value); }} options={[{value: "all", label: t("common.allTypes")}, ...DOCUMENT_TYPE_OPTIONS.map(option => ({value: option.value, label: t(option.labelKey)})), ...documentTemplates.filter(template => !template.is_system).map(template => ({value: template.id, label: template.name}))]}/>
+      </div>
+    {documentsLoading && !documents.length ? <p className="section-copy" role="status">{t("documents.loading")}</p> : documents.length ? <div className="document-table">{documents.map(document => {
+      const activeStatus = processingStatus(document);
+      const processing = ["queued", "extracting", "indexing"].includes(document.status) || (document.processing_job_type !== "EXTRACT_DOCUMENT_METADATA" && ["queued", "running"].includes(document.processing_job_status));
+      const failed = ["failed", "ocr_required"].includes(document.status) || (document.processing_job_type !== "EXTRACT_DOCUMENT_METADATA" && document.processing_job_status === "failed");
+      const title = document.title || document.original_filename;
+      return <article key={document.id} className="document-item">
+        <div className="document-main">
+          <button type="button" className="document-title" onClick={event => openDocumentFromLibrary(document, event)}>{title}</button>
+          <p>{Math.ceil(document.file_size / 1024)} KB · {document.metadata_template_name || documentTypeLabel(t, document.document_type)}</p>
+          {processing && <><ProgressBar label={`${title} processing`} value={document.processing_job_progress_percent ?? 0} variant="warning" isIndeterminate={document.processing_job_progress_percent == null}/><p className="document-status-help">{statusHelp(t, activeStatus) || document.processing_job_stage || t("documents.status.processing")}</p></>}
+          {failed && <p className="document-status-help document-status-warning">{statusHelp(t, document.status) || t("status.failed.help")}{document.error_code ? ` (${document.error_code})` : ""}</p>}
+        </div>
+        <div className="document-status-badges">
+          <StatusBadge status={document.status}/>
+          {document.metadata_status === "needs_review" && <span className="metadata-review-badge" title={t("autoMetadata.needs_review")}>{t("documents.badge.needsReview")}</span>}
+        </div>
+        <div className="document-actions">
+          {document.deleted_at ? <Button label={t("common.restore")} variant="secondary" size="sm" onClick={() => restoreDocument(document)}/> : <>
+            <Button label={t("documents.action.downloadOriginal")} variant="ghost" size="sm" onClick={() => downloadOriginalDocument(document)}/>
+            {isPdfDocument(document) && <Button label={t("documents.action.preview")} variant="ghost" size="sm" onClick={() => previewOriginalDocument(document)}/>}
+            <DocumentRowOverflowMenu document={document} processing={processing} onReprocess={reprocessDocument} onDelete={deleteDocument} t={t}/>
+          </>}
+        </div>
+      </article>;
+    })}</div> : <EmptyState title={documentTotal ? t("documents.empty.noMatch.title") : t("documents.empty.readyTitle")} description={documentTotal ? t("documents.empty.noMatch.description") : t("documents.empty.readyDescription")}/>}
       {documentTotal > pageSize && <div className="document-pagination"><Button label={t("common.previous")} variant="ghost" size="sm" isDisabled={!hasPrevious || documentsLoading} onClick={() => setDocumentOffset(Math.max(0, documentOffset - pageSize))}/><span>{pageStart}–{pageEnd} / {documentTotal}</span><Button label={t("common.next")} variant="secondary" size="sm" isDisabled={!hasNext || documentsLoading} onClick={() => setDocumentOffset(documentOffset + pageSize)}/></div>}
     </section>}
     {hasCompletedDocuments && <section className="next-step-card"><div><p className="eyebrow">{t("documents.nextStep.eyebrow")}</p><h2>{t("documents.nextStep.title")}</h2><p>{t("documents.nextStep.description")}</p></div><div className="next-step-actions"><Button label={t("documents.nextStep.search")} variant="primary" onClick={onSearch}/><Button label={t("workflow.explore")} variant="secondary" onClick={onExplore}/></div></section>}

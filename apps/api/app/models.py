@@ -129,6 +129,9 @@ class Document(Timestamped, Base):
     metadata_template_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     metadata_template_fields: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     document_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    metadata_observations: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    metadata_status: Mapped[str] = mapped_column(String(30), default="not_started", nullable=False, index=True)
+    metadata_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     metadata_search_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     published_at: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     tags: Mapped[list] = mapped_column(JSON, default=list)
@@ -150,9 +153,14 @@ class DocumentMetadataValue(Base):
     document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
     field_key: Mapped[str] = mapped_column(String(80), index=True)
     value_text: Mapped[str] = mapped_column(String(10000))
+    value_number: Mapped[float | None] = mapped_column(Float, nullable=True)
+    value_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    value_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     __table_args__ = (
         UniqueConstraint("document_id", "field_key", name="uq_document_metadata_value"),
+        Index("ix_document_metadata_number", "knowledge_base_id", "field_key", "value_number"),
+        Index("ix_document_metadata_date", "knowledge_base_id", "field_key", "value_date"),
         Index("ix_document_metadata_filter", "knowledge_base_id", "field_key", "value_text"),
     )
 

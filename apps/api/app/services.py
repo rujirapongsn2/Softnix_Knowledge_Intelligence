@@ -1,11 +1,13 @@
 import hashlib
 import logging
+import math
 import mimetypes
 import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from contextvars import copy_context
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import BoundedSemaphore
 
@@ -24,6 +26,8 @@ from .legal_registry import AUTHORITY_LEVELS, classify_kind, normalize_family_ke
 from .legal_resolver import resolve_legal_context
 from .legal_corpus import parse_legal_corpus_metadata
 from .document_templates import metadata_search_text, normalize_field_definitions
+from .metadata_search import apply_typed_predicates, decorate_sources, metadata_coverage, predicate_coverage
+from .metadata_extraction import JOB_TYPE as METADATA_JOB_TYPE, process_metadata_job, queue_metadata_extraction
 from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .openrouter import OpenRouterClient
 from .observability import metrics
@@ -173,6 +177,9 @@ def sync_document_metadata_values(db: Session, document: Document) -> None:
             document_id=document.id,
             field_key=key,
             value_text=str(value)[:10000],
+            value_type=field.get("field_type", "text"),
+            value_number=value if field.get("field_type") == "number" else None,
+            value_date=date.fromisoformat(value) if field.get("field_type") == "date" else None,
         ))
     db.flush()
 
@@ -187,7 +194,9 @@ def sync_document_metadata_graph(db: Session, document: Document) -> dict[str, i
     _remove_metadata_graph_projection(db, document)
     fields = normalize_field_definitions(document.metadata_template_fields)
     mapped = [field for field in fields if field.get("graph_relationship") and field.get("graph_entity_type")
-              and document.document_metadata.get(field.get("key")) not in (None, "")]
+              and document.document_metadata.get(field.get("key")) not in (None, "")
+              and (document.metadata_observations or {}).get(field.get("key"), {}).get("status", "legacy_manual")
+              in {"human_verified", "legacy_manual"}]
     if not mapped:
         return {"entities": 0, "relationships": 0}
     anchor_key = f"metadata:document:{document.id}"
@@ -966,6 +975,7 @@ def analyze_impact(db: Session, subject: str, knowledge_base_ids: list[str], max
                 "path": [nodes[path_id]["name"] for path_id in paths[node_id]], "relationship": edge.relationship_type if edge else "RELATED_TO",
                 "confidence": edge.confidence if edge else None, "citation_ids": citation_ids_by_rel.get(edge.id, []) if edge else []}
         (direct if distance[node_id] == 1 else indirect).append(item)
+    enrich_sources_with_file_links(db, sources)
     return {"status": "success", "subject": {"entity_id": entity.id, "name": entity.name, "type": entity.entity_type},
             "direct_impacts": direct, "indirect_impacts": indirect if include_indirect else [], "sources": sources,
             "insufficient_evidence": not bool(direct or indirect), "warnings": []}
@@ -1113,6 +1123,76 @@ def _trace_preview_fields(query: str, answer: str, sources: list[dict]) -> dict:
     }
 
 
+
+def document_file_available(document: Document) -> bool:
+    """True when the original blob is present under FILE_STORAGE_PATH (path-safe)."""
+    if not document or not document.storage_path:
+        return False
+    try:
+        file_path = Path(document.storage_path).resolve()
+        file_path.relative_to(get_settings().file_root.resolve())
+    except (OSError, ValueError):
+        return False
+    return file_path.is_file()
+
+
+def document_download_url(document_id: str, *, base_url: str | None = None) -> str:
+    """Root-relative download path Agents call with the same MCP Bearer token.
+
+    Absolute URLs are used only when a request base_url is supplied; otherwise
+    Agents prepend the Softnix host. Authorization: Bearer <MCP token> is required.
+    """
+    relative = f"/api/v1/documents/{document_id}/file"
+    if base_url:
+        return f"{base_url.rstrip('/')}{relative}"
+    return relative
+
+
+def enrich_sources_with_file_links(db: Session, sources: list[dict], *, base_url: str | None = None) -> list[dict]:
+    """Attach original_filename / mime_type / download_url onto cited sources.
+
+    Enrichment runs before QueryResult persistence so get_sources returns the
+    same fields. Sources without a stored original omit download_url (null).
+    Does not embed file bytes in JSON-RPC responses.
+    """
+    if not sources:
+        return sources
+    doc_ids = {source.get("document_id") for source in sources if source.get("document_id")}
+    documents = {}
+    if doc_ids:
+        documents = {
+            document.id: document
+            for document in db.query(Document).filter(
+                Document.id.in_(doc_ids), Document.deleted_at.is_(None),
+            ).all()
+        }
+    for source in sources:
+        document = documents.get(source.get("document_id"))
+        if not document or not document_file_available(document):
+            source.setdefault("original_filename", None)
+            source.setdefault("mime_type", None)
+            source.setdefault("download_url", None)
+            continue
+        source["original_filename"] = document.original_filename
+        source["mime_type"] = document.mime_type
+        source["download_url"] = document_download_url(document.id, base_url=base_url)
+    return sources
+
+
+def _persist_query_result(db: Session, result: dict, token_id: str | None = None, *, base_url: str | None = None) -> dict:
+    """Enrich citation sources with download links, then save QueryResult."""
+    sources = result.get("sources")
+    if isinstance(sources, list):
+        enrich_sources_with_file_links(db, sources, base_url=base_url)
+    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
+    db.add(saved)
+    db.flush()
+    result["result_id"] = saved.id
+    saved.result_json = result
+    db.commit()
+    return result
+
+
 def build_legal_metadata_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
     """Resolve publisher/version metadata directly from the legal registry."""
     rows = db.query(Document, LegalInstrument).join(LegalInstrument, LegalInstrument.document_id == Document.id).filter(
@@ -1142,9 +1222,7 @@ def build_legal_metadata_result(db: Session, query: str, kb_ids: list[str], toke
         "retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": len(sources), "duration_ms": 0, "detail": "publisher metadata lookup"}],
         **_trace_preview_fields(query, answer, sources)},
     }
-    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
-    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
-    return result
+    return _persist_query_result(db, result, token_id)
 
 
 def is_legal_provenance_lookup(query: str) -> bool:
@@ -1195,9 +1273,7 @@ def build_legal_effective_rule_result(db: Session, query: str, kb_ids: list[str]
         "retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": len(sources), "duration_ms": 0, "detail": "named amendment commencement clauses"}],
         **_trace_preview_fields(query, answer, sources)},
     }
-    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
-    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
-    return result
+    return _persist_query_result(db, result, token_id)
 
 
 def _verified_amendment_relations(db: Session, kb_ids: list[str], family_id: str | None) -> list[tuple[LegalInstrumentRelation, LegalInstrument, Document]]:
@@ -1301,9 +1377,7 @@ def _persist_legal_clause_result(db: Session, *, query: str, kb_ids: list[str], 
               "retrieval_plan": {"version": 1, "intent": intent, "planner_source": "rules", "channels": ["legal_registry", "document_chunks"]},
               "retrieval_trace": [{"channel": "document_chunks", "system": "PostgreSQL legal sections", "status": "used", "result_count": len(sources), "duration_ms": 0, "detail": detail}],
               **_trace_preview_fields(query, answer, sources)}}
-    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
-    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
-    return result
+    return _persist_query_result(db, result, token_id)
 
 
 def _sole_latest_legal_instrument(db: Session, kb_ids: list[str]) -> tuple[Document, LegalInstrument] | None:
@@ -1616,9 +1690,7 @@ def build_legal_provenance_result(db: Session, query: str, kb_ids: list[str], to
         "retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": len(sources), "duration_ms": 0, "detail": "verified amendment provenance lookup"}],
         **_trace_preview_fields(query, answer, sources)},
     }
-    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
-    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
-    return result
+    return _persist_query_result(db, result, token_id)
 
 
 def legal_scope_gap_response(query: str) -> str:
@@ -1642,9 +1714,7 @@ def _persist_scope_gap_result(db: Session, query: str, kb_ids: list[str], token_
         "retrieval_trace": [{"channel": "legal_registry", "system": "PostgreSQL legal registry", "status": "used", "result_count": 0, "duration_ms": 0, "detail": "out-of-scope document-type check"}],
         **_trace_preview_fields(query, answer, [])},
     }
-    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
-    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
-    return result
+    return _persist_query_result(db, result, token_id)
 
 
 def has_court_decision_evidence(db: Session, kb_ids: list[str]) -> bool:
@@ -1672,6 +1742,7 @@ def has_active_query_filters(query_filters=None) -> bool:
         or getattr(query_filters, "as_of_date", None)
         or getattr(query_filters, "include_historical", False)
         or getattr(query_filters, "metadata", None)
+        or getattr(query_filters, "metadata_predicates", None)
     ))
 
 
@@ -1689,7 +1760,7 @@ def allows_default_current_direct_path(query: str, query_filters=None) -> bool:
 
 
 def summarize_document_inventory(db: Session, kb_ids: list[str], *, scope: str = "all",
-                                 include_documents: bool = True, max_documents: int = 500) -> dict:
+                                 include_documents: bool = True, max_documents: int = 500, query_filters=None) -> dict:
     """Return an authoritative, non-LLM document and legal-registry summary.
 
     ``scope=all`` means every non-deleted document in the token's active KB
@@ -1703,6 +1774,14 @@ def summarize_document_inventory(db: Session, kb_ids: list[str], *, scope: str =
     if scope == "current":
         base_query = base_query.filter(or_(Document.document_type.notin_(LEGAL_DOCUMENT_TYPES), LegalInstrument.status.in_(current_statuses)))
 
+    if query_filters:
+        if query_filters.published_from:
+            base_query = base_query.filter(Document.published_at >= query_filters.published_from)
+        if query_filters.published_to:
+            base_query = base_query.filter(Document.published_at <= query_filters.published_to)
+        if query_filters.metadata:
+            base_query = base_query.filter(Document.id.in_(_metadata_filter_document_ids(db, kb_ids, query_filters.metadata)))
+        base_query = apply_typed_predicates(base_query, query_filters.metadata_predicates)
     total_documents = base_query.with_entities(func.count(Document.id)).scalar() or 0
     type_rows = base_query.with_entities(Document.document_type, func.count(Document.id)).group_by(Document.document_type).all()
     kind_rows = base_query.filter(LegalInstrument.id.is_not(None)).with_entities(LegalInstrument.kind, func.count(Document.id)).group_by(LegalInstrument.kind).all()
@@ -1799,9 +1878,11 @@ def build_document_inventory_result(db: Session, query: str, kb_ids: list[str], 
     """Build a saved, deterministic result for REST/MCP inventory queries."""
     resolved_scope = scope or document_inventory_scope(query, query_filters)
     inventory = summarize_document_inventory(db, kb_ids, scope=resolved_scope,
-                                             include_documents=include_documents, max_documents=max_documents)
+                                             include_documents=include_documents, max_documents=max_documents, query_filters=query_filters)
     sources = _inventory_sources(inventory)
     answer = _inventory_answer(inventory, sources)
+    if any(item["unknown_or_not_filterable"] for item in predicate_coverage(db, kb_ids, getattr(query_filters, "metadata_predicates", []))):
+        answer += "\nผลนี้นับเฉพาะเอกสารที่มีข้อมูลผ่านตัวกรอง ยังมีเอกสารที่ข้อมูลไม่ครบหรือไม่ได้เปิดให้กรอง จึงไม่ควรสรุปว่าเป็นรายการที่ตรงเงื่อนไขทั้งหมด"
     plan = {"version": 1, "intent": "document_inventory", "planner_source": "rules",
             "rationale": "deterministic document/legal registry aggregation", "channels": ["document_registry"],
             "max_sources": len(sources), "graph_depth": 0, "graph_scope": "none", "entity_subjects": [],
@@ -1822,12 +1903,12 @@ def build_document_inventory_result(db: Session, query: str, kb_ids: list[str], 
                            "answer_preview": answer[:800] if get_settings().log_query_text else None,
                            "citation_ids": [source["citation_id"] for source in sources],
                            "filter_summary": query_filters.model_dump(mode="json") if query_filters else {},
+                           "metadata_coverage": metadata_coverage(db, kb_ids),
+                           "predicate_coverage": predicate_coverage(db, kb_ids, getattr(query_filters, "metadata_predicates", [])),
                            "response_summary": {"status": "success", "insufficient_evidence": not bool(inventory["total_documents"]),
                                                 "source_count": len(sources), "entity_count": 0, "relationship_count": 0,
                                                 "total_documents": inventory["total_documents"]}}}
-    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
-    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
-    return result
+    return _persist_query_result(db, result, token_id)
 
 
 def create_document_job(db: Session, knowledge_base_id: str, upload, title: str | None = None, document_type: str = "general", published_at=None,
@@ -2238,7 +2319,7 @@ def classify_track_failure(error_detail: str | None) -> str:
 # Follow-up stages run after a document is already searchable and are cheap;
 # running them before new full pipelines keeps a legal document's registry
 # extraction from queueing minutes behind freshly uploaded bulk work (F4).
-_FOLLOW_UP_JOB_TYPES = ("EXTRACT_LEGAL_METADATA", "REINDEX_EMBEDDINGS")
+_FOLLOW_UP_JOB_TYPES = ("EXTRACT_LEGAL_METADATA", "REINDEX_EMBEDDINGS", METADATA_JOB_TYPE)
 
 
 def process_next_job(db: Session) -> bool:
@@ -2301,6 +2382,9 @@ def process_next_job(db: Session) -> bool:
     if not doc or doc.deleted_at:
         job.status, job.current_stage, job.error_code = "cancelled", "cancelled", "DOCUMENT_DELETED"
         db.commit()
+        return True
+    if job.job_type == METADATA_JOB_TYPE:
+        process_metadata_job(db, job)
         return True
     reindex_only = job.job_type == "REINDEX_EMBEDDINGS"
     legal_only = job.job_type == "EXTRACT_LEGAL_METADATA"
@@ -2400,6 +2484,7 @@ def process_next_job(db: Session) -> bool:
             # recovered from — the document view would show an error code on a
             # healthy document (F2).
             doc.error_code, doc.error_message = None, None
+            queue_metadata_extraction(db, doc)
             if doc.document_type in LEGAL_DOCUMENT_TYPES:
                 db.add(ProcessingJob(
                     document_id=doc.id,
@@ -2498,6 +2583,7 @@ def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources
         "as_of_date": as_of_date or decision.plan.as_of_date,
         "include_historical": include_historical or decision.plan.include_historical,
         "metadata_filters": metadata_filters,
+        "metadata_predicates": [p.model_dump() for p in getattr(query_filters, "metadata_predicates", [])] if query_filters else [],
     })
     if decision.ambiguous and policy.planner_llm_fallback:
         try:
@@ -2548,6 +2634,12 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
         _append_retrieval_trace(trace, channel="metadata_filter", system="PostgreSQL document metadata", status="used",
                                 started_at=time.monotonic(), result_count=len(metadata_document_ids),
                                 detail=f"exact filter keys: {', '.join(sorted(plan.metadata_filters))}")
+    if plan.metadata_predicates:
+        rows = db.query(Document.id).filter(Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None))
+        rows = _apply_metadata_filter(rows, plan)
+        ids = [r[0] for r in apply_typed_predicates(rows, plan.metadata_predicates).all()]
+        plan = plan.model_copy(update={"metadata_document_ids": ids})
+        _append_retrieval_trace(trace, channel="metadata_filter", system="PostgreSQL typed metadata", status="used", started_at=time.monotonic(), result_count=len(ids), detail="Explicit typed predicates; unknown values excluded, filters never relaxed")
     if plan.legal_context and plan.legal_context.ambiguous_context and not plan.include_historical:
         detail = plan.legal_context.ambiguity_reason or "The legal instrument or provision context is ambiguous."
         if warnings is not None:
@@ -2558,6 +2650,11 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
             })
         _append_retrieval_trace(trace, channel="legal_resolver", system="PostgreSQL legal registry", status="ambiguous",
                                 started_at=time.monotonic(), result_count=0, detail=detail)
+        return RetrievalEvidence([], [], [], [])
+    if plan.metadata_document_ids == []:
+        _append_retrieval_trace(trace, channel="metadata_filter", system="planner", status="used",
+                                started_at=time.monotonic(), result_count=0,
+                                detail="No documents satisfy explicit metadata filters; retrieval skipped")
         return RetrievalEvidence([], [], [], [])
     channels: list[RetrievalEvidence] = []
     db_channels = {
@@ -2584,7 +2681,8 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
     with ThreadPoolExecutor(max_workers=max(1, len(db_channels))) as executor:
         for channel, callback in db_channels.items():
             if channel in plan.channels:
-                futures[executor.submit(_run_retrieval_channel, callback, True)] = channel
+                # Each thread needs its own copy to preserve the MCP deadline.
+                futures[executor.submit(copy_context().run, _run_retrieval_channel, callback, True)] = channel
         for future in as_completed(futures):
             try:
                 value = future.result()
@@ -2671,6 +2769,7 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
         _decorate_sources_with_legal_metadata(evidence.sources, instruments_by_document)
 
     if evidence.sources:
+        decorate_sources(db, evidence.sources, kb_ids, [p["field_key"] for p in plan.metadata_predicates] + list(plan.metadata_filters))
         started_at = time.monotonic()
         try:
             evidence.answer = OpenRouterClient().answer_from_sources(query, evidence.sources)
@@ -3155,11 +3254,16 @@ def fuse_evidence(*channels: RetrievalEvidence, limit: int, legal_meta: dict[str
     Knowledge Base with no legal instruments scores exactly as before."""
     candidates: dict[str, dict] = {}
     for channel in channels:
-        for rank, source in enumerate(channel.sources, 1):
+        seen = set()
+        for source in channel.sources:
             # A single document can contribute several relevant passages. Keep
             # each chunk as independent evidence so answer generation receives
             # the passage that actually addresses the question.
             key = f"{source['document_id']}:{source['chunk_id']}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rank = len(seen)
             score = 1.0 / (60 + rank)
             candidate = candidates.setdefault(key, {"score": 0.0, "source": source})
             candidate["score"] += score
@@ -3216,13 +3320,19 @@ def rerank_evidence(query: str, evidence: RetrievalEvidence, limit: int,
                                 started_at=started_at, detail=str(exc))
         return evidence
     ordered = []
+    seen = set()
     for index, relevance in ranked:
-        if 0 <= index < len(candidates):
+        if (isinstance(index, int) and not isinstance(index, bool)
+                and 0 <= index < len(candidates) and index not in seen
+                and isinstance(relevance, (int, float)) and math.isfinite(relevance)):
             ordered.append({**candidates[index], "relevance": relevance})
+            seen.add(index)
     if not ordered:
         _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="used",
                                 started_at=started_at, detail="no ranked candidates returned")
         return evidence
+    # A partial provider response must not silently discard useful evidence.
+    ordered.extend(source for index, source in enumerate(candidates) if index not in seen)
     sources = [{**source, "citation_id": f"S{index}"} for index, source in enumerate(ordered[:limit], 1)]
     _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="used",
                             started_at=started_at, result_count=len(sources), detail="cross-encoder rerank")
@@ -3485,6 +3595,8 @@ def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: 
     evidence = query_documents(db, query, kb_ids, decision.plan.max_sources, retrieval_trace, decision.plan, legal_warnings)
     intent = decision.plan.intent
     answer = compose_cited_answer(evidence, legal_warnings)
+    if any(item["unknown_or_not_filterable"] for item in predicate_coverage(db, kb_ids, getattr(query_filters, "metadata_predicates", []))):
+        answer += "\nยังมีเอกสารที่ metadata ไม่ครบหรือไม่ได้เปิดให้กรอง จึงไม่ควรใช้ผลการค้นหานี้สรุปว่าไม่มีเอกสารอื่นตรงเงื่อนไข"
     if not evidence.sources and decision.plan.legal_context is not None:
         answer = legal_scope_gap_response(query)
     legal_context = decision.plan.legal_context.model_dump(mode="json") if decision.plan.legal_context else None
@@ -3512,9 +3624,9 @@ def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: 
                                                 "answer_preview": answer[:800] if get_settings().log_query_text else None,
                                                 "citation_ids": [source.get("citation_id") for source in evidence.sources],
                                                 "filter_summary": query_filters.model_dump(mode="json") if query_filters else {},
+                           "metadata_coverage": metadata_coverage(db, kb_ids),
+                           "predicate_coverage": predicate_coverage(db, kb_ids, getattr(query_filters, "metadata_predicates", [])),
                                                 "response_summary": {"status": "success", "insufficient_evidence": not bool(evidence.sources),
                                                                      "source_count": len(evidence.sources), "entity_count": len(evidence.entities),
                                                                      "relationship_count": len(evidence.relationships)}}}
-    saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
-    db.add(saved); db.flush(); result["result_id"] = saved.id; saved.result_json = result; db.commit()
-    return result
+    return _persist_query_result(db, result, token_id)

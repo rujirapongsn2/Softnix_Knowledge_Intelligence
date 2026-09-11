@@ -1,16 +1,5 @@
-import os
-import tempfile
 from io import BytesIO
 from types import SimpleNamespace
-
-_TEST_ROOT = tempfile.mkdtemp()
-os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_ROOT}/skip.db"
-os.environ["FILE_STORAGE_PATH"] = f"{_TEST_ROOT}/files"
-os.environ["INITIAL_ADMIN_PASSWORD"] = "correct-horse-battery-staple"
-os.environ["LIGHTRAG_BASE_URL"] = ""
-os.environ["REDIS_URL"] = ""
-os.environ["OPENROUTER_API_KEY"] = ""
-os.environ["EXT_OCR_KEY"] = ""
 
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
@@ -948,6 +937,30 @@ def test_document_template_api_rejects_duplicate_fields_and_does_not_keep_old_pr
     switched = test_client.patch(f"/api/v1/document-templates/{created['id']}", json={"base_document_type": "general"})
     assert switched.status_code == 200
     assert {field["key"] for field in switched.json()["fields"]} == {"owner"}
+
+
+def test_custom_document_template_can_be_duplicated_without_affecting_the_source():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Duplicate template", "code": "duplicate-template"}).json()
+    source = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/document-templates", json={
+        "name": "Supplier invoice", "description": "Invoices from suppliers", "base_document_type": "legal",
+        "fields": [{"key": "invoice_no", "label": "Invoice number", "filterable": True}],
+    }).json()
+    copied = test_client.post(f"/api/v1/document-templates/{source['id']}/duplicate")
+    assert copied.status_code == 200
+    duplicate = copied.json()
+    assert duplicate["id"] != source["id"]
+    assert duplicate["name"] == "Supplier invoice copy"
+    assert duplicate["code"] != source["code"]
+    assert duplicate["description"] == source["description"]
+    assert duplicate["base_document_type"] == "legal" and duplicate["is_active"] is True
+    assert {field["key"] for field in duplicate["fields"]} == {field["key"] for field in source["fields"]}
+
+    second = test_client.post(f"/api/v1/document-templates/{source['id']}/duplicate").json()
+    assert second["name"] == "Supplier invoice copy 2"
+    unchanged = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/document-templates").json()
+    original = next(row for row in unchanged if row["id"] == source["id"])
+    assert original["name"] == "Supplier invoice" and original["usage_count"] == 0
 def test_document_template_guards_system_names_and_archived_empty_schema_snapshots():
     test_client = next(client())
     kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Template Guard KB", "code": "template-guard-kb"}).json()

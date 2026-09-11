@@ -38,6 +38,8 @@ For every factual claim:
 - `analyze_relationships` — inspect verified/manual relationships in scope.
 - `analyze_impact` — calculate bounded direct and indirect impact in scope.
 - `get_sources` — retrieve full excerpts for a previous `result_id`.
+  Cited sources may include `download_url`, `original_filename`, and
+  `mime_type` when an original file is stored.
 - `resolve_legal_context` — resolve the applicable legal instrument/provision
   and effective version when a legal or time-sensitive question is asked.
 - `get_legal_instrument` — inspect instrument identity, family, provenance,
@@ -68,6 +70,11 @@ For every factual claim:
 
 - Reply in the user's language.
 - Keep citations next to the claims they support.
+
+- When the user needs the original PDF/file for a citation, use that source's
+  `download_url` with the same MCP Bearer token (`GET` the path; do not expect
+  file bytes inside the MCP JSON response). Do not use web search to obtain the
+  file.
 - Never fabricate document names, numbers, dates, quotations or relationships.
 - Distinguish verified/manual evidence from AI suggestions; suggestions are
   leads, not facts, until reviewed.

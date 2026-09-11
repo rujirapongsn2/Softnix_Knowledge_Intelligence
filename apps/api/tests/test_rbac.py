@@ -371,6 +371,23 @@ def test_delete_kb_revokes_scoped_tokens():
     assert listed[ingest["id"]] == "revoked"
 
 
+def test_document_template_mutations_require_knowledge_base_access():
+    tc = next(client())
+    protected_kb = make_kb(tc, "Protected templates", "protected-templates")
+    template = tc.post(f"/api/v1/knowledge-bases/{protected_kb['id']}/document-templates", json={
+        "name": "Protected type", "fields": [{"key": "issuer", "label": "Issuer"}],
+    }).json()
+    make_user(tc, "templateoutsider")
+    login_as(tc, "templateoutsider", "UserPass123!")
+
+    assert tc.patch(f"/api/v1/document-templates/{template['id']}", json={"description": "unauthorized"}).status_code == 404
+    assert tc.patch(f"/api/v1/document-templates/{template['id']}/rename", json={"name": "Unauthorized rename"}).status_code == 404
+    assert tc.post(f"/api/v1/document-templates/{template['id']}/duplicate").status_code == 404
+    assert tc.delete(f"/api/v1/document-templates/{template['id']}").status_code == 404
+    assert tc.post(f"/api/v1/document-templates/{template['id']}/activate").status_code == 404
+    assert tc.delete(f"/api/v1/document-templates/{template['id']}/purge").status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Logs gating
 # ---------------------------------------------------------------------------

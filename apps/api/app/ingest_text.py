@@ -89,6 +89,9 @@ def create_text_document_job(db: Session, knowledge_base_id: str, title: str, te
         title=title or f"{_safe_stem(title)}.md",
         document_type=document_type, published_at=published_at,
         metadata_template_id=(metadata_template or {}).get("id"),
+        metadata_template_name=(metadata_template or {}).get("name"),
+        metadata_template_version=(metadata_template or {}).get("version"),
+        metadata_template_fields=(metadata_template or {}).get("fields", []),
         document_metadata=document_metadata or {},
     )
     if document_metadata:

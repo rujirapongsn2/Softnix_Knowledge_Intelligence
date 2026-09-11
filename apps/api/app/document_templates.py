@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import uuid
 import json
+import math
 from copy import deepcopy
 from datetime import date
 from typing import Any
@@ -117,7 +118,7 @@ def resolve_template(db: Session, knowledge_base_id: str, template_id: str | Non
     return result
 
 
-def validate_metadata_values(fields: list[dict[str, Any]], values: dict[str, Any] | None) -> dict[str, Any]:
+def validate_metadata_values(fields: list[dict[str, Any]], values: dict[str, Any] | None, *, allow_extraction_pending: bool = False) -> dict[str, Any]:
     values = values or {}
     if not isinstance(values, dict):
         raise ValueError("DOCUMENT_METADATA_INVALID")
@@ -131,13 +132,13 @@ def validate_metadata_values(fields: list[dict[str, Any]], values: dict[str, Any
     for key, field in allowed.items():
         value = values.get(key)
         if value in (None, ""):
-            if field.get("required"):
+            if field.get("required") and not (allow_extraction_pending and field.get("fill_mode") == "extract"):
                 raise ValueError("DOCUMENT_METADATA_REQUIRED")
             continue
         kind = field.get("field_type", "text")
         if kind == "boolean" and not isinstance(value, bool):
             raise ValueError("DOCUMENT_METADATA_INVALID")
-        if kind == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))):
+        if kind == "number" and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)):
             raise ValueError("DOCUMENT_METADATA_INVALID")
         if kind in {"text", "textarea"} and (not isinstance(value, str) or len(value) > (50_000 if kind == "textarea" else 10_000)):
             raise ValueError("DOCUMENT_METADATA_INVALID")

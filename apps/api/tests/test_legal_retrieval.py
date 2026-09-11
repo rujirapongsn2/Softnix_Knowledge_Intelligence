@@ -593,10 +593,18 @@ def test_query_endpoint_as_of_past_date_returns_the_earlier_version():
 def test_query_endpoint_regression_general_knowledge_base_is_unaffected():
     test_client = next(client())
     kb = test_client.post("/api/v1/knowledge-bases", json={"name": "General regression", "code": "general-regression"}).json()
-    test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={
-        "file": ("architecture.txt", b"Customer Portal runs on APP-01.", "text/plain"),
-    }).json()
-    assert test_client.post("/api/v1/internal/process-next").json()["processed"] is True
+    # Seed this query's evidence directly; unrelated queued jobs must not
+    # determine whether a retrieval regression test has searchable content.
+    with SessionLocal() as db:
+        text = "Customer Portal runs on APP-01."
+        doc = Document(knowledge_base_id=kb["id"], original_filename="architecture.txt",
+                       stored_filename="architecture.txt", storage_path="/tmp/architecture.txt",
+                       mime_type="text/plain", file_size=len(text), checksum_sha256="ab" * 32,
+                       title="Architecture", document_type="general", status="completed", extracted_text=text)
+        db.add(doc)
+        db.flush()
+        services.replace_document_chunks(db, doc, text)
+        db.commit()
     response = test_client.post("/api/v1/query", json={"query": "What runs on APP-01?", "knowledge_base_ids": [kb["id"]]})
     assert response.status_code == 200
     payload = response.json()

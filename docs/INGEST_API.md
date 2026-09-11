@@ -50,6 +50,34 @@ curl "https://knowledge.example.com/api/v1/ingest/knowledge-bases" \
 เพื่อให้ client แยก "ยังไม่ตั้งค่าอะไรเลย" ออกจาก "ตั้งค่าไว้แล้วแต่ถูก disable" ได้ — การอัปโหลด
 เข้า Knowledge Base ที่ไม่ active จะตอบ `409 KNOWLEDGE_BASE_DISABLED` เหมือนเดิม
 
+## เลือก Document Type และรับ id
+
+`GET /api/v1/ingest/knowledge-bases/{kb_id}/document-types`
+
+เรียก endpoint นี้ก่อนนำเข้าเพื่อรับ `id` ของ Document Type ที่ใช้งานได้ใน Knowledge Base นั้น รวมทั้ง
+ชนิดมาตรฐานและชนิดที่ผู้ดูแลสร้างเอง ผลลัพธ์มี `fields` จึงใช้ตรวจชื่อและชนิดของ metadata ที่ส่งใน
+`metadata_json` ได้โดยไม่ต้อง hardcode ฟอร์มไว้ในระบบภายนอก
+
+```bash
+curl "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/document-types" \
+  -H "Authorization: Bearer $SOFTNIX_INGEST_TOKEN"
+```
+
+```json
+{
+  "items": [{
+    "id": "7a1c...",
+    "code": "supplier-invoice",
+    "name": "Supplier invoice",
+    "base_document_type": "general",
+    "fields": [{"key": "invoice_no", "label": "Invoice number", "field_type": "text"}]
+  }]
+}
+```
+
+ใช้ค่า `id` กับ `document_type_id` ในการนำเข้า ตัวอย่างชนิดมาตรฐานคือ `system:general`,
+`system:legal`, `system:regulation` และ `system:contract` ส่วนชนิดแบบกำหนดเองใช้ id ที่ endpoint นี้คืนมา
+
 ## นำเข้าเอกสารทีละไฟล์
 
 `POST /api/v1/ingest/knowledge-bases/{kb_id}/documents` — `multipart/form-data`
@@ -58,8 +86,9 @@ curl "https://knowledge.example.com/api/v1/ingest/knowledge-bases" \
 |---|---|---|
 | `file` | ✓ | ไฟล์เอกสาร |
 | `title` | | ชื่อเอกสาร ถ้าไม่ส่งจะใช้ชื่อไฟล์ |
-| `document_type` | | `general` (ค่าเริ่มต้น), `legal`, `regulation`, `contract` |
-| `template_id` | | id ของ Document Type ที่กำหนดฟอร์ม metadata ไว้ |
+| `document_type_id` | | id จาก endpoint Document Type; เมื่อระบุ ระบบใช้ processing profile และ metadata fields ของชนิดนั้น |
+| `document_type` | | ทางเลือกเดิมสำหรับชนิดมาตรฐาน (`general`, `legal`, `regulation`, `contract`) เมื่อไม่ได้ส่ง `document_type_id` |
+| `template_id` | | ชื่อเดิมที่ยังรองรับเพื่อความเข้ากันได้ ใช้แทน `document_type_id` เท่านั้น |
 | `metadata_json` | | JSON object ของค่า metadata ตาม template |
 | `published_at` | | วันที่ประกาศใช้ รูปแบบ `YYYY-MM-DD` |
 
@@ -68,7 +97,7 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
   -H "Authorization: Bearer $SOFTNIX_INGEST_TOKEN" \
   -F "file=@./contract.pdf" \
   -F "title=สัญญาจัดซื้อ 2569" \
-  -F "document_type=contract" \
+  -F "document_type_id=system:contract" \
   -F "published_at=2026-01-15"
 ```
 
@@ -80,7 +109,8 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
   "document_id": "6f2c...",
   "job_id": "a91d...",
   "document_type": "contract",
-  "template_id": null
+  "document_type_id": "system:contract",
+  "template_id": "system:contract"
 }
 ```
 
@@ -89,7 +119,7 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
 `POST /api/v1/ingest/knowledge-bases/{kb_id}/documents/batch` — `multipart/form-data`
 ส่งฟิลด์ `files` ซ้ำได้ **สูงสุด 20 ไฟล์ต่อ request** (เกินจะได้ `400 BATCH_TOO_MANY_FILES`)
 
-`document_type`, `template_id`, `metadata_json` ใช้ร่วมกันทั้ง batch — ถ้าต้องการ metadata ต่างกันรายไฟล์
+`document_type_id`, `document_type`, `template_id`, `metadata_json` ใช้ร่วมกันทั้ง batch — ถ้าต้องการ metadata ต่างกันรายไฟล์
 ให้ใช้ endpoint แบบไฟล์เดียว
 
 ```bash
@@ -97,7 +127,7 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
   -H "Authorization: Bearer $SOFTNIX_INGEST_TOKEN" \
   -F "files=@./a.pdf" \
   -F "files=@./b.docx" \
-  -F "document_type=general"
+  -F "document_type_id=system:general"
 ```
 
 **Partial success:** ไฟล์เสียใบเดียวไม่ทำให้ทั้ง batch ตก ระบบจะเข้าคิวไฟล์ที่ผ่านทั้งหมดแล้วรายงานผลรายไฟล์
@@ -111,12 +141,13 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
   "queued_count": 1,
   "failed_count": 1,
   "document_type": "general",
-  "template_id": null,
+  "document_type_id": "system:general",
+  "template_id": "system:general",
   "results": [
     {"filename": "a.pdf", "status": "queued", "document_id": "6f2c...", "job_id": "a91d...",
-     "document_type": "general", "template_id": null},
+     "document_type": "general", "document_type_id": "system:general", "template_id": "system:general"},
     {"filename": "b.exe", "status": "failed", "error_code": "FILE_TYPE_NOT_SUPPORTED",
-     "message": "Upload rejected", "document_type": "general", "template_id": null}
+     "message": "Upload rejected", "document_type": "general", "document_type_id": "system:general", "template_id": "system:general"}
   ]
 }
 ```
@@ -131,8 +162,9 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
 |---|---|---|
 | `title` | ✓ | ชื่อเอกสาร |
 | `text` | ✓ | ข้อความเนื้อหาเอกสาร (Markdown / Plain Text) |
-| `document_type` | | `general` (ค่าเริ่มต้น), `legal`, `regulation`, `contract` |
-| `template_id` | | id ของ Metadata Template (ทางเลือก) |
+| `document_type_id` | | id ของ Document Type จาก endpoint Document Type |
+| `document_type` | | ทางเลือกเดิมสำหรับชนิดมาตรฐาน เมื่อไม่ได้ส่ง `document_type_id` |
+| `template_id` | | ชื่อเดิมที่ยังรองรับ ใช้แทน `document_type_id` เท่านั้น |
 | `metadata_json` | | JSON string ของ metadata (ทางเลือก) |
 | `published_at` | | วันที่ประกาศใช้ รูปแบบ `YYYY-MM-DD` (ทางเลือก) |
 
@@ -143,7 +175,7 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
   -d '{
     "title": "สัญญาจัดซื้อ 2569",
     "text": "# สัญญาจัดซื้อ 2569\nรายละเอียดข้อตกลงและเงื่อนไข...",
-    "document_type": "contract"
+    "document_type_id": "system:contract"
   }'
 ```
 
@@ -155,7 +187,8 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
   "document_id": "6f2c...",
   "job_id": "a91d...",
   "document_type": "contract",
-  "template_id": null
+  "document_type_id": "system:contract",
+  "template_id": "system:contract"
 }
 ```
 
@@ -173,6 +206,7 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
   "filename": "contract.pdf",
   "status": "extracting",
   "document_type": "contract",
+  "document_type_id": "system:contract",
   "error_code": null,
   "created_at": "2026-08-03T04:12:55",
   "latest_job": {
@@ -213,6 +247,30 @@ chain ล้ม — ดู log ของ worker ว่า Softnix/Mistral/Tesser
 ไม่จบ ให้เรียกแบบไม่ส่ง `status` เลยแล้วกรอง `completed`/`failed`/`ocr_required` ออกที่ฝั่ง client
 `limit` รับค่า 1–100 (ค่าเริ่มต้น 50) `offset` ต้องไม่ติดลบ ผิดเงื่อนไขได้ `400 DOCUMENT_PAGE_INVALID`
 คืน `{items, total, limit, offset}` โดยแต่ละ item มีโครงเดียวกับสถานะเอกสารรายฉบับ
+
+### ลบเอกสาร
+
+`DELETE /api/v1/ingest/documents/{document_id}`
+
+ลบแบบ **soft delete**: เอกสารจะหายจากรายการและจาก API ของ Ingest token ทันที แต่ยังสามารถกู้คืนได้
+จากหน้าจัดการเอกสารของผู้ดูแลระบบ ระบบจะยกเลิก job ที่ยัง `queued` หรือ `running` และสร้าง job
+`PURGE_REMOTE_INDEX` เพื่อลบ source ออกจาก retrieval index จึงไม่เหลือผลค้นหาจากเอกสารที่ถูกลบ
+
+Token ลบได้เฉพาะเอกสารใน Knowledge Base เดียวที่ผูกไว้เท่านั้น เอกสารนอกขอบเขตหรือที่ถูกลบแล้วจะตอบ
+`404 DOCUMENT_NOT_FOUND` เพื่อไม่เปิดเผยข้อมูลข้ามคลังความรู้
+
+```bash
+curl -X DELETE "https://knowledge.example.com/api/v1/ingest/documents/$DOCUMENT_ID" \
+  -H "Authorization: Bearer $SOFTNIX_INGEST_TOKEN"
+```
+
+```json
+{
+  "status": "deleted",
+  "document_id": "6f2c...",
+  "purge_job_id": "a91d..."
+}
+```
 
 ### จังหวะการ poll ที่แนะนำ
 

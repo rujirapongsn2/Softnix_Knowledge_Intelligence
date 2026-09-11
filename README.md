@@ -55,6 +55,10 @@ Web/API รองรับ PDF, DOCX, PPTX, XLSX/XLS, TXT, Markdown, HTML, CSV �
 
 เอกสารสามารถระบุ `published_at` (`YYYY-MM-DD`) ตอนอัปโหลดหรือแก้ไขภายหลังได้ วันที่นี้ใช้กรองข่าวตามเดือน/ปี และเอกสารที่ไม่มีวันที่จะไม่ผ่าน query ที่มี date filter
 
+### เติม custom metadata อัตโนมัติ
+
+Document Type สามารถกำหนดแต่ละ field ให้ “อ่านจากเอกสาร” ได้ อัปโหลดในหน้าเดียวแล้วระบบเติมข้อมูลเบื้องหลัง พร้อมหลักฐานจากต้นฉบับ ผู้ใช้ตรวจเฉพาะค่าที่ยังไม่ชัดเจนในรายการ “ข้อมูลรอตรวจ” และค่าที่ผู้ใช้แก้ไขจะไม่ถูก AI เขียนทับ การค้นหาผ่าน MCP รองรับ schema discovery และ typed metadata filters ดู [วิธีใช้ ขอบเขต และ migration](docs/AUTO_METADATA_IMPLEMENTATION.md)
+
 ### OCR สำหรับ PDF สแกน
 
 ระบบตรวจ text layer โดยแปลงด้วย MarkItDown (fallback เป็น pypdf) แล้วนับจำนวนตัวอักษรจริง หากได้น้อยกว่า 20 ตัวจะถือว่าเป็น PDF สแกนที่ไม่มี text layer

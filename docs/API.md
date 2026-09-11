@@ -18,7 +18,7 @@ Base path คือ `/api/v1` และ endpoint ของผู้ดูแล�
 - `POST /knowledge-bases/{id}/documents` และ `/documents/batch`
 - `GET|POST /knowledge-bases/{id}/document-templates` และ `PATCH|DELETE /document-templates/{id}` — Document Type เป็นฟอร์ม metadata ที่สืบทอด field พื้นฐานจาก Processing Profile และกำหนดความสามารถราย field ได้ (`searchable`, `filterable`, `graph_entity_type`, `graph_relationship`)
 - `GET /knowledge-bases/{id}/documents` (legacy list), `GET /knowledge-bases/{id}/documents/page` (bounded UI page with `limit`, `offset`, `search`, `status`, `document_type`, plus global processing/completed/legal flags), `POST /knowledge-bases/{id}/documents/reindex`
-- `GET /documents/{id}/text|jobs`, `POST /documents/{id}/reprocess`, `DELETE /documents/{id}`, `POST /documents/{id}/restore`
+- `GET /documents/{id}/text|jobs|file`, `POST /documents/{id}/reprocess`, `DELETE /documents/{id}`, `POST /documents/{id}/restore` — `/file` downloads the stored original (`Content-Disposition: attachment`)
 - `PATCH /documents/{id}/metadata` รองรับ `published_at: YYYY-MM-DD` และแก้ค่าฟิลด์ metadata ตาม snapshot ของเอกสาร
 
 ## Ingestion API (token)
@@ -29,7 +29,7 @@ curl/Python/Node อยู่ใน [INGEST_API.md](INGEST_API.md)
 
 - `POST /ingest/knowledge-bases/{id}/documents` และ `/documents/batch` (≤20 ไฟล์) — ตอบ `202` เพราะงานเข้าคิว batch รายงานผลรายไฟล์ใน `results[]`
 - `GET /ingest/knowledge-bases/{id}/documents` — `status`, `limit` 1-100, `offset`
-- `GET /ingest/documents/{id}` และ `GET /ingest/documents/{id}/jobs`
+- `GET /ingest/documents/{id}`, `GET /ingest/documents/{id}/jobs`, และ `GET /ingest/documents/{id}/file` (ดาวน์โหลดต้นฉบับใน KB ของ token)
 
 Knowledge Base และเอกสารที่อยู่นอกสิทธิ์ของ token ตอบ `404` เหมือนไม่มีอยู่จริง เพื่อไม่ให้ไล่เดาทรัพยากรของคนอื่น
 

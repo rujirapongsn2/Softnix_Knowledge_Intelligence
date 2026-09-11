@@ -7,9 +7,9 @@ import re
 import time
 import unicodedata
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 import httpx
 import redis
 from sqlalchemy import func, or_, text
@@ -22,12 +22,14 @@ from .graph_store import Neo4jGraphStore
 from .legal_registry import provision_number_matches, resolve_instrument_statuses
 from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, Group, KbOwner, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, ROLE_ADMIN, TokenKey, TraceRun, TraceSpan, User
 from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, custom_template_fields, list_templates, merge_profile_fields, metadata_search_text, resolve_template, template_code, validate_metadata_values
+from .metadata_search import describe_schema
+from .metadata_extraction import queue_metadata_extraction, update_status as update_metadata_status
 from .observability import metrics, now
 from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
-from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
+from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
 from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
@@ -539,6 +541,28 @@ def update_kb_icon(kb_id: str, payload: KnowledgeBaseIconUpdate, user: User = De
     return kb
 
 
+@app.patch("/api/v1/knowledge-bases/{kb_id}/rename", response_model=KnowledgeBaseOut)
+def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Rename a Knowledge Base without touching its stable code.
+
+    The code is the immutable identifier external systems and ingest tokens
+    rely on; renaming changes only the display name (and optionally the
+    description) so integrations never break.
+    """
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
+    values = payload.model_dump(exclude_unset=True)
+    kb.name = values["name"]
+    if "description" in values:
+        kb.description = values["description"]
+    record_audit(db, "knowledge_base.rename", user.id, "knowledge_base", kb.id,
+                 {"name": kb.name, "previous_name": None, "description_changed": "description" in values})
+    db.commit(); db.refresh(kb)
+    return kb
+
+
 @app.post("/api/v1/knowledge-bases/{kb_id}/activate")
 def activate_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
@@ -619,6 +643,7 @@ def update_document_template(template_id: str, payload: DocumentMetadataTemplate
     row = db.get(DocumentMetadataTemplate, template_id)
     if not row:
         raise HTTPException(404, "Document template not found")
+    assert_kb_access(db, user, row.knowledge_base_id)
     values = payload.model_dump(exclude_unset=True)
     if "name" in values and (values["name"].casefold() in SYSTEM_TEMPLATE_NAMES or any(
         other.id != row.id and other.name.casefold() == values["name"].casefold()
@@ -626,7 +651,7 @@ def update_document_template(template_id: str, payload: DocumentMetadataTemplate
     )):
         raise HTTPException(409, {"code": "DOCUMENT_TEMPLATE_NAME_EXISTS", "message": "A document type with this name already exists.", "retryable": False})
     if "fields" in values:
-        raw_fields = [item.model_dump() for item in values["fields"]]
+        raw_fields = [dict(item) for item in values["fields"]]
         values["custom_fields"] = raw_fields
         values["fields"] = merge_profile_fields(values.get("base_document_type", row.base_document_type), raw_fields)
     elif "base_document_type" in values:
@@ -649,10 +674,102 @@ def deactivate_document_template(template_id: str, user: User = Depends(current_
     row = db.get(DocumentMetadataTemplate, template_id)
     if not row:
         raise HTTPException(404, "Document template not found")
+    assert_kb_access(db, user, row.knowledge_base_id)
     row.is_active = False
     record_audit(db, "document_template.deactivate", user.id, "document_template", row.id)
     db.commit()
     return {"status": "inactive", "template_id": row.id}
+
+
+@app.patch("/api/v1/document-templates/{template_id}/rename", response_model=DocumentMetadataTemplateOut)
+def rename_document_template(template_id: str, payload: DocumentTemplateRename, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Rename a custom document type without touching its fields or version.
+
+    Only display metadata changes, so the template version (which documents
+    already queued against) stays at the same value.
+    """
+    row = db.get(DocumentMetadataTemplate, template_id)
+    if not row:
+        raise HTTPException(404, "Document template not found")
+    assert_kb_access(db, user, row.knowledge_base_id)
+    new_name = payload.name.strip()
+    if new_name.casefold() in SYSTEM_TEMPLATE_NAMES or any(
+        other.id != row.id and other.name.casefold() == new_name.casefold()
+        for other in db.query(DocumentMetadataTemplate).filter_by(knowledge_base_id=row.knowledge_base_id).all()
+    ):
+        raise HTTPException(409, {"code": "DOCUMENT_TEMPLATE_NAME_EXISTS", "message": "A document type with this name already exists.", "retryable": False})
+    row.name = new_name
+    if payload.description is not None:
+        row.description = payload.description.strip() or None
+    record_audit(db, "document_template.rename", user.id, "document_template", row.id, {"name": row.name})
+    db.commit(); db.refresh(row)
+    usage_count = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.deleted_at.is_(None)).scalar() or 0
+    return {"id": row.id, "code": row.code, "name": row.name, "description": row.description, "base_document_type": row.base_document_type,
+            "fields": merge_profile_fields(row.base_document_type, custom_template_fields(row)), "version": row.version, "is_active": row.is_active, "is_system": False, "usage_count": usage_count}
+
+
+@app.post("/api/v1/document-templates/{template_id}/duplicate", response_model=DocumentMetadataTemplateOut)
+def duplicate_document_template(template_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Copy a custom document type into a new active type with a unique name."""
+    source = db.get(DocumentMetadataTemplate, template_id)
+    if not source:
+        raise HTTPException(404, "Document template not found")
+    assert_kb_access(db, user, source.knowledge_base_id)
+    existing = db.query(DocumentMetadataTemplate.name, DocumentMetadataTemplate.code).filter_by(
+        knowledge_base_id=source.knowledge_base_id,
+    ).all()
+    names = {name.casefold() for name, _ in existing}
+    codes = {code.casefold() for _, code in existing} | SYSTEM_TEMPLATE_CODES
+    sequence = 1
+    while True:
+        suffix = " copy" if sequence == 1 else f" copy {sequence}"
+        name = f"{source.name[:255 - len(suffix)].rstrip()}{suffix}"
+        code = template_code(name)
+        if name.casefold() not in names and code.casefold() not in codes:
+            break
+        sequence += 1
+    custom_fields = custom_template_fields(source)
+    row = DocumentMetadataTemplate(
+        knowledge_base_id=source.knowledge_base_id,
+        code=code,
+        name=name,
+        description=source.description,
+        base_document_type=source.base_document_type,
+        custom_fields=custom_fields,
+        fields=merge_profile_fields(source.base_document_type, custom_fields),
+        is_active=True,
+    )
+    db.add(row)
+    record_audit(db, "document_template.duplicate", user.id, "document_template", row.id, {
+        "source_template_id": source.id,
+        "knowledge_base_id": row.knowledge_base_id,
+        "code": row.code,
+    })
+    db.commit(); db.refresh(row)
+    return {"id": row.id, "code": row.code, "name": row.name, "description": row.description, "base_document_type": row.base_document_type,
+            "fields": merge_profile_fields(row.base_document_type, custom_template_fields(row)), "version": row.version, "is_active": True, "is_system": False, "usage_count": 0}
+
+
+@app.delete("/api/v1/document-templates/{template_id}/purge")
+def purge_document_template(template_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Permanently delete a custom document type.
+
+    Refused while any non-deleted document still references the template, so
+    stored metadata can never point at a missing definition. Archive the type
+    instead when documents exist.
+    """
+    row = db.get(DocumentMetadataTemplate, template_id)
+    if not row:
+        raise HTTPException(404, "Document template not found")
+    assert_kb_access(db, user, row.knowledge_base_id)
+    live_documents = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.deleted_at.is_(None)).scalar() or 0
+    if live_documents:
+        raise HTTPException(409, {"code": "DOCUMENT_TEMPLATE_IN_USE", "message": f"{live_documents} document(s) still use this type. Archive it instead.", "retryable": False, "usage_count": live_documents})
+    code, name = row.code, row.name
+    db.delete(row)
+    record_audit(db, "document_template.purge", user.id, "document_template", template_id, {"code": code, "name": name})
+    db.commit()
+    return {"status": "deleted", "template_id": template_id}
 
 
 @app.post("/api/v1/document-templates/{template_id}/activate")
@@ -660,6 +777,7 @@ def activate_document_template(template_id: str, user: User = Depends(current_ad
     row = db.get(DocumentMetadataTemplate, template_id)
     if not row:
         raise HTTPException(404, "Document template not found")
+    assert_kb_access(db, user, row.knowledge_base_id)
     row.is_active = True
     record_audit(db, "document_template.activate", user.id, "document_template", row.id)
     db.commit()
@@ -672,7 +790,7 @@ def _upload_metadata(template_id: str | None, document_type: str, metadata_json:
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError("DOCUMENT_METADATA_INVALID") from exc
     template = resolve_template(db, kb_id, template_id, document_type)
-    return template, template["base_document_type"], validate_metadata_values(template.get("fields") or [], values)
+    return template, template["base_document_type"], validate_metadata_values(template.get("fields") or [], values, allow_extraction_pending=True)
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/documents")
@@ -719,7 +837,8 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
     results = []
     for upload in files:
         filename = upload.filename or "unnamed-file"
-        result = {"filename": filename, "status": "failed", "document_type": profile, "template_id": template.get("id")}
+        result = {"filename": filename, "status": "failed", "document_type": profile,
+                  "document_type_id": template.get("id"), "template_id": template.get("id")}
         try:
             doc, job = create_document_job(db, kb_id, upload, title if len(files) == 1 else None, profile, None, template, metadata)
             record_audit(db, "document.upload", user.id, "document", doc.id, {"knowledge_base_id": kb_id, "filename": doc.original_filename, "document_type": doc.document_type, "batch": True})
@@ -741,7 +860,7 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
 @app.get("/api/v1/knowledge-bases/{kb_id}/documents/page", response_model=DocumentPageOut)
 def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, offset: int = 0,
                    search: str | None = None, status: str | None = None, document_type: str | None = None,
-                   template_id: str | None = None,
+                   template_id: str | None = None, metadata_status: str | None = None,
                    user: User = Depends(current_admin), db: Session = Depends(get_db)):
     """Return a bounded Documents-page slice without changing the legacy list contract."""
     if not db.get(KnowledgeBase, kb_id):
@@ -771,6 +890,8 @@ def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, o
             if not template or template.knowledge_base_id != kb_id:
                 raise HTTPException(400, {"code": "DOCUMENT_TEMPLATE_INVALID", "message": "Document type is invalid.", "retryable": False})
             rows = rows.filter(Document.metadata_template_id == template_id)
+    if metadata_status:
+        rows = rows.filter(Document.metadata_status.in_(["needs_review", "failed"]) if metadata_status == "needs_review" else Document.metadata_status == metadata_status)
     total = rows.count()
     documents = rows.order_by(Document.created_at.desc()).offset(offset).limit(limit).all()
     has_legal_documents = db.query(Document.id).filter(
@@ -855,7 +976,85 @@ def document_text(document_id: str, user: User = Depends(current_admin), db: Ses
     return {"document_id": doc.id, "status": doc.status, "document_type": doc.document_type, "metadata_template_id": doc.metadata_template_id,
             "metadata_template_name": doc.metadata_template_name, "metadata_template_version": doc.metadata_template_version,
             "metadata_template_fields": doc.metadata_template_fields or [],
-            "document_metadata": doc.document_metadata or {}, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata}
+            "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata}
+
+
+def resolve_document_file(doc: Document) -> Path:
+    """Return the on-disk original if it exists under FILE_STORAGE_PATH; else 404."""
+    try:
+        file_path = Path(doc.storage_path).resolve()
+        file_path.relative_to(get_settings().file_root.resolve())
+    except (OSError, ValueError):
+        raise HTTPException(404, "Original file not found")
+    if not file_path.is_file():
+        raise HTTPException(404, "Original file not found")
+    return file_path
+
+
+def assert_mcp_can_download_document(db: Session, token: TokenKey, doc: Document) -> None:
+    """Authorize an MCP read Bearer token to download one original file.
+
+    Requires the document's Knowledge Base to be in the token's allowed/active
+    MCP read scope. Does not require documents:write / ingest scope — Agents use
+    the same read token that called search_knowledge. Ingest-only credentials
+    (empty allowed_tools) keep using GET /api/v1/ingest/documents/{id}/file.
+    Soft-deleted documents 404 here (prefer 404 over matching /text, which still
+    returns soft-deleted rows for admin inspection).
+    """
+    if INGEST_SCOPE in (token.allowed_scopes or []) and not (token.allowed_tools or []):
+        raise HTTPException(403, {
+            "code": "AUTH_SCOPE_NOT_ALLOWED",
+            "message": "Use the Ingest document file endpoint with a documents:write token.",
+            "retryable": False,
+        })
+    try:
+        allowed = set(effective_mcp_knowledge_base_ids(db, token))
+    except HTTPException:
+        raise
+    if doc.knowledge_base_id not in allowed:
+        # Anti-enumeration: same wording as missing documents.
+        raise HTTPException(404, "Document not found")
+
+
+def load_document_for_file_download(document_id: str, request: Request, db: Session) -> Document:
+    """Resolve a document for original-file download via session or MCP Bearer.
+
+    Soft-deleted documents return 404 for every caller on this path (see
+    assert_mcp_can_download_document). Session admins keep cookie auth; MCP Agents
+    use Authorization: Bearer with KB-scoped read access.
+    """
+    doc = db.get(Document, document_id)
+    if not doc or doc.deleted_at:
+        raise HTTPException(404, "Document not found")
+    # Prefer Bearer when present so MCP Agents (and tests that are also logged
+    # into the admin UI) hit the token KB scope rather than session RBAC.
+    authorization = request.headers.get("authorization", "")
+    if authorization.startswith("Bearer "):
+        token = bearer_token(request, db)
+        assert_mcp_can_download_document(db, token, doc)
+        return doc
+    if request.cookies.get("skip_access"):
+        user = current_admin(request, db)
+        assert_kb_access(db, user, doc.knowledge_base_id)
+        return doc
+    raise HTTPException(401, {"code": "AUTH_TOKEN_MISSING", "message": "Authentication required", "retryable": False})
+
+
+@app.get("/api/v1/documents/{document_id}/file")
+def document_file(
+    document_id: str,
+    request: Request,
+    disposition: str = Query("attachment", pattern="^(attachment|inline)$"),
+    db: Session = Depends(get_db),
+):
+    doc = load_document_for_file_download(document_id, request, db)
+    file_path = resolve_document_file(doc)
+    return FileResponse(
+        path=file_path,
+        media_type=doc.mime_type or "application/octet-stream",
+        filename=doc.original_filename,
+        content_disposition_type=disposition,
+    )
 
 
 @app.get("/api/v1/documents/{document_id}/jobs")
@@ -889,7 +1088,7 @@ def extract_legal_metadata(document_id: str, user: User = Depends(current_admin)
 
 @app.patch("/api/v1/documents/{document_id}/legal-metadata")
 def update_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
-    doc = db.get(Document, document_id)
+    doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or doc.deleted_at:
         raise HTTPException(404, "Document not found")
@@ -919,7 +1118,15 @@ def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, 
             if not fields and doc.metadata_template_name is None:
                 template = resolve_template(db, doc.knowledge_base_id, doc.metadata_template_id, doc.document_type)
                 fields = template.get("fields") or []
-            doc.document_metadata = validate_metadata_values(fields, payload.values)
+            doc.document_metadata = validate_metadata_values(fields, payload.values, allow_extraction_pending=True)
+            observations = dict(doc.metadata_observations or {})
+            for field in fields:
+                key = field["key"]
+                observations[key] = {**observations.get(key, {}), "status": "human_verified" if key in doc.document_metadata else "not_found_confirmed",
+                                     "origin": "manual", "locked": True, "reviewed_by": user.id, "reviewed_at": datetime.utcnow().isoformat()}
+            doc.metadata_observations = observations
+            doc.metadata_revision += 1
+            update_metadata_status(doc)
             doc.metadata_search_text = metadata_search_text(fields, doc.document_metadata)
             sync_document_metadata_values(db, doc)
             sync_document_metadata_graph(db, doc)
@@ -929,6 +1136,82 @@ def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, 
                  "metadata_fields": sorted((doc.document_metadata or {}).keys())})
     db.commit()
     return {"status": "updated", "document_id": doc.id, "published_at": doc.published_at, "document_metadata": doc.document_metadata or {}}
+
+
+class MetadataExtractionRequest(BaseModel):
+    enable_missing_fields: bool = False
+
+
+class MetadataReviewRequest(BaseModel):
+    revision: int = Field(ge=0)
+    field_key: str = Field(min_length=1, max_length=80)
+    action: str = Field(pattern="^(confirm|set|not_found)$")
+    candidate_index: int = Field(default=0, ge=0, le=19)
+    value: Any = None
+
+
+@app.post("/api/v1/documents/{document_id}/metadata-extract")
+def extract_custom_metadata(document_id: str, payload: MetadataExtractionRequest, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
+    if not doc or doc.deleted_at:
+        raise HTTPException(404, "Document not found")
+    assert_kb_access(db, user, doc.knowledge_base_id)
+    if not doc.extracted_text:
+        raise HTTPException(409, "Document text is not ready")
+    # ``enable_missing_fields`` predates per-field fill modes.  It means
+    # "extract the missing values from fields already configured for AI", not
+    # permission to rewrite a document snapshot and turn manual fields into
+    # extraction fields.  The latter bypassed the required extraction
+    # instruction and changed the author's intended workflow.
+    queued = queue_metadata_extraction(db, doc)
+    record_audit(db, "document.metadata.extract", user.id, "document", doc.id, {"queued": queued})
+    db.commit()
+    return {"queued": queued, "metadata_status": doc.metadata_status}
+
+
+@app.post("/api/v1/documents/{document_id}/metadata-review")
+def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
+    if not doc or doc.deleted_at:
+        raise HTTPException(404, "Document not found")
+    assert_kb_access(db, user, doc.knowledge_base_id)
+    if payload.revision != doc.metadata_revision:
+        raise HTTPException(409, "Metadata changed. Refresh before reviewing.")
+    field = next((f for f in doc.metadata_template_fields or [] if f["key"] == payload.field_key), None)
+    if not field:
+        raise HTTPException(400, "Unknown metadata field")
+    observations = dict(doc.metadata_observations or {})
+    observation = dict(observations.get(payload.field_key, {}))
+    values = dict(doc.document_metadata or {})
+    if payload.action == "not_found":
+        values.pop(payload.field_key, None)
+    else:
+        value = payload.value
+        if payload.action == "confirm":
+            candidates = observation.get("candidates", [])
+            if payload.candidate_index >= len(candidates):
+                raise HTTPException(400, "Candidate not found")
+            if observation.get("content_version") != hashlib.sha256((doc.extracted_text or "").encode()).hexdigest():
+                raise HTTPException(409, "Source changed. Extract metadata again.")
+            value = candidates[payload.candidate_index]["value"]
+        try:
+            values[payload.field_key] = validate_metadata_values([{**field, "required": True}], {payload.field_key: value})[payload.field_key]
+        except (ValueError, KeyError):
+            raise HTTPException(400, "Invalid metadata value")
+    observation.update(status="not_found_confirmed" if payload.action == "not_found" else "human_verified",
+                       locked=True, reviewed_by=user.id, reviewed_at=datetime.utcnow().isoformat())
+    if payload.action == "set":
+        observation["origin"] = "manual"
+    observations[payload.field_key] = observation
+    doc.document_metadata, doc.metadata_observations = values, observations
+    doc.metadata_revision += 1
+    doc.metadata_search_text = metadata_search_text(doc.metadata_template_fields, values)
+    update_metadata_status(doc)
+    sync_document_metadata_values(db, doc)
+    sync_document_metadata_graph(db, doc)
+    record_audit(db, "document.metadata.review", user.id, "document", doc.id, {"field_key": payload.field_key, "action": payload.action, "revision": doc.metadata_revision})
+    db.commit()
+    return {"metadata_revision": doc.metadata_revision, "metadata_status": doc.metadata_status}
 
 
 @app.put("/api/v1/documents/{document_id}/legal-metadata")
@@ -978,20 +1261,27 @@ def reprocess_document(document_id: str, user: User = Depends(current_admin), db
     return {"status": "queued", "document_id": doc.id, "job_id": job.id}
 
 
+def soft_delete_document(db: Session, doc: Document) -> ProcessingJob:
+    """Hide a document and asynchronously remove its remote retrieval source."""
+    doc.deleted_at, doc.status = datetime.utcnow(), "deleted"
+    db.query(ProcessingJob).filter(
+        ProcessingJob.document_id == doc.id,
+        ProcessingJob.status.in_(["queued", "running"]),
+    ).update({"status": "cancelled"}, synchronize_session=False)
+    # Keep the retrieval index in sync. A failed purge remains retryable as a
+    # normal processing job, so a deleted source cannot silently block re-ingest.
+    purge = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type="PURGE_REMOTE_INDEX")
+    db.add(purge)
+    return purge
+
+
 @app.delete("/api/v1/documents/{document_id}")
 def delete_document(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or doc.deleted_at:
         raise HTTPException(404, "Document not found")
-    doc.deleted_at, doc.status = datetime.utcnow(), "deleted"
-    db.query(ProcessingJob).filter(ProcessingJob.document_id == doc.id, ProcessingJob.status.in_(["queued", "running"])).update({"status": "cancelled"}, synchronize_session=False)
-    # 4b: cascade the delete into the remote retrieval index asynchronously —
-    # ghost sources in LightRAG keep occupying the content-hash namespace and
-    # block legitimate re-ingests. Best-effort by design: a failed purge job
-    # is visible in the jobs list and retryable.
-    purge = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type="PURGE_REMOTE_INDEX")
-    db.add(purge)
+    purge = soft_delete_document(db, doc)
     record_audit(db, "document.delete", user.id, "document", doc.id, {"knowledge_base_id": doc.knowledge_base_id})
     db.commit()
     return {"status": "deleted", "document_id": doc.id, "purge_job_id": purge.id}
@@ -2124,6 +2414,7 @@ def list_mcp_activity(limit: int = 50, _: User = Depends(current_admin), db: Ses
 
 
 MCP_TOOLS = [
+    {"name": "describe_knowledge_schema", "description": "Discover authorized metadata templates, typed filter operators, and paginated coverage. Unknown metadata does not mean no matching documents.", "inputSchema": {"type": "object", "additionalProperties": False, "properties": {"offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}}},
     {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning", "inputSchema": QueryRequest.model_json_schema()},
     {"name": "document_inventory_summary", "description": "Count and group non-deleted documents from the scoped document and legal registries", "inputSchema": DocumentInventoryRequest.model_json_schema()},
     {"name": "find_entities", "description": "Find entities by name or alias", "inputSchema": {"type": "object", "properties": {"search_text": {"type": "string"}}, "required": ["search_text"]}},
@@ -2217,12 +2508,17 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
                 payload = QueryRequest.model_validate(arguments)
                 payload.knowledge_base_ids = effective_kb_ids
                 result = authorized_query(payload, token, db)
+            elif name == "describe_knowledge_schema":
+                offset, limit = arguments.get("offset", 0), arguments.get("limit", 200)
+                if type(offset) is not int or type(limit) is not int or offset < 0 or not 1 <= limit <= 500:
+                    raise ValueError("Invalid schema page")
+                result = describe_schema(db, effective_kb_ids, offset, limit)
             elif name == "document_inventory_summary":
                 payload = DocumentInventoryRequest.model_validate(arguments)
                 result = build_document_inventory_result(
                     db, payload.query or "document inventory summary", effective_kb_ids, token_id=token.id,
                     scope=payload.scope, include_documents=payload.include_documents,
-                    max_documents=payload.max_documents,
+                    max_documents=payload.max_documents, query_filters=payload.filters,
                 )
             elif name == "find_entities":
                 kb_ids = effective_kb_ids
@@ -2403,6 +2699,7 @@ def ingest_document_view(db: Session, doc: Document) -> dict:
     job = db.query(ProcessingJob).filter_by(document_id=doc.id).order_by(ProcessingJob.created_at.desc()).first()
     return {"document_id": doc.id, "knowledge_base_id": doc.knowledge_base_id, "title": doc.title,
             "filename": doc.original_filename, "status": doc.status, "document_type": doc.document_type,
+            "document_type_id": doc.metadata_template_id,
             "error_code": doc.error_code, "created_at": doc.created_at,
             "latest_job": ingest_job_view(job) if job else None}
 
@@ -2431,6 +2728,13 @@ def record_ingest_rejection(db: Session, token: TokenKey, kb_id: str, filename: 
     db.commit()
 
 
+def ingest_document_type_id(document_type_id: str | None, template_id: str | None) -> str | None:
+    """Accept the public name while preserving the legacy template_id input."""
+    if document_type_id and template_id and document_type_id != template_id:
+        raise ValueError("DOCUMENT_TYPE_ID_CONFLICT")
+    return document_type_id or template_id
+
+
 @app.get("/api/v1/ingest/knowledge-bases")
 def ingest_list_knowledge_bases(token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
     """Report the (single) Knowledge Base this token may write to.
@@ -2449,11 +2753,13 @@ def ingest_list_knowledge_bases(token: TokenKey = Depends(ingest_budget), db: Se
 @app.post("/api/v1/ingest/knowledge-bases/{kb_id}/documents", status_code=202)
 def ingest_upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None),
                            document_type: str = Form("general"), template_id: str | None = Form(None),
+                           document_type_id: str | None = Form(None),
                            metadata_json: str | None = Form(None), published_at: date | None = Form(None),
                            token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
     ingest_knowledge_base(db, token, kb_id)
     try:
-        template, profile, metadata = _upload_metadata(template_id, document_type, metadata_json, db, kb_id)
+        selected_type_id = ingest_document_type_id(document_type_id, template_id)
+        template, profile, metadata = _upload_metadata(selected_type_id, document_type, metadata_json, db, kb_id)
         doc, job = create_document_job(db, kb_id, file, title, profile, published_at, template, metadata)
     except ValueError as exc:
         record_ingest_rejection(db, token, kb_id, file.filename, str(exc))
@@ -2467,7 +2773,7 @@ def ingest_upload_document(kb_id: str, file: UploadFile = File(...), title: str 
     except Exception:
         db.rollback()
     return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type,
-            "template_id": doc.metadata_template_id}
+            "document_type_id": doc.metadata_template_id, "template_id": doc.metadata_template_id}
 
 
 class IngestTextRequest(BaseModel):
@@ -2479,6 +2785,7 @@ class IngestTextRequest(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     text: str = Field(min_length=1)
     document_type: str = "general"
+    document_type_id: str | None = None
     template_id: str | None = None
     metadata_json: str | None = None
     published_at: date | None = None
@@ -2496,7 +2803,8 @@ def ingest_upload_document_text(kb_id: str, body: IngestTextRequest,
     from .ingest_text import create_text_document_job
     ingest_knowledge_base(db, token, kb_id)
     try:
-        template, profile, metadata = _upload_metadata(body.template_id, body.document_type, body.metadata_json, db, kb_id)
+        selected_type_id = ingest_document_type_id(body.document_type_id, body.template_id)
+        template, profile, metadata = _upload_metadata(selected_type_id, body.document_type, body.metadata_json, db, kb_id)
         doc, job = create_text_document_job(db, kb_id, body.title, body.text, profile, body.published_at,
                                             template, metadata)
     except ValueError as exc:
@@ -2508,12 +2816,13 @@ def ingest_upload_document_text(kb_id: str, body: IngestTextRequest,
     except Exception:
         db.rollback()
     return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type,
-            "template_id": doc.metadata_template_id}
+            "document_type_id": doc.metadata_template_id, "template_id": doc.metadata_template_id}
 
 
 @app.post("/api/v1/ingest/knowledge-bases/{kb_id}/documents/batch", status_code=202)
 def ingest_upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), document_type: str = Form("general"),
                                   template_id: str | None = Form(None), metadata_json: str | None = Form(None),
+                                  document_type_id: str | None = Form(None),
                                   token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
     """Queue a bounded batch where a per-file failure never discards the rest."""
     ingest_knowledge_base(db, token, kb_id)
@@ -2522,7 +2831,8 @@ def ingest_upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...
     if len(files) > INGEST_MAX_BATCH_FILES:
         raise HTTPException(400, {"code": "BATCH_TOO_MANY_FILES", "message": f"A batch can contain at most {INGEST_MAX_BATCH_FILES} files.", "retryable": False})
     try:
-        template, profile, metadata = _upload_metadata(template_id, document_type, metadata_json, db, kb_id)
+        selected_type_id = ingest_document_type_id(document_type_id, template_id)
+        template, profile, metadata = _upload_metadata(selected_type_id, document_type, metadata_json, db, kb_id)
     except ValueError as exc:
         record_ingest_rejection(db, token, kb_id, None, str(exc))
         raise HTTPException(400, {"code": str(exc), "message": "Document metadata is invalid.", "retryable": False})
@@ -2557,7 +2867,7 @@ def ingest_upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...
 
     queued_count = sum(item["status"] == "queued" for item in results)
     return {"status": "queued" if queued_count == len(results) else "partial", "document_type": profile,
-            "template_id": template.get("id"), "total": len(results), "queued_count": queued_count,
+            "document_type_id": template.get("id"), "template_id": template.get("id"), "total": len(results), "queued_count": queued_count,
             "failed_count": len(results) - queued_count, "results": results}
 
 
@@ -2575,6 +2885,13 @@ def ingest_list_documents(kb_id: str, status: str | None = None, limit: int = 50
     return {"items": [ingest_document_view(db, doc) for doc in documents], "total": total, "limit": limit, "offset": offset}
 
 
+@app.get("/api/v1/ingest/knowledge-bases/{kb_id}/document-types")
+def ingest_list_document_types(kb_id: str, token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    """List active built-in and custom document types available for ingestion."""
+    ingest_knowledge_base(db, token, kb_id)
+    return {"items": list_templates(db, kb_id)}
+
+
 @app.get("/api/v1/ingest/documents/{document_id}")
 def ingest_document_status(document_id: str, token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
     return ingest_document_view(db, ingest_document_row(db, token, document_id))
@@ -2585,3 +2902,35 @@ def ingest_document_jobs(document_id: str, token: TokenKey = Depends(ingest_budg
     doc = ingest_document_row(db, token, document_id)
     rows = db.query(ProcessingJob).filter_by(document_id=doc.id).order_by(ProcessingJob.created_at.desc()).all()
     return [ingest_job_view(job) for job in rows]
+
+
+@app.get("/api/v1/ingest/documents/{document_id}/file")
+def ingest_document_file(
+    document_id: str,
+    disposition: str = Query("attachment", pattern="^(attachment|inline)$"),
+    token: TokenKey = Depends(ingest_budget),
+    db: Session = Depends(get_db),
+):
+    doc = ingest_document_row(db, token, document_id)
+    file_path = resolve_document_file(doc)
+    return FileResponse(
+        path=file_path,
+        media_type=doc.mime_type or "application/octet-stream",
+        filename=doc.original_filename,
+        content_disposition_type=disposition,
+    )
+
+
+@app.delete("/api/v1/ingest/documents/{document_id}")
+def ingest_delete_document(document_id: str, token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    """Soft-delete one document in the token's sole configured Knowledge Base."""
+    doc = ingest_document_row(db, token, document_id)
+    purge = soft_delete_document(db, doc)
+    record_audit(db, "document.delete", None, "document", doc.id, {
+        "knowledge_base_id": doc.knowledge_base_id,
+        "transport": "ingest_api",
+        "token_id": token.id,
+        "token_name": token.name,
+    })
+    db.commit()
+    return {"status": "deleted", "document_id": doc.id, "purge_job_id": purge.id}

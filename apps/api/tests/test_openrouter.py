@@ -104,3 +104,20 @@ def test_openrouter_legal_extraction_returns_structured_metadata(monkeypatch):
     }])
     assert answer == "Grounded answer [S1]."
     get_settings.cache_clear()
+
+
+def test_openrouter_metadata_extraction_accepts_fenced_json(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request):
+        assert request.url.path == "/api/v1/chat/completions"
+        content = '```json\n{"fields": {"issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department"}]}}\n```'
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    client = OpenRouterClient(httpx.Client(transport=httpx.MockTransport(handler)))
+    assert client.extract_document_metadata(
+        [{"key": "issuer", "extraction_description": "Official issuer"}],
+        "Issuer: Land Department",
+    )["issuer"][0]["value"] == "Land Department"
+    get_settings.cache_clear()

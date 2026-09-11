@@ -84,6 +84,7 @@ class RetrievalPlan(BaseModel):
     published_to: date | None = None
     as_of_date: date | None = None
     include_historical: bool = False
+    metadata_predicates: list[dict] = Field(default_factory=list)
     metadata_filters: dict[str, str] = Field(default_factory=dict)
     metadata_document_ids: list[str] | None = Field(default=None, exclude=True, repr=False)
     legal_context: LegalContext | None = None

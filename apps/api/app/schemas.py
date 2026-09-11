@@ -128,6 +128,9 @@ class DocumentOut(ORMModel):
     metadata_template_version: int | None = None
     metadata_template_fields: list[dict[str, Any]] = Field(default_factory=list)
     document_metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata_observations: dict[str, Any] = Field(default_factory=dict)
+    metadata_status: str = "not_started"
+    metadata_revision: int = 0
     published_at: date | None
     mime_type: str
     file_size: int
@@ -169,6 +172,10 @@ class MetadataFieldDefinition(BaseModel):
     label: str = Field(min_length=1, max_length=160)
     field_type: Literal["text", "textarea", "date", "number", "select", "boolean"] = "text"
     required: bool = False
+    fill_mode: Literal["manual", "extract"] = "manual"
+    extraction_description: str | None = Field(default=None, max_length=1000)
+    review_policy: Literal["evidence", "always"] = "evidence"
+    batch_default_allowed: bool = False
     help_text: str | None = Field(default=None, max_length=300)
     options: list[str] = Field(default_factory=list, max_length=30)
     # Capabilities keep a metadata field useful without making every field a
@@ -176,7 +183,26 @@ class MetadataFieldDefinition(BaseModel):
     searchable: bool = True
     filterable: bool = False
     graph_entity_type: str | None = Field(default=None, max_length=100)
-    graph_relationship: str | None = Field(default=None, max_length=100, pattern=r"^[A-Z][A-Z0-9_]{1,99}$")
+    # No Field(pattern=) here: pydantic applies pattern constraints BEFORE
+    # field validators, so an empty string would fail before we could coerce
+    # it to None. The pattern is enforced in validate_graph_fields below.
+    graph_relationship: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_graph_fields(self):
+        if self.fill_mode == "extract":
+            self.extraction_description = (self.extraction_description or "").strip() or None
+            if not self.extraction_description:
+                raise ValueError("extraction_description is required when fill_mode is extract.")
+        # The web editor sends empty strings for untouched graph inputs; treat
+        # them as "not set". Real values must be UPPER_SNAKE.
+        self.graph_entity_type = self.graph_entity_type or None
+        self.graph_relationship = self.graph_relationship or None
+        if self.graph_relationship:
+            import re
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,99}", self.graph_relationship):
+                raise ValueError("graph_relationship must be UPPER_SNAKE (e.g. ISSUED_BY).")
+        return self
 
     @model_validator(mode="after")
     def validate_options(self):
@@ -188,6 +214,34 @@ class MetadataFieldDefinition(BaseModel):
         if self.graph_relationship and not self.graph_entity_type:
             raise ValueError("graph_entity_type is required when graph_relationship is set.")
         return self
+
+
+class DocumentTemplateRename(BaseModel):
+    """Rename payload for a custom document type (display name only)."""
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Document type name cannot be blank.")
+        return value
+
+
+class KnowledgeBaseRename(BaseModel):
+    """Rename payload for a Knowledge Base (display name only; code is stable)."""
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Knowledge Base name cannot be blank.")
+        return value
 
 
 class DocumentMetadataTemplateCreate(BaseModel):
@@ -255,7 +309,11 @@ class DocumentMetadataTemplateOut(ORMModel):
     usage_count: int = 0
 
 
+from .metadata_search import MetadataPredicate
+
+
 class QueryFilters(BaseModel):
+    metadata_predicates: list[MetadataPredicate] = Field(default_factory=list, max_length=20)
     published_from: date | None = None
     published_to: date | None = None
     as_of_date: date | None = None
@@ -347,6 +405,7 @@ class QueryRequest(BaseModel):
 
 class DocumentInventoryRequest(BaseModel):
     """Deterministic document-registry summary request for MCP clients."""
+    filters: QueryFilters = Field(default_factory=QueryFilters)
     query: str | None = Field(default=None, min_length=1, max_length=10_000)
     scope: Literal["all", "current"] = "all"
     include_documents: bool = True

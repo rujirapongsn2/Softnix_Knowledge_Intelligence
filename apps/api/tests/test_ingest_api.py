@@ -180,6 +180,27 @@ def test_ingest_token_cannot_reach_another_knowledge_base():
     assert leaked.status_code == 404
     assert leaked.json()["error"]["code"] == "DOCUMENT_NOT_FOUND"
     assert test_client.get(f"/api/v1/ingest/documents/{foreign['document_id']}/jobs", headers=_headers(secret)).status_code == 404
+    assert test_client.delete(f"/api/v1/ingest/documents/{foreign['document_id']}", headers=_headers(secret)).status_code == 404
+
+
+def test_ingest_token_soft_deletes_its_own_document_and_queues_index_purge():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, "ingest-api-delete")
+    secret = _token(test_client, [kb_id])
+    uploaded = _upload(test_client, secret, kb_id, "remove-me.txt", b"Remove this source.").json()
+
+    deleted = test_client.delete(f"/api/v1/ingest/documents/{uploaded['document_id']}", headers=_headers(secret))
+    assert deleted.status_code == 200
+    body = deleted.json()
+    assert body["status"] == "deleted" and body["document_id"] == uploaded["document_id"]
+    assert body["purge_job_id"]
+
+    assert test_client.get(f"/api/v1/ingest/documents/{uploaded['document_id']}", headers=_headers(secret)).status_code == 404
+    listed = test_client.get(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents", headers=_headers(secret)).json()
+    assert listed["total"] == 0 and listed["items"] == []
+    audit = test_client.get("/api/v1/audit-logs?limit=100").json()
+    entry = next(row for row in audit if row["action"] == "document.delete" and row["target_id"] == uploaded["document_id"])
+    assert entry["metadata"]["transport"] == "ingest_api" and entry["metadata"]["token_name"] == "ingest-agent"
 
 
 def test_ingest_batch_isolates_per_file_failures():
@@ -242,6 +263,34 @@ def test_ingest_lists_only_its_own_knowledge_base():
     assert test_client.post(f"/api/v1/knowledge-bases/{kb_id}/disable").status_code == 200
     disabled_listing = test_client.get("/api/v1/ingest/knowledge-bases", headers=_headers(secret)).json()
     assert disabled_listing["items"][0]["status"] == "disabled"
+
+
+def test_ingest_lists_document_types_and_accepts_document_type_id():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, "ingest-api-document-types")
+    other_kb_id = _knowledge_base(test_client, "ingest-api-document-types-other")
+    secret = _token(test_client, [kb_id])
+    created = test_client.post(f"/api/v1/knowledge-bases/{kb_id}/document-templates", json={
+        "name": "Supplier invoice", "code": "supplier-invoice", "fields": [{"key": "invoice_no", "label": "Invoice number"}],
+    }).json()
+
+    listed = test_client.get(f"/api/v1/ingest/knowledge-bases/{kb_id}/document-types", headers=_headers(secret))
+    assert listed.status_code == 200
+    item = next(row for row in listed.json()["items"] if row["id"] == created["id"])
+    assert item["name"] == "Supplier invoice" and item["fields"][0]["key"] == "invoice_no"
+    assert test_client.get(f"/api/v1/ingest/knowledge-bases/{other_kb_id}/document-types", headers=_headers(secret)).status_code == 404
+
+    uploaded = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents", headers=_headers(secret),
+                                files={"file": ("invoice.txt", b"Invoice INV-2026-001", "text/plain")},
+                                data={"document_type_id": created["id"], "metadata_json": '{"invoice_no":"INV-2026-001"}'}).json()
+    assert uploaded["document_type_id"] == created["id"] and uploaded["template_id"] == created["id"]
+    view = test_client.get(f"/api/v1/ingest/documents/{uploaded['document_id']}", headers=_headers(secret)).json()
+    assert view["document_type_id"] == created["id"]
+
+    conflict = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents", headers=_headers(secret),
+                                files={"file": ("conflict.txt", b"Conflict", "text/plain")},
+                                data={"document_type_id": created["id"], "template_id": "system:general"})
+    assert conflict.status_code == 400 and conflict.json()["error"]["code"] == "DOCUMENT_TYPE_ID_CONFLICT"
 
 
 def test_ingest_rejects_invalid_credentials():

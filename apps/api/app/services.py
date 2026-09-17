@@ -1189,6 +1189,7 @@ def _persist_query_result(db: Session, result: dict, token_id: str | None = None
     if isinstance(sources, list):
         enrich_sources_with_file_links(db, sources, base_url=base_url or public_document_base_url())
         result["sources"] = sanitize_source_reference_urls(sources)
+    apply_answer_reference_contract(result)
     saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
     db.add(saved)
     db.flush()
@@ -3576,6 +3577,102 @@ def sanitize_source_reference_urls(sources: list[dict]) -> list[dict]:
             row["provenance"] = provenance
         sanitized.append(row)
     return sanitized
+
+
+ANSWER_REFERENCE_SCHEMA_VERSION = "ski.answer.v1"
+_STRUCTURED_CITATION_RE = re.compile(r"\[([A-Z]\d+)\]")
+
+
+def build_structured_references(sources: list[dict]) -> list[dict]:
+    """Normalize retrieval sources into a stable frontend-facing contract.
+
+    ``sources`` remains available for backward compatibility.  Consumers that
+    render citations should use this smaller, versioned representation instead
+    of depending on retrieval-engine fields that may change independently.
+    """
+    references = []
+    for index, source in enumerate(sanitize_source_reference_urls(sources), 1):
+        download_url = source.get("download_url")
+        references.append({
+            "id": f"R{index}",
+            "citation_id": source.get("citation_id"),
+            "document_id": source.get("document_id"),
+            "title": source.get("title") or source.get("original_filename") or "Document",
+            "file": {
+                "available": bool(download_url),
+                "name": source.get("original_filename"),
+                "mime_type": source.get("mime_type"),
+                "download_url": download_url,
+                "access": {
+                    "method": "GET",
+                    "authentication": "bearer_or_session",
+                    "disposition_parameter": "inline|attachment",
+                } if download_url else None,
+            },
+            "locator": {
+                "chunk_id": source.get("chunk_id"),
+                "section": source.get("section_label"),
+                "section_kind": source.get("section_kind"),
+                "section_number": source.get("section_number"),
+                # Page coordinates are optional until the extractor supplies
+                # reliable page provenance. Never infer page numbers.
+                "page_start": source.get("page_start"),
+                "page_end": source.get("page_end"),
+            },
+            "excerpt": source.get("excerpt"),
+            "relevance": source.get("relevance"),
+            "source_url": source.get("source_uri"),
+            "provenance": source.get("provenance"),
+        })
+    return references
+
+
+def build_answer_claims(answer: str | None, references: list[dict]) -> list[dict]:
+    """Map cited answer lines to reference IDs without asking clients to parse sources."""
+    if not answer or not references:
+        return []
+    citation_to_reference = {
+        str(reference.get("citation_id")): reference["id"]
+        for reference in references if reference.get("citation_id")
+    }
+    body = answer
+    for marker in ("\n\nรายละเอียดแหล่งอ้างอิง:", "\n\nแหล่งอ้างอิง:"):
+        body = body.split(marker, 1)[0]
+    claims = []
+    for line in (item.strip() for item in body.splitlines()):
+        citation_ids = list(dict.fromkeys(_STRUCTURED_CITATION_RE.findall(line)))
+        reference_ids = [citation_to_reference[item] for item in citation_ids if item in citation_to_reference]
+        if not reference_ids:
+            continue
+        text = _STRUCTURED_CITATION_RE.sub("", line).strip()
+        if text:
+            claims.append({
+                "id": f"C{len(claims) + 1}",
+                "text": text,
+                "citation_ids": citation_ids,
+                "reference_ids": reference_ids,
+            })
+    if claims or not body.strip():
+        return claims
+    # Legacy/generated answers sometimes attach one citation list after the
+    # prose instead of placing IDs on each sentence. Preserve that broad
+    # attribution explicitly rather than forcing the frontend to guess.
+    return [{
+        "id": "C1",
+        "text": body.strip(),
+        "citation_ids": [item.get("citation_id") for item in references if item.get("citation_id")],
+        "reference_ids": [item["id"] for item in references],
+    }]
+
+
+def apply_answer_reference_contract(result: dict) -> dict:
+    """Attach the versioned answer/reference view to a result in place."""
+    sources = result.get("sources") if isinstance(result.get("sources"), list) else []
+    references = build_structured_references(sources)
+    result["schema_version"] = ANSWER_REFERENCE_SCHEMA_VERSION
+    result["references"] = references
+    result["claims"] = build_answer_claims(result.get("answer") or result.get("text"), references)
+    return result
 
 
 def _source_is_ingested_pdf(source: dict) -> bool:

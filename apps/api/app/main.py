@@ -32,7 +32,7 @@ from .retention import prune_observability
 from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
-from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
+from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, apply_answer_reference_contract, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8080", "http://localhost:8081"], allow_credentials=True,
@@ -2197,7 +2197,13 @@ def admin_query(payload: QueryRequest, request: Request, user: User = Depends(cu
 def get_sources(result_id: str, _: User = Depends(current_admin), db: Session = Depends(get_db)):
     saved = db.get(QueryResult, result_id)
     if not saved or saved.expires_at < datetime.utcnow(): raise HTTPException(404, "Result not found")
-    return {"result_id": result_id, "sources": sanitize_source_reference_urls(saved.result_json.get("sources", []))}
+    result = {
+        "status": "success",
+        "result_id": result_id,
+        "answer": saved.result_json.get("answer"),
+        "sources": sanitize_source_reference_urls(saved.result_json.get("sources", [])),
+    }
+    return apply_answer_reference_contract(result)
 
 
 @app.post("/api/v1/query/results/{result_id}/feedback")
@@ -2415,12 +2421,12 @@ def list_mcp_activity(limit: int = 50, _: User = Depends(current_admin), db: Ses
 
 MCP_TOOLS = [
     {"name": "describe_knowledge_schema", "description": "Discover authorized metadata templates, typed filter operators, and paginated coverage. Unknown metadata does not mean no matching documents.", "inputSchema": {"type": "object", "additionalProperties": False, "properties": {"offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}}},
-    {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning", "inputSchema": QueryRequest.model_json_schema()},
+    {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning. Returns ski.answer.v1 structuredContent with answer, claims, references, and backward-compatible sources.", "inputSchema": QueryRequest.model_json_schema()},
     {"name": "document_inventory_summary", "description": "Count and group non-deleted documents from the scoped document and legal registries", "inputSchema": DocumentInventoryRequest.model_json_schema()},
     {"name": "find_entities", "description": "Find entities by name or alias", "inputSchema": {"type": "object", "properties": {"search_text": {"type": "string"}}, "required": ["search_text"]}},
     {"name": "analyze_relationships", "description": "Analyze entity relationships", "inputSchema": {"type": "object", "properties": {"subjects": {"type": "array"}, "question": {"type": "string"}}, "required": ["subjects", "question"]}},
     {"name": "analyze_impact", "description": "Analyze direct and indirect impact", "inputSchema": ImpactRequest.model_json_schema()},
-    {"name": "get_sources", "description": "Retrieve sources for a result", "inputSchema": {"type": "object", "properties": {"result_id": {"type": "string"}}, "required": ["result_id"]}},
+    {"name": "get_sources", "description": "Retrieve the ski.answer.v1 answer, claims, references, and backward-compatible sources for a saved result", "inputSchema": {"type": "object", "properties": {"result_id": {"type": "string"}}, "required": ["result_id"]}},
     {"name": "resolve_legal_context", "description": "Resolve the in-force legal instruments and provisions relevant to a query within this MCP key's scope", "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 10000}, "as_of_date": {"type": "string", "format": "date"}, "include_historical": {"type": "boolean"}}, "required": ["query"]}},
     {"name": "get_legal_instrument", "description": "Get one legal instrument, its family and reviewed cross-document relations", "inputSchema": {"type": "object", "properties": {"instrument_id": {"type": "string"}}, "required": ["instrument_id"]}},
     {"name": "get_provision_history", "description": "List document versions containing a legal provision, scoped to the MCP key", "inputSchema": {"type": "object", "properties": {"instrument_id": {"type": "string"}, "provision_number": {"type": "string", "maxLength": 120}}, "required": ["instrument_id", "provision_number"]}},
@@ -2541,7 +2547,13 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
                     source_kb_ids = saved.result_json.get("metadata", {}).get("knowledge_base_ids", [])
                     authorize(token, "get_sources", source_kb_ids)
                     active_mcp_knowledge_base_ids(db, source_kb_ids)
-                result = {"sources": sanitize_source_reference_urls(saved.result_json.get("sources", []))} if saved else {"sources": []}
+                result = {
+                    "status": "success",
+                    "result_id": saved.id,
+                    "answer": saved.result_json.get("answer"),
+                    "sources": sanitize_source_reference_urls(saved.result_json.get("sources", [])),
+                } if saved else {"status": "success", "result_id": arguments.get("result_id"), "answer": None, "sources": []}
+                apply_answer_reference_contract(result)
                 result["metadata"] = {"retrieval_trace": [{"channel": "result_sources", "system": "PostgreSQL query result store", "status": "used", "result_count": len(result["sources"]), "detail": "stored cited sources"}]}
             elif name == "resolve_legal_context":
                 query = str(arguments.get("query", "")).strip()

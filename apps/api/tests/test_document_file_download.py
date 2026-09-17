@@ -135,6 +135,7 @@ def test_search_knowledge_sources_include_download_url():
     })
     assert reply.status_code == 200
     structured = reply.json()["result"]["structuredContent"]
+    assert structured["schema_version"] == "ski.answer.v1"
     sources = structured["sources"]
     assert sources
     source = next(item for item in sources if item.get("document_id") == uploaded["document_id"])
@@ -142,11 +143,20 @@ def test_search_knowledge_sources_include_download_url():
     assert urlsplit(source["download_url"]).path == expected_download_path
     assert source["original_filename"] == "cited-original.txt"
     assert source["mime_type"].startswith("text/plain")
+    reference = next(item for item in structured["references"] if item.get("document_id") == uploaded["document_id"])
+    assert reference["citation_id"] == source["citation_id"]
+    assert reference["file"]["download_url"] == source["download_url"]
+    assert reference["file"]["access"]["authentication"] == "bearer_or_session"
+    assert structured["claims"]
+    assert reference["id"] in structured["claims"][0]["reference_ids"]
     # get_sources must return the same enriched fields from stored result_json
-    stored = test_client.post("/mcp", headers=headers, json={
+    stored_result = test_client.post("/mcp", headers=headers, json={
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": {"name": "get_sources", "arguments": {"result_id": structured["result_id"]}},
-    }).json()["result"]["structuredContent"]["sources"]
+    }).json()["result"]["structuredContent"]
+    assert stored_result["schema_version"] == "ski.answer.v1"
+    assert stored_result["references"][0]["file"]["download_url"]
+    stored = stored_result["sources"]
     stored_source = next(item for item in stored if item.get("document_id") == uploaded["document_id"])
     assert stored_source["download_url"] == source["download_url"]
 

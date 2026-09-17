@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledge.softnix.ai/schemas/ski-answer-v1.schema.json",
+  "title": "Softnix Knowledge Intelligence answer",
+  "type": "object",
+  "required": ["schema_version", "answer", "claims", "references", "sources"],
+  "properties": {
+    "schema_version": { "const": "ski.answer.v1" },
+    "answer": { "type": ["string", "null"] },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "text", "citation_ids", "reference_ids"],
+        "properties": {
+          "id": { "type": "string" },
+          "text": { "type": "string" },
+          "citation_ids": { "type": "array", "items": { "type": "string" } },
+          "reference_ids": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "references": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "citation_id", "document_id", "title", "file", "locator"],
+        "properties": {
+          "id": { "type": "string" },
+          "citation_id": { "type": ["string", "null"] },
+          "document_id": { "type": ["string", "null"] },
+          "title": { "type": "string" },
+          "file": {
+            "type": "object",
+            "required": ["available", "name", "mime_type", "download_url", "access"],
+            "properties": {
+              "available": { "type": "boolean" },
+              "name": { "type": ["string", "null"] },
+              "mime_type": { "type": ["string", "null"] },
+              "download_url": { "type": ["string", "null"] },
+              "access": { "type": ["object", "null"] }
+            },
+            "additionalProperties": true
+          },
+          "locator": {
+            "type": "object",
+            "required": ["chunk_id", "section", "section_kind", "section_number", "page_start", "page_end"],
+            "additionalProperties": true
+          },
+          "excerpt": { "type": ["string", "null"] },
+          "relevance": { "type": ["number", "null"] },
+          "source_url": { "type": ["string", "null"] },
+          "provenance": { "type": ["object", "null"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "sources": {
+      "type": "array",
+      "description": "Backward-compatible retrieval sources; new frontends should use references."
+    }
+  },
+  "additionalProperties": true
+}

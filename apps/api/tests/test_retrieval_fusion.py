@@ -1,5 +1,5 @@
 from app.retrieval import RetrievalEvidence
-from app.services import compose_cited_answer, fuse_evidence, processing_retry_delay, sanitize_source_reference_urls
+from app.services import apply_answer_reference_contract, compose_cited_answer, fuse_evidence, processing_retry_delay, sanitize_source_reference_urls
 
 
 def source(document_id: str, relevance: float = 1.0) -> dict:
@@ -192,3 +192,34 @@ def test_structured_sources_omit_ocs_urls_including_nested_provenance():
     # Response sanitization must not mutate an ORM-backed cached payload.
     assert original[0]["source_uri"].startswith("https://")
     assert original[0]["provenance"]["source_uri"].startswith("https://")
+
+
+def test_answer_reference_contract_is_frontend_ready_and_versioned():
+    result = apply_answer_reference_contract({
+        "answer": "ระบบใช้ข้อกำหนดนี้ [S1]\n\nรายละเอียดแหล่งอ้างอิง:\n[S1] เอกสาร",
+        "sources": [{
+            "citation_id": "S1",
+            "document_id": "doc-1",
+            "chunk_id": "chunk-1",
+            "title": "ข้อกำหนดตัวอย่าง",
+            "section_label": "ข้อ 4",
+            "excerpt": "หลักฐาน",
+            "original_filename": "rule.pdf",
+            "mime_type": "application/pdf",
+            "download_url": "https://knowledge.softnix.ai/api/v1/documents/doc-1/file",
+        }],
+    })
+    assert result["schema_version"] == "ski.answer.v1"
+    assert result["claims"] == [{
+        "id": "C1",
+        "text": "ระบบใช้ข้อกำหนดนี้",
+        "citation_ids": ["S1"],
+        "reference_ids": ["R1"],
+    }]
+    reference = result["references"][0]
+    assert reference["id"] == "R1"
+    assert reference["locator"]["section"] == "ข้อ 4"
+    assert reference["locator"]["page_start"] is None
+    assert reference["file"]["available"] is True
+    assert reference["file"]["download_url"].endswith("/doc-1/file")
+    assert reference["file"]["access"]["authentication"] == "bearer_or_session"

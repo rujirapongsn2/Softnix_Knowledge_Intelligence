@@ -62,7 +62,61 @@ claude mcp add --transport http softnix-knowledge "https://your-softnix-host/mcp
 
 ## Citations และดาวน์โหลดไฟล์ต้นฉบับ
 
-ผลลัพธ์จาก `search_knowledge` (และ `get_sources` จาก `result_id` เดิม) มีฟิลด์ citation เพิ่มเติมเมื่อเอกสารมีไฟล์ต้นฉบับที่เก็บไว้:
+ผลลัพธ์จาก `search_knowledge` ใช้ contract `ski.answer.v1` ใน `result.structuredContent` เพื่อให้ Agent และ frontend อ่านข้อมูลโดยไม่ต้อง parse ข้อความ คีย์หลักคือ:
+
+- `answer` — คำตอบสำหรับแสดงผล
+- `claims[]` — ข้อความย่อยพร้อม `reference_ids[]` ที่รองรับแต่ละ claim
+- `references[]` — แหล่งอ้างอิงรูปแบบคงที่สำหรับ citation card, evidence drawer และ PDF preview
+- `sources[]` — ข้อมูล retrieval เดิมสำหรับ backward compatibility; frontend ใหม่ควรใช้ `references`
+
+ตัวอย่าง:
+
+```json
+{
+  "schema_version": "ski.answer.v1",
+  "answer": "ข้อกำหนดระบุให้ดำเนินการตามขั้นตอน [S1]",
+  "claims": [
+    {
+      "id": "C1",
+      "text": "ข้อกำหนดระบุให้ดำเนินการตามขั้นตอน",
+      "citation_ids": ["S1"],
+      "reference_ids": ["R1"]
+    }
+  ],
+  "references": [
+    {
+      "id": "R1",
+      "citation_id": "S1",
+      "document_id": "DOCUMENT_ID",
+      "title": "ข้อกำหนดตัวอย่าง",
+      "file": {
+        "available": true,
+        "name": "rule.pdf",
+        "mime_type": "application/pdf",
+        "download_url": "https://knowledge.softnix.ai/api/v1/documents/DOCUMENT_ID/file",
+        "access": {
+          "method": "GET",
+          "authentication": "bearer_or_session",
+          "disposition_parameter": "inline|attachment"
+        }
+      },
+      "locator": {
+        "chunk_id": "CHUNK_ID",
+        "section": "ข้อ 4",
+        "section_kind": "ข้อ",
+        "section_number": "4",
+        "page_start": null,
+        "page_end": null
+      },
+      "excerpt": "ข้อความหลักฐานที่ใช้ตอบคำถาม"
+    }
+  ]
+}
+```
+
+JSON Schema อยู่ที่ [`docs/schemas/ski-answer-v1.schema.json`](schemas/ski-answer-v1.schema.json) และ `get_sources` จาก `result_id` เดิมจะคืน `answer`, `claims`, `references` และ `sources` ใน contract เดียวกัน
+
+แหล่งอ้างอิงมีข้อมูลไฟล์ต้นฉบับเมื่อไฟล์ยังอยู่ในระบบ:
 
 - `original_filename` — ชื่อไฟล์ตอนอัปโหลด
 - `mime_type` — เช่น `application/pdf`
@@ -70,12 +124,14 @@ claude mcp add --transport http softnix-knowledge "https://your-softnix-host/mcp
 
 ในบล็อกข้อความ «รายละเอียดแหล่งอ้างอิง» ของคำตอบ: ระบบใส่ URL ไฟล์ใน SKI (`download_url`) เมื่อมีไฟล์ต้นฉบับที่เก็บไว้ (PDF หรือข้อความ) — **ไม่ใช้**ลิงก์ OCS / searchlaw / council-of-state จาก `source_uri` ใน citation prose; ถ้าไม่มี `download_url` และไม่มี `source_uri` ที่ปลอดภัย จะแสดงเฉพาะชื่อเอกสาร
 
-Agent ต้องเรียก `GET download_url` พร้อม header เดียวกับ MCP:
+Agent backend ต้องเรียก `GET references[].file.download_url` พร้อม header เดียวกับ MCP:
 
 ```http
 Authorization: Bearer skik_live_...
 ```
 
 ไม่ฝังไบต์ของ PDF ใน JSON-RPC — ใช้ลิงก์ดาวน์โหลดที่ควบคุมด้วย token เท่านั้น Token ต้องมี Knowledge Base ของเอกสารนั้นในขอบเขตอ่าน (ไม่ต้องมี `documents:write`) เอกสารที่ soft-delete แล้วจะได้ 404 การดาวน์โหลดด้วย session ของแอดมินและ Ingest API (`GET /api/v1/ingest/documents/{id}/file`) ยังทำงานเหมือนเดิม
+
+ห้ามส่ง MCP token ไปเก็บหรือเรียกใช้จาก browser frontend ให้ application backend proxy ไฟล์ด้วยสิทธิ์ของผู้ใช้ หรือใช้ session ของ SKI สำหรับ browser ที่ลงชื่อเข้าใช้แล้ว ใช้ `?disposition=inline` สำหรับ PDF preview และ `?disposition=attachment` สำหรับดาวน์โหลด
 
 ระบบนี้ยัง**ห้าม** web search / web fetch นอก Knowledge Base ที่ token อนุญาต

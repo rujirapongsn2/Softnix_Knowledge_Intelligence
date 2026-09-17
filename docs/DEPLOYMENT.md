@@ -57,5 +57,5 @@ docker compose ps
 - เพิ่ม `MAX_FILE_SIZE_MB` แล้ว rebuild `web` และ `api` เพื่อให้ file picker, proxy และ API ใช้ค่าเดียวกัน (ค่าเริ่มต้น 100 MB)
 - เปลี่ยน embedding model/dimension ต้อง reindex embeddings ทั้ง Knowledge Base อย่างควบคุม (ค่าเริ่มต้น dimension 1536)
 - เพิ่ม/แก้ `published_at` ได้ตอน upload หรือผ่าน `PATCH /api/v1/documents/{id}/metadata`; ไม่มีการ backfill อัตโนมัติ
-- หาก deploy API ใหม่แล้ว web ได้ `502` ให้ recreate web เพื่อให้ nginx resolve IP ของ API ใหม่: `docker compose up -d --force-recreate web`
+- nginx ฝั่ง web resolve ชื่อ service `api` ซ้ำผ่าน Docker DNS จึงรองรับการ recreate API container โดยไม่ต้อง restart web ตาม
 - migration `0023_token_ingest_scope` ถอน wildcard ของ `allowed_tools` (รายการว่างเคยหมายถึง "ทุก tool") โดยเขียนชื่อ tool ทั้ง 9 ตัวลงในแถวเดิมที่ค่าว่าง สิทธิ์ของ token เก่าจึงเท่าเดิมทุกใบ และ `allowed_scopes` เริ่มต้นเป็นรายการว่าง = ยังไม่มีใบใดเขียนได้ ต้องเปิด "Write access" ให้ใบใหม่เองเมื่อจะใช้ Ingestion API

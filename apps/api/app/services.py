@@ -642,8 +642,12 @@ def upsert_legal_instrument(db: Session, document: Document) -> LegalInstrument 
         row.effective_to = parse_thai_date(instrument_meta.get("effective_to"))
         # Extraction may provide an official source, but a curator's manual
         # provenance must never be overwritten by a re-process.
+        if _is_ocs_reference_url(row.source_uri):
+            row.source_uri = None
         if not row.source_uri:
-            row.source_uri = _legal_value(instrument_meta, "source_uri", "official_source_url", "source_url") or None
+            row.source_uri = _safe_registry_source_uri(
+                _legal_value(instrument_meta, "source_uri", "official_source_url", "source_url") or None
+            )
         if not row.source_reference:
             row.source_reference = _legal_value(instrument_meta, "source_reference", "gazette_reference", "ราชกิจจานุเบกษา") or None
     db.flush()
@@ -1183,7 +1187,8 @@ def _persist_query_result(db: Session, result: dict, token_id: str | None = None
     """Enrich citation sources with download links, then save QueryResult."""
     sources = result.get("sources")
     if isinstance(sources, list):
-        enrich_sources_with_file_links(db, sources, base_url=base_url)
+        enrich_sources_with_file_links(db, sources, base_url=base_url or public_document_base_url())
+        result["sources"] = sanitize_source_reference_urls(sources)
     saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
     db.add(saved)
     db.flush()
@@ -1212,7 +1217,7 @@ def build_legal_metadata_result(db: Session, query: str, kb_ids: list[str], toke
             answer = f"เอกสารที่ตรงกับฉบับแก้ไขครั้งที่ {requested} คือ {document.title or document.original_filename} — {instrument.official_title or ''} — วันที่ในผัง {date_text} [S1]"
         else:
             answer = f"ฉบับล่าสุดในชุดข้อมูลคือ {document.title or document.original_filename} — {instrument.official_title or ''} — วันที่ในผัง {date_text} [S1]"
-        answer += "\n\nรายละเอียดแหล่งอ้างอิง:\n" + _render_citation_details(sources)
+        answer += "\n\nรายละเอียดแหล่งอ้างอิง:\n" + render_citation_details_for_answer(db, sources)
     else:
         answer = "ไม่พบเอกสารกฎหมายที่มี metadata ตรงกับฉบับที่ร้องขอในขอบเขตของ MCP key"
     result = {
@@ -1263,7 +1268,7 @@ def build_legal_effective_rule_result(db: Session, query: str, kb_ids: list[str]
             })
     if sources:
         answer = "\n\n".join(f"{source['excerpt']}\n[{source['citation_id']}]" for source in sources)
-        answer += "\n\nรายละเอียดแหล่งอ้างอิง:\n" + _render_citation_details(sources)
+        answer += "\n\nรายละเอียดแหล่งอ้างอิง:\n" + render_citation_details_for_answer(db, sources)
     else:
         answer = "ไม่พบข้อบทว่าด้วยวันเริ่มใช้บังคับของฉบับแก้ไขที่ระบุในคลังข้อมูลที่เลือก"
     result = {
@@ -1369,7 +1374,7 @@ def _persist_legal_clause_result(db: Session, *, query: str, kb_ids: list[str], 
         answer = "คำตอบนี้อ้างอิงฉบับปรับปรุงล่าสุดที่มีผลบังคับใช้ในคลังข้อมูล\n" + answer
         if attribution_lines:
             answer += "\n\n" + "\n".join(attribution_lines)
-        answer += "\n\nรายละเอียดแหล่งอ้างอิง:\n" + _render_citation_details(sources)
+        answer += "\n\nรายละเอียดแหล่งอ้างอิง:\n" + render_citation_details_for_answer(db, sources)
     else:
         answer = "ไม่พบข้อบทที่ตรงกับเงื่อนไขในคลังข้อมูลที่เลือก"
     result = {"status": "success", "result_id": "", "answer": answer, "insufficient_evidence": not bool(sources), "sources": sources,
@@ -1680,7 +1685,7 @@ def build_legal_provenance_result(db: Session, query: str, kb_ids: list[str], to
             for relation, instrument, document in amends:
                 emit_relation(relation, instrument, document, relation.target_provision or ref["number"])
     if statements:
-        answer = "\n".join(statements) + "\n\nรายละเอียดแหล่งอ้างอิง:\n" + _render_citation_details(sources)
+        answer = "\n".join(statements) + "\n\nรายละเอียดแหล่งอ้างอิง:\n" + render_citation_details_for_answer(db, sources)
     else:
         answer = "ไม่พบความสัมพันธ์การแก้ไขหรือยกเลิกที่ตรวจสอบแล้วสำหรับมาตราที่ระบุในคลังข้อมูลที่เลือก"
     result = {
@@ -3461,10 +3466,11 @@ def _decorate_sources_with_legal_metadata(sources: list[dict], instruments_by_do
         source["legal_work_key"] = instrument.legal_work_key
         source["document_class"] = instrument.document_class
         source["version_role"] = instrument.version_role
-        source["source_uri"] = instrument.source_uri
+        safe_source_uri = _safe_registry_source_uri(instrument.source_uri)
+        source["source_uri"] = safe_source_uri
         source["source_reference"] = instrument.source_reference
         source["provenance"] = {"origin": "legal_registry", "review_status": instrument.review_status,
-                                 "document_id": instrument.document_id, "source_uri": instrument.source_uri,
+                                 "document_id": instrument.document_id, "source_uri": safe_source_uri,
                                  "source_reference": instrument.source_reference}
         # An unconfirmed status is informational (F6): the document is indexed
         # and its content is evidence.  Only a *known* adverse status belongs
@@ -3529,13 +3535,86 @@ def _validate_answer_citations(evidence: RetrievalEvidence, warnings: list[dict]
     evidence.sources = [available[citation_id] for citation_id in sorted(valid_ids, key=lambda value: int(value[1:]))]
 
 
+
+def render_citation_details_for_answer(db: Session, sources: list[dict]) -> str:
+    """Enrich PDF download links then render citation prose for answers."""
+    enrich_sources_with_file_links(db, sources, base_url=public_document_base_url())
+    return _render_citation_details(sources)
+
+_OCS_CITATION_URL_MARKERS = ("ocs.go.th", "searchlaw", "council-of-state")
+
+
+def _is_ocs_reference_url(url: str | None) -> bool:
+    """True for Council-of-State / searchlaw.ocs.go.th style reference links."""
+    if not url:
+        return False
+    lowered = url.lower()
+    return any(marker in lowered for marker in _OCS_CITATION_URL_MARKERS)
+
+
+def _safe_registry_source_uri(url: str | None) -> str | None:
+    """Persist / expose registry URIs only when they are not OCS-family links."""
+    if not url or _is_ocs_reference_url(url):
+        return None
+    return url
+
+
+def sanitize_source_reference_urls(sources: list[dict]) -> list[dict]:
+    """Return response-safe source copies without blocked registry URLs.
+
+    Applying this policy when results are written and read also protects
+    results cached before the policy existed.
+    """
+    sanitized = []
+    for source in sources:
+        row = dict(source)
+        row["source_uri"] = _safe_registry_source_uri(row.get("source_uri"))
+        provenance = row.get("provenance")
+        if isinstance(provenance, dict):
+            provenance = dict(provenance)
+            provenance["source_uri"] = _safe_registry_source_uri(provenance.get("source_uri"))
+            row["provenance"] = provenance
+        sanitized.append(row)
+    return sanitized
+
+
+def _source_is_ingested_pdf(source: dict) -> bool:
+    """True when the cited document's stored original is a PDF."""
+    mime = (source.get("mime_type") or "").lower()
+    name = (source.get("original_filename") or source.get("title") or "").lower()
+    return "pdf" in mime or name.endswith(".pdf")
+
+
+def _citation_reference_url(source: dict) -> str | None:
+    """URL shown in answer citation details.
+
+    Prefer the SKI ingested-file download link whenever present (PDF or text).
+    Never emit OCS / searchlaw / council-of-state URLs in prose citations.
+    Non-OCS registry ``source_uri`` is used only when no ``download_url`` exists;
+    otherwise omit the URL (title-only citation line).
+    """
+    download_url = source.get("download_url")
+    if download_url:
+        return download_url
+    return _safe_registry_source_uri(source.get("source_uri"))
+
+
+def public_document_base_url() -> str | None:
+    """Public origin for absolute MCP citation / download links."""
+    settings = get_settings()
+    # Prefer dedicated public URL; OPENROUTER_APP_URL is already set to the
+    # customer-facing host in production (.env → knowledge.softnix.ai).
+    base = (getattr(settings, "public_app_url", None) or settings.openrouter_app_url or "").strip()
+    return base.rstrip("/") or None
+
+
 def _render_citation_details(sources: list[dict]) -> str:
     lines = []
     for source in sources:
         label = source.get("title") or "เอกสาร"
         if source.get("section_label"):
             label = f"{label}, {source['section_label']}"
-        uri = source.get("source_uri")
+        uri = _citation_reference_url(source)
         detail = f"[{source.get('citation_id')}] {label}"
         if uri:
             detail += f" — {uri}"
@@ -3594,6 +3673,9 @@ def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: 
     decision = build_retrieval_plan(db, query, kb_ids, max_sources, query_filters, retrieval_trace)
     evidence = query_documents(db, query, kb_ids, decision.plan.max_sources, retrieval_trace, decision.plan, legal_warnings)
     intent = decision.plan.intent
+    # Attach PDF download links before composing answer prose so citation
+    # details can prefer SKI download_url and never emit OCS source_uri.
+    enrich_sources_with_file_links(db, evidence.sources, base_url=public_document_base_url())
     answer = compose_cited_answer(evidence, legal_warnings)
     if any(item["unknown_or_not_filterable"] for item in predicate_coverage(db, kb_ids, getattr(query_filters, "metadata_predicates", []))):
         answer += "\nยังมีเอกสารที่ metadata ไม่ครบหรือไม่ได้เปิดให้กรอง จึงไม่ควรใช้ผลการค้นหานี้สรุปว่าไม่มีเอกสารอื่นตรงเงื่อนไข"

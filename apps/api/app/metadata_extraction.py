@@ -15,34 +15,37 @@ MAX_WINDOWS = 4
 
 def extraction_fields(document):
     observations = document.metadata_observations or {}
+    digest = hashlib.sha256((document.extracted_text or "").encode()).hexdigest()
     return [f for f in (document.metadata_template_fields or [])
             if f.get("fill_mode") == "extract"
             and not observations.get(f["key"], {}).get("locked")
-            and f["key"] not in (document.document_metadata or {})]
+            # A value from an earlier source version must be refreshed, but it
+            # remains visible until a new, evidence-backed result is ready.
+            and (f["key"] not in (document.document_metadata or {})
+                 or (observations.get(f["key"], {}).get("origin") == "document_extraction"
+                     and observations.get(f["key"], {}).get("content_version") != digest))]
 
 
 def update_status(document):
     observations = document.metadata_observations or {}
-    pending = [f for f in document.metadata_template_fields or [] if f.get("fill_mode") == "extract"
-               and f["key"] not in (document.document_metadata or {})
-               and observations.get(f["key"], {}).get("status") != "not_found_confirmed"]
+    values = document.document_metadata or {}
+    pending = [f for f in document.metadata_template_fields or []
+               if f.get("fill_mode") == "extract"
+               and not observations.get(f["key"], {}).get("locked")
+               and observations.get(f["key"], {}).get("status") != "not_found_confirmed"
+               and (f["key"] not in values
+                    or (observations.get(f["key"], {}).get("origin") == "document_extraction"
+                        and observations.get(f["key"], {}).get("status") != "auto_accepted"))]
     document.metadata_status = "needs_review" if pending else "complete"
 
 
 def queue_metadata_extraction(db, document):
     # Callers hold a document row lock (or own an uncommitted new document).
-    digest = hashlib.sha256((document.extracted_text or "").encode()).hexdigest()
-    observations = dict(document.metadata_observations or {})
-    stale = {key for key, item in observations.items() if item.get("origin") == "document_extraction"
-             and not item.get("locked") and item.get("content_version") != digest}
-    if stale:
-        from .services import sync_document_metadata_graph, sync_document_metadata_values
-        document.document_metadata = {k: v for k, v in (document.document_metadata or {}).items() if k not in stale}
-        document.metadata_observations = {k: v for k, v in observations.items() if k not in stale}
-        document.metadata_revision += 1
-        document.metadata_search_text = metadata_search_text(document.metadata_template_fields, document.document_metadata)
-        sync_document_metadata_values(db, document)
-        sync_document_metadata_graph(db, document)
+    # Do not delete the last evidence-backed value just because the source has
+    # changed.  The old implementation cleared it before the provider call;
+    # a timeout or invalid response therefore made a visible, searchable value
+    # disappear.  ``extraction_fields`` above includes stale values in the next
+    # run and publication replaces them only after that run completes.
     if not extraction_fields(document):
         return False
     active = db.query(ProcessingJob.id).filter(

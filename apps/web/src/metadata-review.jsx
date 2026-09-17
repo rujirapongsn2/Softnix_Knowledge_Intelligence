@@ -13,7 +13,16 @@ export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFi
   useEffect(() => { setEditing(null); setDraft({}); setError(""); }, [preview.document_id]);
   const observations = preview.metadata_observations || {};
   const values = preview.document_metadata || {};
-  const needsReview = field => field.fill_mode === "extract" && values[field.key] === undefined && observations[field.key]?.status !== "not_found_confirmed";
+  const needsReview = field => {
+    if (field.fill_mode !== "extract") return false;
+    const observation = observations[field.key] || {};
+    if (observation.locked || observation.status === "not_found_confirmed") return false;
+    // A manually supplied value is already authoritative.  A prior automatic
+    // value stays visible while a changed source is re-extracted, but a new
+    // suggestion/conflict still needs review before it replaces that value.
+    if (values[field.key] !== undefined && observation.origin !== "document_extraction") return false;
+    return values[field.key] === undefined || observation.status !== "auto_accepted";
+  };
   const reviewFields = fields.filter(needsReview);
   const visible = all ? fields : reviewFields;
   const running = ["queued", "running"].includes(preview.metadata_status);

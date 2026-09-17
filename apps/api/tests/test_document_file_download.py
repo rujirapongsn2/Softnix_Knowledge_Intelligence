@@ -1,12 +1,13 @@
 """Download original document file endpoint."""
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
 
 from app.db import SessionLocal
 from app.main import app
-from app.models import Document
+from app.models import Document, QueryResult
 
 
 def client():
@@ -137,7 +138,8 @@ def test_search_knowledge_sources_include_download_url():
     sources = structured["sources"]
     assert sources
     source = next(item for item in sources if item.get("document_id") == uploaded["document_id"])
-    assert source["download_url"] == f"/api/v1/documents/{uploaded['document_id']}/file"
+    expected_download_path = f"/api/v1/documents/{uploaded['document_id']}/file"
+    assert urlsplit(source["download_url"]).path == expected_download_path
     assert source["original_filename"] == "cited-original.txt"
     assert source["mime_type"].startswith("text/plain")
     # get_sources must return the same enriched fields from stored result_json
@@ -147,7 +149,30 @@ def test_search_knowledge_sources_include_download_url():
     }).json()["result"]["structuredContent"]["sources"]
     stored_source = next(item for item in stored if item.get("document_id") == uploaded["document_id"])
     assert stored_source["download_url"] == source["download_url"]
-    file_response = test_client.get(source["download_url"], headers=headers)
+
+    # Results cached before URL filtering must also be sanitized at both read
+    # boundaries without mutating or deleting the cached record.
+    blocked_url = "https://searchlaw.ocs.go.th/example"
+    with SessionLocal() as db:
+        saved = db.get(QueryResult, structured["result_id"])
+        cached = dict(saved.result_json)
+        cached["sources"] = [{
+            **item,
+            "source_uri": blocked_url,
+            "provenance": {"origin": "legal_registry", "source_uri": blocked_url},
+        } for item in cached["sources"]]
+        saved.result_json = cached
+        db.commit()
+    stored = test_client.post("/mcp", headers=headers, json={
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "get_sources", "arguments": {"result_id": structured["result_id"]}},
+    }).json()["result"]["structuredContent"]["sources"]
+    assert all(item.get("source_uri") is None for item in stored)
+    assert all(item.get("provenance", {}).get("source_uri") is None for item in stored)
+    admin_sources = test_client.get(f"/api/v1/query/results/{structured['result_id']}/sources").json()["sources"]
+    assert all(item.get("source_uri") is None for item in admin_sources)
+
+    file_response = test_client.get(expected_download_path, headers=headers)
     assert file_response.status_code == 200
     assert file_response.content == b"AlphaWidget runs on NODE-42."
 
@@ -158,4 +183,3 @@ def test_document_file_download_soft_deleted_returns_404():
     assert test_client.delete(f"/api/v1/documents/{doc_id}").status_code == 200
     response = test_client.get(f"/api/v1/documents/{doc_id}/file")
     assert response.status_code == 404
-

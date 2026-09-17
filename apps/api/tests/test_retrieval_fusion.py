@@ -1,5 +1,5 @@
 from app.retrieval import RetrievalEvidence
-from app.services import compose_cited_answer, fuse_evidence, processing_retry_delay
+from app.services import compose_cited_answer, fuse_evidence, processing_retry_delay, sanitize_source_reference_urls
 
 
 def source(document_id: str, relevance: float = 1.0) -> dict:
@@ -111,3 +111,84 @@ def test_parallel_retrieval_inherits_request_deadline(monkeypatch):
         reset_deadline(token)
     assert len(observed) == 1
     assert 0 < observed[0] <= 10
+
+
+def test_cited_answer_prefers_ingested_pdf_url_over_source_uri():
+    evidence = RetrievalEvidence(
+        [{
+            "citation_id": "S1",
+            "document_id": "doc-pdf",
+            "title": "พ.ร.บ. ตัวอย่าง",
+            "section_label": "มาตรา 1",
+            "excerpt": "ข้อความ",
+            "source_uri": "https://searchlaw.ocs.go.th/example",
+            "mime_type": "application/pdf",
+            "original_filename": "sample.pdf",
+            "download_url": "https://knowledge.softnix.ai/api/v1/documents/doc-pdf/file",
+        }],
+        [], [], [],
+        "คำตอบจากหลักฐาน [S1]",
+    )
+    answer = compose_cited_answer(evidence)
+    assert "https://knowledge.softnix.ai/api/v1/documents/doc-pdf/file" in answer
+    assert "searchlaw.ocs.go.th" not in answer
+
+
+def test_cited_answer_prefers_ski_download_url_for_text_plain():
+    evidence = RetrievalEvidence(
+        [{
+            "citation_id": "S1",
+            "document_id": "doc-txt",
+            "title": "เอกสารข้อความ",
+            "excerpt": "ข้อความ",
+            "source_uri": "https://searchlaw.ocs.go.th/example",
+            "mime_type": "text/plain",
+            "original_filename": "note.txt",
+            "download_url": "https://knowledge.softnix.ai/api/v1/documents/doc-txt/file",
+        }],
+        [], [], [],
+        "คำตอบ [S1]",
+    )
+    answer = compose_cited_answer(evidence)
+    assert "https://knowledge.softnix.ai/api/v1/documents/doc-txt/file" in answer
+    assert "searchlaw.ocs.go.th" not in answer
+    assert "ocs.go.th" not in answer
+
+
+def test_cited_answer_omits_ocs_only_source_uri():
+    evidence = RetrievalEvidence(
+        [{
+            "citation_id": "S1",
+            "document_id": "doc-ocs",
+            "title": "เอกสาร OCS เท่านั้น",
+            "excerpt": "ข้อความ",
+            "source_uri": "https://searchlaw.ocs.go.th/council-of-state/#/public/doc/abc",
+            "mime_type": "text/plain",
+            "original_filename": "note.txt",
+            "download_url": None,
+        }],
+        [], [], [],
+        "คำตอบ [S1]",
+    )
+    answer = compose_cited_answer(evidence)
+    assert "searchlaw.ocs.go.th" not in answer
+    assert "ocs.go.th" not in answer
+    assert "council-of-state" not in answer
+    assert "[S1] เอกสาร OCS เท่านั้น" in answer
+
+
+def test_structured_sources_omit_ocs_urls_including_nested_provenance():
+    original = [{
+        "citation_id": "S1",
+        "source_uri": "https://searchlaw.ocs.go.th/example",
+        "provenance": {
+            "origin": "legal_registry",
+            "source_uri": "https://www.ocs.go.th/example",
+        },
+    }]
+    sanitized = sanitize_source_reference_urls(original)
+    assert sanitized[0]["source_uri"] is None
+    assert sanitized[0]["provenance"]["source_uri"] is None
+    # Response sanitization must not mutate an ORM-backed cached payload.
+    assert original[0]["source_uri"].startswith("https://")
+    assert original[0]["provenance"]["source_uri"].startswith("https://")

@@ -1,6 +1,8 @@
 /*
  * The React Flow node boundary must match the visible circle exactly.
  * Labels are absolutely positioned so they never affect edge geometry.
+ * Title, type, and review status are stacked with Thai-safe line-height
+ * so the status badge never overlaps the node title.
  */
 .graph-visual-node {
   position: relative !important;
@@ -19,23 +21,35 @@
 }
 
 .graph-visual-node .graph-node-label,
-.graph-visual-node .graph-node-type {
+.graph-visual-node .graph-node-type,
+.graph-visual-node .graph-node-review {
   position: absolute;
   left: 50%;
-  width: 180px;
-  max-width: 180px;
   transform: translateX(-50%);
   pointer-events: none;
+  text-align: center;
+  line-height: 1.45 !important;
 }
 
 .graph-visual-node .graph-node-label {
-  top: 75px;
-  min-height: 31px;
+  top: 76px;
+  width: 180px;
+  max-width: 180px;
+  min-height: 2.9em;
 }
 
 .graph-visual-node .graph-node-type {
-  top: 108px;
-  text-align: center;
+  top: 122px;
+  width: 180px;
+  max-width: 180px;
+}
+
+.graph-visual-node .graph-node-review {
+  top: 146px;
+  width: max-content;
+  max-width: 180px;
+  justify-content: center;
+  box-sizing: border-box;
 }
 
 .graph-visual-node .graph-handle {

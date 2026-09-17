@@ -215,3 +215,174 @@
 .pdf-file-preview-modal { width: min(1100px, 100%); height: min(90vh, 900px); }
 .pdf-file-preview-modal .preview-heading { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; }
 .pdf-file-preview-frame { flex: 1 1 auto; width: 100%; min-height: 0; border: 1px solid #d9e5e7; border-radius: 12px; background: #fff; }
+
+
+/* File Preview tab (extracted text + TOC for all documents) */
+.document-preview-tab-panel.is-file-preview {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-right: 0;
+  min-height: 0;
+}
+.file-preview-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 30%) minmax(0, 1fr);
+  gap: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  border: 1px solid var(--color-border, #d9e5e7);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fff;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.65;
+}
+.file-preview-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--color-border, #d9e5e7);
+  background: #f7fafb;
+}
+.file-preview-meta {
+  flex: 0 0 auto;
+  padding: 1rem 1rem .85rem;
+  border-bottom: 1px solid var(--color-border, #d9e5e7);
+  background: #fff;
+}
+.file-preview-meta h3 {
+  margin: 0 0 .75rem;
+  font-size: .95rem;
+  font-weight: 600;
+  line-height: 1.45;
+  color: #17394a;
+}
+.file-preview-meta-list {
+  display: grid;
+  gap: .35rem;
+  margin: 0;
+}
+.file-preview-meta-list > div {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: .35rem .55rem;
+  align-items: baseline;
+  font-size: .78rem;
+  line-height: 1.4;
+}
+.file-preview-meta-list dt {
+  margin: 0;
+  color: #687c86;
+  font-weight: 650;
+}
+.file-preview-meta-list dt::after { content: ":"; }
+.file-preview-meta-list dd {
+  margin: 0;
+  color: #17394a;
+}
+.file-preview-toc {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.file-preview-toc-header {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: .5rem;
+  flex: 0 0 auto;
+  padding: .55rem .9rem;
+  border-bottom: 1px solid var(--color-border, #d9e5e7);
+  background: #eef3f5;
+  color: #50676e;
+  font-size: .72rem;
+  font-weight: 750;
+  letter-spacing: .02em;
+}
+.file-preview-toc-list {
+  list-style: none;
+  margin: 0;
+  padding: .35rem 0;
+  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.file-preview-toc-list li { margin: 0; }
+.file-preview-toc-list button {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  padding: .55rem .9rem;
+  background: transparent;
+  color: #2786C2;
+  font: inherit;
+  font-size: .82rem;
+  font-weight: 600;
+  text-align: left;
+  line-height: 1.55;
+  cursor: pointer;
+}
+.file-preview-toc-list button:hover,
+.file-preview-toc-list button:focus-visible {
+  background: #2786C20d;
+  outline: none;
+}
+.file-preview-toc-list button.selected {
+  background: #e8eef1;
+  color: #0f4f75;
+}
+.file-preview-sidebar-actions {
+  flex: 0 0 auto;
+  padding: .75rem .9rem;
+  border-top: 1px solid var(--color-border, #d9e5e7);
+  background: #fff;
+}
+.file-preview-content {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 1.1rem 1.25rem;
+  background: #fff;
+}
+.file-preview-empty {
+  display: grid;
+  gap: .35rem;
+  align-content: start;
+  padding: .25rem 0;
+  max-width: 36rem;
+}
+.file-preview-empty .section-copy:first-child {
+  margin: 0;
+  font-weight: 650;
+  color: #17394a;
+}
+.file-preview-empty .section-copy:last-child {
+  margin: 0;
+  color: #687c86;
+}
+.file-preview-section { scroll-margin-top: .75rem; }
+.file-preview-section + .file-preview-section { margin-top: .35rem; }
+.file-preview-section-body {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.7;
+  color: #17394a;
+}
+@media (max-width: 800px) {
+  .file-preview-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(180px, 38%) minmax(0, 1fr);
+  }
+  .file-preview-sidebar { border-right: 0; border-bottom: 1px solid var(--color-border, #d9e5e7); }
+}

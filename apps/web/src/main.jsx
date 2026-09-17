@@ -18,6 +18,7 @@ import "./documents.css";
 import "./admin.css";
 import "./cloudflare-overrides.css";
 import {connectionHandles} from "./graph-geometry.mjs";
+import {buildFilePreviewSections, isFilePreviewEmptyValue, mapFilePreviewClassLabel, pickDocumentMetadataValue, pickFilePreviewValue} from "./file-preview.mjs";
 import {LanguageProvider, useLanguage} from "./language.jsx";
 import {MetadataReviewPanel} from "./metadata-review.jsx";
 import {legalLabels} from "./translations.js";
@@ -525,7 +526,7 @@ function App() {
     try {
       const [preview, jobs] = await Promise.all([api(`/v1/documents/${document.id}/text`), api(`/v1/documents/${document.id}/jobs`)]);
       setDocumentJobPollError("");
-      setDocumentPreview({...preview, title: document.title || document.original_filename, original_filename: document.original_filename}); setDocumentJobs(jobs);
+      setDocumentPreview({...preview, title: document.title || document.original_filename, original_filename: document.original_filename, mime_type: document.mime_type}); setDocumentJobs(jobs);
     } catch (error) { showError(error); }
   };
   const closePreview = useCallback(() => setDocumentPreview(null), []);
@@ -1682,7 +1683,7 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
     </section>}
     {hasCompletedDocuments && <section className="next-step-card"><div><p className="eyebrow">{t("documents.nextStep.eyebrow")}</p><h2>{t("documents.nextStep.title")}</h2><p>{t("documents.nextStep.description")}</p></div><div className="next-step-actions"><Button label={t("documents.nextStep.search")} variant="primary" onClick={onSearch}/><Button label={t("workflow.explore")} variant="secondary" onClick={onExplore}/></div></section>}
     {libraryTab === "legal" && legalInstruments?.length > 0 && <LegalInstrumentsTab knowledgeBaseId={selectedKb.id} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={refreshGraph} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship} resolveLegalRegistry={resolveLegalRegistry} onOpenDocument={openDocumentFromLibrary}/>}
-    {pdfPreview && <PdfFilePreview preview={pdfPreview} onClose={onClosePdfPreview} onDownload={downloadOriginalDocument}/>}{documentPreview && <DocumentPreview preview={documentPreview} jobs={documentJobs} isPollingJobs={documentJobPolling} pollingError={documentJobPollError} templates={documentTemplates} legalInstrument={legalInstruments?.find(row => row.document_id === documentPreview.document_id)} onExtractLegal={extractLegalMetadata} onSaveLegal={saveLegalMetadata} onDeleteLegal={deleteLegalMetadata} onDownloadOriginal={downloadOriginalDocument} onRefreshMetadata={async () => { await openDocument({id: documentPreview.document_id, title: documentPreview.title, original_filename: documentPreview.original_filename}); await refreshDocuments(); }} onUpdateLegalInstrument={updateLegalInstrument} onClose={closeDocumentPreview}/>}<DocumentTypeDrawer open={isTypeDrawerOpen} templates={documentTemplates} onClose={closeTypeDrawer} onCreate={createDocumentTemplate} onUpdate={updateDocumentTemplate} onDeactivate={deactivateDocumentTemplate} onActivate={activateDocumentTemplate} onRename={renameDocumentTemplate} onDuplicate={duplicateDocumentTemplate} onPurge={purgeDocumentTemplate}/></>
+    {pdfPreview && <PdfFilePreview preview={pdfPreview} onClose={onClosePdfPreview} onDownload={downloadOriginalDocument}/>}{documentPreview && <DocumentPreview preview={documentPreview} jobs={documentJobs} isPollingJobs={documentJobPolling} pollingError={documentJobPollError} templates={documentTemplates} legalInstrument={legalInstruments?.find(row => row.document_id === documentPreview.document_id)} onExtractLegal={extractLegalMetadata} onSaveLegal={saveLegalMetadata} onDeleteLegal={deleteLegalMetadata} onDownloadOriginal={downloadOriginalDocument} onRefreshMetadata={async () => { await openDocument({id: documentPreview.document_id, title: documentPreview.title, original_filename: documentPreview.original_filename, mime_type: documentPreview.mime_type}); await refreshDocuments(); }} onUpdateLegalInstrument={updateLegalInstrument} onClose={closeDocumentPreview}/>}<DocumentTypeDrawer open={isTypeDrawerOpen} templates={documentTemplates} onClose={closeTypeDrawer} onCreate={createDocumentTemplate} onUpdate={updateDocumentTemplate} onDeactivate={deactivateDocumentTemplate} onActivate={activateDocumentTemplate} onRename={renameDocumentTemplate} onDuplicate={duplicateDocumentTemplate} onPurge={purgeDocumentTemplate}/></>
 }
 
 const legalStatusLabel = (labels, status) => labels.status[status] || labels.status.unknown;
@@ -2634,6 +2635,120 @@ function LegalInstrumentCard({instrument, onUpdate}) {
   </div>;
 }
 
+
+function FilePreviewPanel({preview, legalInstrument, onDownloadOriginal}) {
+  const {t, language} = useLanguage();
+  const labels = legalLabels[language] || legalLabels.en;
+  const legal = preview.legal_metadata && typeof preview.legal_metadata === "object" ? preview.legal_metadata : {};
+  const instrumentMeta = legal.instrument && typeof legal.instrument === "object" ? legal.instrument : {};
+  const documentMetadata = preview.document_metadata && typeof preview.document_metadata === "object" ? preview.document_metadata : {};
+  const sections = useMemo(
+    () => buildFilePreviewSections(preview.text, preview.legal_metadata, t),
+    [preview.text, preview.legal_metadata, t],
+  );
+  const [activeId, setActiveId] = useState(sections[0]?.id || "fp-sec-0");
+  const contentRef = useRef(null);
+
+  useEffect(() => {
+    setActiveId(sections[0]?.id || "fp-sec-0");
+    if (contentRef.current) contentRef.current.scrollTop = 0;
+  }, [preview.document_id, sections]);
+
+  const scrollToSection = id => {
+    setActiveId(id);
+    const node = contentRef.current?.querySelector(`[data-fp-section="${id}"]`);
+    node?.scrollIntoView({behavior: "smooth", block: "start"});
+  };
+
+  const title = legalInstrument?.official_title || instrumentMeta.official_title || instrumentMeta.title || preview.title;
+  const documentMetaVersionRaw = pickDocumentMetadataValue(documentMetadata, [
+    "version_label", "version", "edition", "ฉบับ", "document_class",
+  ]);
+  const documentMetaVersion = documentMetaVersionRaw == null
+    ? null
+    : (labels.class?.[String(documentMetaVersionRaw).trim()] || String(documentMetaVersionRaw).trim());
+  const versionLabel = pickFilePreviewValue(
+    legalInstrument?.version_label,
+    mapFilePreviewClassLabel(labels, legalInstrument?.document_class),
+    instrumentMeta.version_label,
+    mapFilePreviewClassLabel(labels, instrumentMeta.document_class),
+    legal.version_label,
+    mapFilePreviewClassLabel(labels, legal.document_class),
+    documentMetaVersion,
+  ) || "—";
+
+  // Status: prefer real registry/legal/document values; allow explicit "unknown" only after better sources miss.
+  const statusAliasKeys = ["status", "legal_status", "สถานะ", "force_status"];
+  const statusFromLegal = pickFilePreviewValue(
+    legalInstrument?.status,
+    instrumentMeta.status,
+    legal.status,
+  );
+  const statusFromDocumentMeta = pickDocumentMetadataValue(documentMetadata, statusAliasKeys);
+  const hasExplicitUnknownStatus = [legalInstrument?.status, instrumentMeta.status, legal.status]
+    .some(value => String(value || "").trim().toLowerCase() === "unknown")
+    || statusAliasKeys.some(key => {
+      const value = documentMetadata?.[key];
+      return String(value || "").trim().toLowerCase() === "unknown";
+    })
+    || Object.entries(documentMetadata || {}).some(([key, value]) => (
+      statusAliasKeys.some(alias => String(alias).trim().toLowerCase() === String(key).trim().toLowerCase())
+      && String(value || "").trim().toLowerCase() === "unknown"
+    ));
+  const statusKey = statusFromLegal || statusFromDocumentMeta || (hasExplicitUnknownStatus ? "unknown" : null);
+  const statusLabel = statusKey
+    ? (labels.status?.[statusKey] || statusKey)
+    : "—";
+
+  const gazetteDate = pickFilePreviewValue(
+    legalInstrument?.effective_from,
+    instrumentMeta.effective_date,
+    instrumentMeta.gazette_date,
+    legal.effective_date,
+    legal.gazette_date,
+    pickDocumentMetadataValue(documentMetadata, [
+      "gazette_date", "effective_date", "effective_from", "publication_date", "announce_date", "วันที่ประกาศ", "ราชกิจจา",
+    ]),
+  ) || "—";
+
+  return <div className="file-preview-layout">
+    <aside className="file-preview-sidebar">
+      <div className="file-preview-meta">
+        <h3>{title}</h3>
+        <dl className="file-preview-meta-list">
+          <div><dt>{t("documentPreview.filePreview.version")}</dt><dd>{versionLabel}</dd></div>
+          <div><dt>{t("documentPreview.filePreview.status")}</dt><dd>{statusLabel}</dd></div>
+          <div><dt>{t("documentPreview.filePreview.gazetteDate")}</dt><dd>{gazetteDate}</dd></div>
+        </dl>
+      </div>
+      <div className="file-preview-toc">
+        <div className="file-preview-toc-header" aria-hidden="true">
+          <span>{t("documentPreview.filePreview.tocHeading")}</span>
+          <span>{t("documentPreview.filePreview.tocAnnotation")}</span>
+        </div>
+        <ul className="file-preview-toc-list" role="list">
+          {sections.map(section => <li key={section.id}>
+            <button type="button" className={activeId === section.id ? "selected" : ""} aria-current={activeId === section.id ? "true" : undefined} onClick={() => scrollToSection(section.id)}>{section.label}</button>
+          </li>)}
+        </ul>
+      </div>
+      {onDownloadOriginal && <div className="file-preview-sidebar-actions">
+        <Button label={t("documents.action.downloadOriginal")} size="sm" variant="secondary" onClick={() => onDownloadOriginal({id: preview.document_id, original_filename: preview.original_filename, title: preview.title, mime_type: preview.mime_type})}/>
+      </div>}
+    </aside>
+    <div className="file-preview-content" ref={contentRef}>
+      {String(preview.text || "").trim()
+        ? sections.map(section => <section key={section.id} data-fp-section={section.id} className="file-preview-section">
+            <pre className="file-preview-section-body">{section.body}</pre>
+          </section>)
+        : <div className="file-preview-empty" role="status">
+            <p className="section-copy">{t("documentPreview.filePreview.emptyTitle")}</p>
+            <p className="section-copy">{t("documentPreview.filePreview.emptyDescription")}</p>
+          </div>}
+    </div>
+  </div>;
+}
+
 function PdfFilePreview({preview, onClose, onDownload}) {
   const {t} = useLanguage();
   const headingRef = useRef(null);
@@ -2713,8 +2828,8 @@ function DocumentPreview({onRefreshMetadata, preview, jobs, isPollingJobs, polli
       <div className="preview-heading"><div><p className="eyebrow">{t("documentPreview.eyebrow")}</p><h2 id="document-preview-title" tabIndex={-1} ref={headingRef}>{preview.title}</h2></div><div className="preview-actions"><StatusBadge status={preview.status}/>{onDownloadOriginal && <Button label={t("documents.action.downloadOriginal")} size="sm" variant="ghost" onClick={() => onDownloadOriginal({id: preview.document_id, original_filename: preview.original_filename, title: preview.title})}/>}{isExtracting && <span className="live-status" role="status" aria-live="polite">{t("documentPreview.extractingMetadata")}</span>}{preview.status === "completed" && ["legal", "regulation", "contract"].includes(preview.document_type) && <Button label={isExtracting ? t("documentPreview.extractingMetadata") : t("documentPreview.extractLegalMetadata")} size="sm" variant="secondary" isLoading={isExtracting} isDisabled={isExtracting} onClick={() => onExtractLegal({id: preview.document_id, title: preview.title})}/>}<button type="button" className="drawer-close" onClick={onClose} aria-label={t("documentPreview.closeAriaLabel")}>×</button></div></div>
       {preview.error_code && <p className="inline-error">{preview.error_code}</p>}
       <nav className="document-preview-tabs" role="tablist" aria-label={t("documentPreview.sectionsAriaLabel")}>{tabs.map(([value, label]) => <button type="button" role="tab" aria-selected={tab === value} className={tab === value ? "selected" : ""} key={value} onClick={() => setTab(value)}>{label}</button>)}</nav>
-      <div className="document-preview-tab-panel">
-        {tab === "content" && <pre className="excerpt">{preview.text || t("documentPreview.content.placeholder")}</pre>}
+      <div className={`document-preview-tab-panel${tab === "content" ? " is-file-preview" : ""}`}>
+        {tab === "content" && <FilePreviewPanel preview={preview} legalInstrument={legalInstrument} onDownloadOriginal={onDownloadOriginal}/>}
         {tab === "metadata" && <MetadataReviewPanel preview={preview} fields={documentFields} api={api} onRefresh={onRefreshMetadata} MetadataFields={MetadataFields}/>}
 
         {tab === "legal" && <div className="legal-metadata-panel">{legalInstrument && <LegalInstrumentCard instrument={legalInstrument} onUpdate={onUpdateLegalInstrument}/>}<div className="legal-metadata-heading"><div><h3>{t("documentPreview.legal.heading")}</h3><p className="section-copy">{t("documentPreview.legal.description")}</p></div>{!editingLegal && <div className="legal-metadata-actions"><Button label={hasLegalMetadata ? t("documentPreview.legal.editMetadata") : t("documentPreview.legal.addMetadata")} size="sm" variant="secondary" onClick={startEditing}/>{hasLegalMetadata && <Button label={t("documentPreview.legal.deleteMetadata")} size="sm" variant="destructive" onClick={() => onDeleteLegal({id: preview.document_id, title: preview.title})}/>}</div>}</div>{editingLegal ? <form className="legal-editor" onSubmit={save}><textarea aria-label={t("documentPreview.legal.jsonAriaLabel")} value={legalDraft} onChange={event => setLegalDraft(event.target.value)} rows={18} spellCheck="false"/><p className="section-copy">{t("documentPreview.legal.helpPart1")} <code>instrument</code>, <code>provisions</code> {t("documentPreview.legal.helpPart2")} <code>references</code> {t("documentPreview.legal.helpPart3")} <code>evidence_quote</code>{t("documentPreview.legal.helpPart4")}</p>{legalError && <p className="inline-error" role="alert">{legalError}</p>}<div className="preview-actions"><Button label={t("documentPreview.legal.saveMetadata")} type="submit" variant="primary"/><Button label={t("common.cancel")} type="button" variant="ghost" onClick={() => setEditingLegal(false)}/></div></form> : hasLegalMetadata ? <pre className="excerpt legal-metadata">{JSON.stringify(preview.legal_metadata, null, 2)}</pre> : <p className="section-copy">{t("documentPreview.legal.emptyState", {addLabel: t("documentPreview.legal.addMetadata"), extractLabel: t("documentPreview.extractLegalMetadata")})}</p>}</div>}

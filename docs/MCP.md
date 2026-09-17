@@ -66,7 +66,9 @@ claude mcp add --transport http softnix-knowledge "https://your-softnix-host/mcp
 
 - `original_filename` — ชื่อไฟล์ตอนอัปโหลด
 - `mime_type` — เช่น `application/pdf`
-- `download_url` — path แบบ root-relative เช่น `/api/v1/documents/{document_id}/file`
+- `download_url` — path แบบ root-relative เช่น `/api/v1/documents/{document_id}/file` (หรือ absolute เมื่อตั้ง `PUBLIC_APP_URL`)
+
+ในบล็อกข้อความ «รายละเอียดแหล่งอ้างอิง» ของคำตอบ: ระบบใส่ URL ไฟล์ใน SKI (`download_url`) เมื่อมีไฟล์ต้นฉบับที่เก็บไว้ (PDF หรือข้อความ) — **ไม่ใช้**ลิงก์ OCS / searchlaw / council-of-state จาก `source_uri` ใน citation prose; ถ้าไม่มี `download_url` และไม่มี `source_uri` ที่ปลอดภัย จะแสดงเฉพาะชื่อเอกสาร
 
 Agent ต้องเรียก `GET download_url` พร้อม header เดียวกับ MCP:
 

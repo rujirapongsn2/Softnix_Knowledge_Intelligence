@@ -236,7 +236,7 @@ def test_updated_template_does_not_rewrite_an_old_manual_snapshot():
     assert api.get(f"/api/v1/documents/{doc_id}/text").json()["metadata_template_fields"][0]["fill_mode"] == "manual"
 
 
-def test_source_change_invalidates_auto_value_and_old_filter(monkeypatch):
+def test_source_change_keeps_auto_value_until_replacement_is_published(monkeypatch):
     api = next(client())
     _, _, doc_id = setup_document(api)
     monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {"issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}]})
@@ -247,8 +247,31 @@ def test_source_change_invalidates_auto_value_and_old_filter(monkeypatch):
         doc.extracted_text = "A different source version."
         assert queue_metadata_extraction(db, doc)
         db.commit()
-        assert doc.document_metadata == {}
-        assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id).count() == 0
+        # A queue operation must not erase the last usable value or remove it
+        # from structured search before a replacement has passed validation.
+        assert doc.document_metadata == {"issuer": "Land Department"}
+        assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id).count() == 1
+
+
+def test_source_change_replaces_auto_value_only_after_success(monkeypatch):
+    api = next(client())
+    _, _, doc_id = setup_document(api)
+    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {
+        "issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}],
+    })
+    queue_and_run(doc_id)
+    with SessionLocal() as db:
+        doc = db.get(Document, doc_id)
+        doc.extracted_text = "Issuer: Revenue Department."
+        assert queue_metadata_extraction(db, doc)
+        db.commit()
+        job = db.query(ProcessingJob).filter_by(document_id=doc_id, job_type="EXTRACT_DOCUMENT_METADATA", status="queued").one()
+    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {
+        "issuer": [{"value": "Revenue Department", "evidence_quote": "Issuer: Revenue Department."}],
+    })
+    with SessionLocal() as db:
+        process_metadata_job(db, db.get(ProcessingJob, job.id))
+        assert db.get(Document, doc_id).document_metadata == {"issuer": "Revenue Department"}
 
 
 def test_typed_projection_migration_preserves_existing_rows():

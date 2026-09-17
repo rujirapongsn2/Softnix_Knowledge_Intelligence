@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     openrouter_rerank_model: str = ""
     rerank_candidate_limit: int = 20
     openrouter_app_url: str = ""
+    # Customer-facing origin for absolute citation/download links in MCP answers.
+    public_app_url: str = ""
     openrouter_app_title: str = "Softnix Knowledge Intelligence Platform"
     reranker_enabled: bool = False
     retrieval_planner_timeout_seconds: int = 4

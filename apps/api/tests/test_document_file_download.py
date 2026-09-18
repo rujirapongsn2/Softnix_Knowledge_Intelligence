@@ -54,6 +54,10 @@ def test_document_file_download_missing_disk_file_returns_404():
         path = Path(doc.storage_path)
         assert path.is_file()
         path.unlink()
+    quality = test_client.get(f"/api/v1/documents/{doc_id}/text").json()["quality"]
+    assert quality["schema_version"] == "ski.quality.v1"
+    assert quality["status"] == "not_queryable"
+    assert "source_file_missing" in quality["blockers"]
     response = test_client.get(f"/api/v1/documents/{doc_id}/file")
     assert response.status_code == 404
 
@@ -123,6 +127,12 @@ def test_search_knowledge_sources_include_download_url():
         test_client.post("/api/v1/internal/process-next")
     else:
         raise AssertionError("document did not complete processing")
+    quality = test_client.get(f"/api/v1/documents/{uploaded['document_id']}/text").json()["quality"]
+    assert quality["schema_version"] == "ski.quality.v1"
+    assert quality["status"] in {"ai_ready", "verified"}
+    assert quality["blockers"] == []
+    assert quality["metrics"]["chunks"] >= 1
+    assert quality["metrics"]["embedding_coverage"] == 1
     token = test_client.post("/api/v1/tokens", json={
         "name": "citation-agent",
         "allowed_knowledge_base_ids": [kb["id"]],
@@ -147,6 +157,8 @@ def test_search_knowledge_sources_include_download_url():
     assert reference["citation_id"] == source["citation_id"]
     assert reference["file"]["download_url"] == source["download_url"]
     assert reference["file"]["access"]["authentication"] == "bearer_or_session"
+    assert reference["quality"]["schema_version"] == "ski.quality.v1"
+    assert reference["quality"]["blockers"] == []
     assert structured["claims"]
     assert reference["id"] in structured["claims"][0]["reference_ids"]
     # get_sources must return the same enriched fields from stored result_json
@@ -156,6 +168,7 @@ def test_search_knowledge_sources_include_download_url():
     }).json()["result"]["structuredContent"]
     assert stored_result["schema_version"] == "ski.answer.v1"
     assert stored_result["references"][0]["file"]["download_url"]
+    assert stored_result["references"][0]["quality"]["schema_version"] == "ski.quality.v1"
     stored = stored_result["sources"]
     stored_source = next(item for item in stored if item.get("document_id") == uploaded["document_id"])
     assert stored_source["download_url"] == source["download_url"]

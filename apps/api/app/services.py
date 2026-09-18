@@ -29,6 +29,7 @@ from .document_templates import metadata_search_text, normalize_field_definition
 from .metadata_search import apply_typed_predicates, decorate_sources, metadata_coverage, predicate_coverage
 from .metadata_extraction import JOB_TYPE as METADATA_JOB_TYPE, process_metadata_job, queue_metadata_extraction
 from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
+from .data_quality import build_document_quality_report
 from .openrouter import OpenRouterClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
@@ -1170,16 +1171,22 @@ def enrich_sources_with_file_links(db: Session, sources: list[dict], *, base_url
                 Document.id.in_(doc_ids), Document.deleted_at.is_(None),
             ).all()
         }
+    quality_by_document = {}
     for source in sources:
         document = documents.get(source.get("document_id"))
+        if document and document.id not in quality_by_document:
+            quality_by_document[document.id] = build_document_quality_report(db, document)
         if not document or not document_file_available(document):
             source.setdefault("original_filename", None)
             source.setdefault("mime_type", None)
             source.setdefault("download_url", None)
+            if document:
+                source["quality"] = quality_by_document[document.id]
             continue
         source["original_filename"] = document.original_filename
         source["mime_type"] = document.mime_type
         source["download_url"] = document_download_url(document.id, base_url=base_url)
+        source["quality"] = quality_by_document[document.id]
     return sources
 
 
@@ -3623,6 +3630,7 @@ def build_structured_references(sources: list[dict]) -> list[dict]:
             "relevance": source.get("relevance"),
             "source_url": source.get("source_uri"),
             "provenance": source.get("provenance"),
+            "quality": source.get("quality"),
         })
     return references
 

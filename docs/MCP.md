@@ -69,6 +69,15 @@ claude mcp add --transport http softnix-knowledge "https://your-softnix-host/mcp
 - `references[]` — แหล่งอ้างอิงรูปแบบคงที่สำหรับ citation card, evidence drawer และ PDF preview
 - `sources[]` — ข้อมูล retrieval เดิมสำหรับ backward compatibility; frontend ใหม่ควรใช้ `references`
 
+แต่ละ `references[]` มี `quality` ตาม contract `ski.quality.v1` เพื่อให้ Agent และ frontend ประเมินความพร้อมของหลักฐานได้โดยไม่เดาจากสถานะ processing:
+
+- `status` — `not_queryable`, `needs_review`, `ai_ready` หรือ `verified`
+- `score` และ `dimensions` — คะแนนรวมและคะแนน content, structure, metadata, retrieval, citation และ graph
+- `blockers[]` — ปัญหาที่ทำให้เอกสารยังไม่ควรถูกใช้ตอบ
+- `warnings[]` — เอกสารยังใช้ได้ แต่ Agent ควรแจ้งข้อจำกัดหรือเลือกหลักฐานที่ดีกว่า
+
+Agent ต้องไม่ใช้ reference ที่เป็น `not_queryable`; สำหรับ `needs_review` ให้แสดงข้อจำกัดจาก `warnings` และยังต้องอ้างอิงข้อความหลักฐานตามปกติ คะแนนคุณภาพใช้ประกอบการเลือกแหล่งข้อมูล ไม่ใช้แทน relevance ของคำถาม
+
 ตัวอย่าง:
 
 ```json

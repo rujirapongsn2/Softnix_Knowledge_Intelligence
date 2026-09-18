@@ -2,6 +2,29 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://knowledge.softnix.ai/schemas/ski-answer-v1.schema.json",
   "title": "Softnix Knowledge Intelligence answer",
+  "$defs": {
+    "qualityReport": {
+      "type": "object",
+      "required": ["schema_version", "status", "score", "blockers", "warnings", "dimensions", "metrics", "evaluated_at"],
+      "properties": {
+        "schema_version": { "const": "ski.quality.v1" },
+        "status": { "enum": ["not_queryable", "needs_review", "ai_ready", "verified"] },
+        "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "blockers": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "dimensions": {
+          "type": "object",
+          "required": ["content", "structure", "metadata", "retrieval", "citation", "graph"],
+          "additionalProperties": { "type": "integer", "minimum": 0, "maximum": 100 }
+        },
+        "metrics": { "type": "object" },
+        "content_revision": { "type": "string" },
+        "metadata_revision": { "type": "integer" },
+        "evaluated_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": true
+    }
+  },
   "type": "object",
   "required": ["schema_version", "answer", "claims", "references", "sources"],
   "properties": {
@@ -51,7 +74,13 @@
           "excerpt": { "type": ["string", "null"] },
           "relevance": { "type": ["number", "null"] },
           "source_url": { "type": ["string", "null"] },
-          "provenance": { "type": ["object", "null"] }
+          "provenance": { "type": ["object", "null"] },
+          "quality": {
+            "oneOf": [
+              { "$ref": "#/$defs/qualityReport" },
+              { "type": "null" }
+            ]
+          }
         },
         "additionalProperties": false
       }

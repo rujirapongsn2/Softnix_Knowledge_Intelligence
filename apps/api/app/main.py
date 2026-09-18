@@ -22,6 +22,7 @@ from .graph_store import Neo4jGraphStore
 from .legal_registry import provision_number_matches, resolve_instrument_statuses
 from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, Group, KbOwner, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, ROLE_ADMIN, TokenKey, TraceRun, TraceSpan, User
 from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, custom_template_fields, list_templates, merge_profile_fields, metadata_search_text, resolve_template, template_code, validate_metadata_values
+from .data_quality import build_document_quality_report
 from .metadata_search import describe_schema
 from .metadata_extraction import queue_metadata_extraction, update_status as update_metadata_status
 from .observability import metrics, now
@@ -976,7 +977,8 @@ def document_text(document_id: str, user: User = Depends(current_admin), db: Ses
     return {"document_id": doc.id, "status": doc.status, "document_type": doc.document_type, "metadata_template_id": doc.metadata_template_id,
             "metadata_template_name": doc.metadata_template_name, "metadata_template_version": doc.metadata_template_version,
             "metadata_template_fields": doc.metadata_template_fields or [],
-            "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata}
+            "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata,
+            "quality": build_document_quality_report(db, doc)}
 
 
 def resolve_document_file(doc: Document) -> Path:
@@ -2421,12 +2423,12 @@ def list_mcp_activity(limit: int = 50, _: User = Depends(current_admin), db: Ses
 
 MCP_TOOLS = [
     {"name": "describe_knowledge_schema", "description": "Discover authorized metadata templates, typed filter operators, and paginated coverage. Unknown metadata does not mean no matching documents.", "inputSchema": {"type": "object", "additionalProperties": False, "properties": {"offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}}},
-    {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning. Returns ski.answer.v1 structuredContent with answer, claims, references, and backward-compatible sources.", "inputSchema": QueryRequest.model_json_schema()},
+    {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning. Returns ski.answer.v1 structuredContent with answer, claims, references, and backward-compatible sources. Each reference includes ski.quality.v1; never use not_queryable evidence and disclose warnings for needs_review evidence.", "inputSchema": QueryRequest.model_json_schema()},
     {"name": "document_inventory_summary", "description": "Count and group non-deleted documents from the scoped document and legal registries", "inputSchema": DocumentInventoryRequest.model_json_schema()},
     {"name": "find_entities", "description": "Find entities by name or alias", "inputSchema": {"type": "object", "properties": {"search_text": {"type": "string"}}, "required": ["search_text"]}},
     {"name": "analyze_relationships", "description": "Analyze entity relationships", "inputSchema": {"type": "object", "properties": {"subjects": {"type": "array"}, "question": {"type": "string"}}, "required": ["subjects", "question"]}},
     {"name": "analyze_impact", "description": "Analyze direct and indirect impact", "inputSchema": ImpactRequest.model_json_schema()},
-    {"name": "get_sources", "description": "Retrieve the ski.answer.v1 answer, claims, references, and backward-compatible sources for a saved result", "inputSchema": {"type": "object", "properties": {"result_id": {"type": "string"}}, "required": ["result_id"]}},
+    {"name": "get_sources", "description": "Retrieve the ski.answer.v1 answer, claims, references, quality signals, and backward-compatible sources for a saved result", "inputSchema": {"type": "object", "properties": {"result_id": {"type": "string"}}, "required": ["result_id"]}},
     {"name": "resolve_legal_context", "description": "Resolve the in-force legal instruments and provisions relevant to a query within this MCP key's scope", "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 10000}, "as_of_date": {"type": "string", "format": "date"}, "include_historical": {"type": "boolean"}}, "required": ["query"]}},
     {"name": "get_legal_instrument", "description": "Get one legal instrument, its family and reviewed cross-document relations", "inputSchema": {"type": "object", "properties": {"instrument_id": {"type": "string"}}, "required": ["instrument_id"]}},
     {"name": "get_provision_history", "description": "List document versions containing a legal provision, scoped to the MCP key", "inputSchema": {"type": "object", "properties": {"instrument_id": {"type": "string"}, "provision_number": {"type": "string", "maxLength": 120}}, "required": ["instrument_id", "provision_number"]}},

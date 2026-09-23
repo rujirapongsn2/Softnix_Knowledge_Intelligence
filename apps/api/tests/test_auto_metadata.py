@@ -224,7 +224,7 @@ def test_multi_select_upload_validation_indexing_and_typed_filters():
             files={"file": ("invalid.txt", b"Category test", "text/plain")},
         )
         assert response.status_code == 400
-        assert response.json()["detail"]["code"] == "DOCUMENT_METADATA_INVALID"
+        assert response.json()["error"]["code"] == "DOCUMENT_METADATA_INVALID"
 
     with SessionLocal() as db:
         sync_document_metadata_values(db, db.get(Document, doc_id))

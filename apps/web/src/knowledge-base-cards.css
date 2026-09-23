@@ -1,0 +1,230 @@
+.kb-hub-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  gap: 1.25rem;
+}
+
+.kb-hub-card {
+  overflow: hidden;
+  padding: 0;
+  gap: 0;
+  border-radius: 16px;
+}
+
+.kb-cover {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  background: linear-gradient(135deg, #e9f4f7 0%, #d3e9ee 52%, #bcdde4 100%);
+}
+
+.kb-cover-open {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.kb-cover-open:focus-visible {
+  outline: 3px solid var(--color-kumo-brand, #2786c2);
+  outline-offset: -4px;
+}
+
+.kb-cover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform 180ms ease;
+}
+
+.kb-hub-card:hover .kb-cover img {
+  transform: scale(1.025);
+}
+
+.kb-cover-placeholder {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  color: #126e7a;
+  background:
+    radial-gradient(circle at 76% 24%, rgba(255,255,255,.75) 0 8%, transparent 9%),
+    linear-gradient(145deg, rgba(255,255,255,.44), transparent 58%);
+}
+
+.kb-cover-placeholder svg {
+  filter: drop-shadow(0 5px 10px rgba(13, 104, 116, .18));
+}
+
+.kb-cover-actions {
+  position: absolute;
+  right: .65rem;
+  top: .65rem;
+  display: flex;
+  gap: .4rem;
+}
+
+.kb-cover-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid rgba(255,255,255,.7);
+  border-radius: 8px;
+  color: #18232f;
+  background: rgba(255,255,255,.88);
+  box-shadow: 0 3px 12px rgba(19, 38, 48, .16);
+  font: inherit;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+}
+
+.kb-cover-action:hover {
+  background: #fff;
+}
+
+.kb-cover-action:focus-within,
+.kb-cover-action:focus-visible {
+  outline: 3px solid rgba(39, 134, 194, .4);
+  outline-offset: 2px;
+}
+
+.kb-cover-action input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.kb-cover-action > span:not(.kb-cover-spinner) {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.kb-cover-remove {
+  color: #5f6973;
+}
+
+.kb-cover-remove:hover {
+  color: #a62424;
+  background: #fff5f5;
+}
+
+.kb-cover-spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid rgba(39, 134, 194, .25);
+  border-top-color: #2786c2;
+  border-radius: 50%;
+  animation: kb-cover-spin .7s linear infinite;
+}
+
+@keyframes kb-cover-spin { to { transform: rotate(360deg); } }
+
+.kb-hub-card > .kb-hub-open {
+  justify-items: stretch;
+  gap: .5rem;
+  padding: 1rem 1rem .7rem;
+  text-align: left;
+}
+
+.kb-hub-title-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: .55rem;
+}
+
+.kb-hub-title-row .kb-hub-avatar {
+  width: 34px;
+  height: 34px;
+  margin: 0;
+  border-radius: 9px;
+}
+
+.kb-hub-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 1.05rem;
+}
+
+.kb-hub-description {
+  display: -webkit-box;
+  min-height: 2.65em;
+  overflow: hidden;
+  color: var(--text-color-kumo-subtle, var(--color-text-secondary));
+  font-size: .86rem;
+  line-height: 1.4;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.kb-hub-code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kb-hub-link {
+  justify-self: start;
+}
+
+.kb-hub-actions {
+  justify-content: flex-start;
+  padding: 0 1rem .8rem;
+}
+
+.kb-hub-card > details {
+  margin: 0 1rem 1rem;
+}
+
+.kb-hub-create {
+  min-height: 360px;
+}
+
+.kb-hub-create-trigger {
+  align-self: stretch;
+  align-content: center;
+  min-height: 358px;
+  padding: 0;
+}
+
+.kb-hub-create-preview {
+  display: grid;
+  place-items: center;
+  width: calc(100% - 2rem);
+  aspect-ratio: 16 / 10;
+  border: 1px dashed rgba(39, 134, 194, .45);
+  border-radius: 12px;
+  color: #2786c2;
+  background: rgba(39, 134, 194, .06);
+}
+
+.kb-hub-create.open {
+  min-height: auto;
+  padding: 1rem;
+}
+
+@media (max-width: 560px) {
+  .kb-hub-grid { grid-template-columns: 1fr; }
+  .kb-cover-action { width: 34px; height: 34px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kb-cover img { transition: none; }
+  .kb-cover-spinner { animation-duration: 1.4s; }
+}

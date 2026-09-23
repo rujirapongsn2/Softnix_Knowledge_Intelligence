@@ -29,7 +29,7 @@ from .document_templates import metadata_search_text, normalize_field_definition
 from .metadata_search import apply_typed_predicates, decorate_sources, metadata_coverage, predicate_coverage
 from .metadata_extraction import JOB_TYPE as METADATA_JOB_TYPE, process_metadata_job, queue_metadata_extraction
 from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
-from .data_quality import build_document_quality_report
+from .data_quality import build_document_quality_reports
 from .openrouter import OpenRouterClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
@@ -173,15 +173,18 @@ def sync_document_metadata_values(db: Session, document: Document) -> None:
         value = values.get(key) if key else None
         if not field.get("filterable") or value in (None, ""):
             continue
-        db.add(DocumentMetadataValue(
-            knowledge_base_id=document.knowledge_base_id,
-            document_id=document.id,
-            field_key=key,
-            value_text=str(value)[:10000],
-            value_type=field.get("field_type", "text"),
-            value_number=value if field.get("field_type") == "number" else None,
-            value_date=date.fromisoformat(value) if field.get("field_type") == "date" else None,
-        ))
+        field_type = field.get("field_type", "text")
+        indexed_values = value if field_type == "multi_select" else [value]
+        for item in indexed_values:
+            db.add(DocumentMetadataValue(
+                knowledge_base_id=document.knowledge_base_id,
+                document_id=document.id,
+                field_key=key,
+                value_text=str(item)[:10000],
+                value_type=field_type,
+                value_number=item if field_type == "number" else None,
+                value_date=date.fromisoformat(item) if field_type == "date" else None,
+            ))
     db.flush()
 
 
@@ -220,40 +223,42 @@ def sync_document_metadata_graph(db: Session, document: Document) -> dict[str, i
     entity_count, relationship_count = int(created_anchor), 0
     for field in mapped:
         raw_value = document.document_metadata.get(field["key"])
-        value = str(raw_value).strip()[:500]
-        entity_type = str(field["graph_entity_type"]).strip()[:100]
-        relationship_type = str(field["graph_relationship"]).strip().upper()
-        identity_key = f"metadata:{entity_type.casefold()}:{canonical_entity_name(value)}"
-        target = db.query(Entity).filter_by(knowledge_base_id=document.knowledge_base_id,
-                                             identity_key=identity_key, entity_type=entity_type).first()
-        if not target:
-            target = Entity(knowledge_base_id=document.knowledge_base_id, name=value,
-                            canonical_name=canonical_entity_name(value), identity_key=identity_key,
-                            entity_type=entity_type, confidence=1.0, origin="metadata",
-                            review_status="verified", is_legal=False,
-                            attributes={"metadata_field": field["key"]})
-            db.add(target); db.flush()
-            db.add(GraphProjectionEvent(event_type="entity", entity_id=target.id))
-            entity_count += 1
-        else:
-            target.deleted_at = None
-        excerpt = f"{field.get('label') or field['key']}: {value}"[:5000]
-        if not db.query(EntitySource).filter_by(entity_id=target.id, document_id=document.id, excerpt=excerpt).first():
-            db.add(EntitySource(entity_id=target.id, document_id=document.id, excerpt=excerpt)); target.source_count += 1
-        edge = db.query(Relationship).filter_by(knowledge_base_id=document.knowledge_base_id,
-                                                source_entity_id=anchor.id, target_entity_id=target.id,
-                                                relationship_type=relationship_type).first()
-        if not edge:
-            edge = Relationship(knowledge_base_id=document.knowledge_base_id, source_entity_id=anchor.id,
-                                target_entity_id=target.id, relationship_type=relationship_type,
-                                description=excerpt, confidence=1.0, origin="metadata",
-                                review_status="verified", is_legal=False)
-            db.add(edge); db.flush(); relationship_count += 1
-            db.add(GraphProjectionEvent(event_type="relationship", relationship_id=edge.id))
-        else:
-            edge.deleted_at, edge.description, edge.origin, edge.review_status = None, excerpt, "metadata", "verified"
-        if not db.query(RelationshipSource).filter_by(relationship_id=edge.id, document_id=document.id, excerpt=excerpt).first():
-            db.add(RelationshipSource(relationship_id=edge.id, document_id=document.id, excerpt=excerpt)); edge.source_count += 1
+        field_values = raw_value if field.get("field_type") == "multi_select" else [raw_value]
+        for raw_item in field_values:
+            value = str(raw_item).strip()[:500]
+            entity_type = str(field["graph_entity_type"]).strip()[:100]
+            relationship_type = str(field["graph_relationship"]).strip().upper()
+            identity_key = f"metadata:{entity_type.casefold()}:{canonical_entity_name(value)}"
+            target = db.query(Entity).filter_by(knowledge_base_id=document.knowledge_base_id,
+                                                 identity_key=identity_key, entity_type=entity_type).first()
+            if not target:
+                target = Entity(knowledge_base_id=document.knowledge_base_id, name=value,
+                                canonical_name=canonical_entity_name(value), identity_key=identity_key,
+                                entity_type=entity_type, confidence=1.0, origin="metadata",
+                                review_status="verified", is_legal=False,
+                                attributes={"metadata_field": field["key"]})
+                db.add(target); db.flush()
+                db.add(GraphProjectionEvent(event_type="entity", entity_id=target.id))
+                entity_count += 1
+            else:
+                target.deleted_at = None
+            excerpt = f"{field.get('label') or field['key']}: {value}"[:5000]
+            if not db.query(EntitySource).filter_by(entity_id=target.id, document_id=document.id, excerpt=excerpt).first():
+                db.add(EntitySource(entity_id=target.id, document_id=document.id, excerpt=excerpt)); target.source_count += 1
+            edge = db.query(Relationship).filter_by(knowledge_base_id=document.knowledge_base_id,
+                                                    source_entity_id=anchor.id, target_entity_id=target.id,
+                                                    relationship_type=relationship_type).first()
+            if not edge:
+                edge = Relationship(knowledge_base_id=document.knowledge_base_id, source_entity_id=anchor.id,
+                                    target_entity_id=target.id, relationship_type=relationship_type,
+                                    description=excerpt, confidence=1.0, origin="metadata",
+                                    review_status="verified", is_legal=False)
+                db.add(edge); db.flush(); relationship_count += 1
+                db.add(GraphProjectionEvent(event_type="relationship", relationship_id=edge.id))
+            else:
+                edge.deleted_at, edge.description, edge.origin, edge.review_status = None, excerpt, "metadata", "verified"
+            if not db.query(RelationshipSource).filter_by(relationship_id=edge.id, document_id=document.id, excerpt=excerpt).first():
+                db.add(RelationshipSource(relationship_id=edge.id, document_id=document.id, excerpt=excerpt)); edge.source_count += 1
     db.flush()
     return {"entities": entity_count, "relationships": relationship_count}
 
@@ -1162,7 +1167,18 @@ def enrich_sources_with_file_links(db: Session, sources: list[dict], *, base_url
     """
     if not sources:
         return sources
-    doc_ids = {source.get("document_id") for source in sources if source.get("document_id")}
+    unresolved_doc_ids = {
+        source.get("document_id") for source in sources
+        if source.get("document_id") and not isinstance(source.get("quality"), dict)
+    }
+    doc_ids = {
+        source.get("document_id") for source in sources
+        if source.get("document_id") and (
+            source.get("document_id") in unresolved_doc_ids or "download_url" not in source
+        )
+    }
+    if not doc_ids:
+        return sources
     documents = {}
     if doc_ids:
         documents = {
@@ -1171,23 +1187,72 @@ def enrich_sources_with_file_links(db: Session, sources: list[dict], *, base_url
                 Document.id.in_(doc_ids), Document.deleted_at.is_(None),
             ).all()
         }
-    quality_by_document = {}
+    quality_by_document = build_document_quality_reports(
+        db, [document for document in documents.values() if document.id in unresolved_doc_ids],
+        include_page_details=False,
+    )
     for source in sources:
         document = documents.get(source.get("document_id"))
-        if document and document.id not in quality_by_document:
-            quality_by_document[document.id] = build_document_quality_report(db, document)
+        if document and not isinstance(source.get("quality"), dict):
+            source["quality"] = quality_by_document[document.id]
         if not document or not document_file_available(document):
             source.setdefault("original_filename", None)
             source.setdefault("mime_type", None)
             source.setdefault("download_url", None)
-            if document:
-                source["quality"] = quality_by_document[document.id]
             continue
         source["original_filename"] = document.original_filename
         source["mime_type"] = document.mime_type
         source["download_url"] = document_download_url(document.id, base_url=base_url)
-        source["quality"] = quality_by_document[document.id]
     return sources
+
+
+def exclude_not_queryable_sources(sources: list[dict], warnings: list[dict] | None = None) -> set[str]:
+    """Remove evidence that failed a hard readiness gate and report what changed."""
+    def has_verified_registry_evidence(source: dict) -> bool:
+        provenance = source.get("provenance")
+        return bool(
+            isinstance(provenance, dict)
+            and provenance.get("origin") == "verified_legal_relation"
+            and provenance.get("review_status") == "verified"
+            and str(source.get("excerpt") or "").strip()
+        )
+
+    blocked = [
+        source for source in sources
+        if source.get("quality", {}).get("status") == "not_queryable"
+        and not has_verified_registry_evidence(source)
+    ]
+    if not blocked:
+        return set()
+    blocked_object_ids = {id(source) for source in blocked}
+    blocked_ids = {str(source.get("citation_id")) for source in blocked if source.get("citation_id")}
+    sources[:] = [source for source in sources if id(source) not in blocked_object_ids]
+    if warnings is not None:
+        warnings.append({
+            "code": "DATA_QUALITY_SOURCE_EXCLUDED",
+            "detail": "Evidence with a not_queryable quality status was excluded before composing the answer.",
+            "citation_ids": sorted(blocked_ids),
+        })
+    return blocked_ids
+
+
+def _safe_answer_after_quality_filter(result: dict, blocked_ids: set[str]) -> None:
+    if not blocked_ids:
+        return
+    sources = result.get("sources") if isinstance(result.get("sources"), list) else []
+    result["answer"] = compose_cited_answer(RetrievalEvidence(sources, [], [], [], None), result.get("warnings"))
+    result["insufficient_evidence"] = not bool(sources)
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    metadata["citation_ids"] = [source.get("citation_id") for source in sources]
+    answer_contract = metadata.get("answer_contract")
+    if isinstance(answer_contract, dict):
+        answer_contract["claim_citations"] = metadata["citation_ids"]
+        if not sources:
+            answer_contract["status"] = "insufficient"
+    response_summary = metadata.get("response_summary")
+    if isinstance(response_summary, dict):
+        response_summary["source_count"] = len(sources)
+        response_summary["insufficient_evidence"] = not bool(sources)
 
 
 def _persist_query_result(db: Session, result: dict, token_id: str | None = None, *, base_url: str | None = None) -> dict:
@@ -1195,6 +1260,9 @@ def _persist_query_result(db: Session, result: dict, token_id: str | None = None
     sources = result.get("sources")
     if isinstance(sources, list):
         enrich_sources_with_file_links(db, sources, base_url=base_url or public_document_base_url())
+        warnings = result.setdefault("warnings", [])
+        blocked_ids = exclude_not_queryable_sources(sources, warnings if isinstance(warnings, list) else None)
+        _safe_answer_after_quality_filter(result, blocked_ids)
         result["sources"] = sanitize_source_reference_urls(sources)
     apply_answer_reference_contract(result)
     saved = QueryResult(token_key_id=token_id, result_json=result, expires_at=datetime.utcnow() + timedelta(minutes=30))
@@ -1624,6 +1692,10 @@ def build_legal_provenance_result(db: Session, query: str, kb_ids: list[str], to
             "version_role": instrument.version_role, "version_date": instrument.version_date.isoformat() if instrument.version_date else None,
             "source_uri": instrument.source_uri, "source_reference": instrument.source_reference,
             "legal_label": instrument.official_title or title,
+            "provenance": {
+                "origin": "verified_legal_relation", "review_status": relation.review_status,
+                "relation_id": relation.id,
+            },
         })
         target = targets.get(relation.target_instrument_id)
         if target:
@@ -1649,6 +1721,10 @@ def build_legal_provenance_result(db: Session, query: str, kb_ids: list[str], to
                 "version_date": target_instrument.version_date.isoformat() if target_instrument.version_date else None,
                 "source_uri": target_instrument.source_uri, "source_reference": target_instrument.source_reference,
                 "legal_label": target_instrument.official_title or target_document.title or target_document.original_filename,
+                "provenance": {
+                    "origin": "verified_legal_relation", "review_status": relation.review_status,
+                    "relation_id": relation.id,
+                },
             })
             statement_citations.append(target_citation_id)
         statements.append(f"มาตรา {provision} {action}โดย {instrument.official_title or title} {' '.join(f'[{item}]' for item in statement_citations)}")
@@ -3781,6 +3857,12 @@ def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: 
     # Attach PDF download links before composing answer prose so citation
     # details can prefer SKI download_url and never emit OCS source_uri.
     enrich_sources_with_file_links(db, evidence.sources, base_url=public_document_base_url())
+    blocked_citation_ids = exclude_not_queryable_sources(evidence.sources, legal_warnings)
+    if evidence.answer and blocked_citation_ids.intersection(_CITATION_RE.findall(evidence.answer)):
+        # Never preserve generated prose whose supporting evidence failed a
+        # hard quality gate. The composer will return the remaining evidence
+        # list, or an insufficient-evidence response when none remains.
+        evidence.answer = None
     answer = compose_cited_answer(evidence, legal_warnings)
     if any(item["unknown_or_not_filterable"] for item in predicate_coverage(db, kb_ids, getattr(query_filters, "metadata_predicates", []))):
         answer += "\nยังมีเอกสารที่ metadata ไม่ครบหรือไม่ได้เปิดให้กรอง จึงไม่ควรใช้ผลการค้นหานี้สรุปว่าไม่มีเอกสารอื่นตรงเงื่อนไข"

@@ -1,4 +1,5 @@
 """Download original document file endpoint."""
+import hashlib
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -6,8 +7,10 @@ from urllib.parse import urlsplit
 from fastapi.testclient import TestClient
 
 from app.db import SessionLocal
+from app.data_quality import _has_value
 from app.main import app
-from app.models import Document, QueryResult
+from app.models import Document, DocumentChunk, QueryResult
+from app.services import exclude_not_queryable_sources
 
 
 def client():
@@ -54,6 +57,21 @@ def test_document_file_download_missing_disk_file_returns_404():
         path = Path(doc.storage_path)
         assert path.is_file()
         path.unlink()
+        indexed_text = "Indexed text remains usable, but its source file is missing."
+        doc.status = "completed"
+        doc.extracted_text = indexed_text
+        db.add(DocumentChunk(
+            document_id=doc.id,
+            knowledge_base_id=doc.knowledge_base_id,
+            chunk_index=0,
+            content=indexed_text,
+            content_sha256=hashlib.sha256(indexed_text.encode()).hexdigest(),
+            char_start=0,
+            char_end=len(indexed_text),
+            token_count=10,
+            embedding=[0.0] * 1536,
+        ))
+        db.commit()
     quality = test_client.get(f"/api/v1/documents/{doc_id}/text").json()["quality"]
     assert quality["schema_version"] == "ski.quality.v1"
     assert quality["status"] == "not_queryable"
@@ -133,6 +151,15 @@ def test_search_knowledge_sources_include_download_url():
     assert quality["blockers"] == []
     assert quality["metrics"]["chunks"] >= 1
     assert quality["metrics"]["embedding_coverage"] == 1
+    assert "pages" in quality["metrics"]
+    kb_quality = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/quality-readiness").json()
+    assert kb_quality["schema_version"] == "ski.kb-quality.v1"
+    assert kb_quality["aggregation_method"] == "equal_weight_mean"
+    assert kb_quality["document_count"] == 1
+    assert kb_quality["score"] == quality["score"]
+    assert kb_quality["dimensions"] == quality["dimensions"]
+    assert kb_quality["documents"][0]["document_id"] == uploaded["document_id"]
+    assert kb_quality["documents"][0]["score"] == quality["score"]
     token = test_client.post("/api/v1/tokens", json={
         "name": "citation-agent",
         "allowed_knowledge_base_ids": [kb["id"]],
@@ -159,6 +186,7 @@ def test_search_knowledge_sources_include_download_url():
     assert reference["file"]["access"]["authentication"] == "bearer_or_session"
     assert reference["quality"]["schema_version"] == "ski.quality.v1"
     assert reference["quality"]["blockers"] == []
+    assert "pages" not in reference["quality"]["metrics"]
     assert structured["claims"]
     assert reference["id"] in structured["claims"][0]["reference_ids"]
     # get_sources must return the same enriched fields from stored result_json
@@ -198,6 +226,110 @@ def test_search_knowledge_sources_include_download_url():
     file_response = test_client.get(expected_download_path, headers=headers)
     assert file_response.status_code == 200
     assert file_response.content == b"AlphaWidget runs on NODE-42."
+
+    # A source that fails a hard readiness gate must be removed before the
+    # MCP answer/reference contract is built, rather than relying on the Agent
+    # to notice the quality field after it has already received an answer.
+    with SessionLocal() as db:
+        document = db.get(Document, uploaded["document_id"])
+        document.extracted_text = ""
+        db.query(DocumentChunk).filter(DocumentChunk.document_id == document.id).update({"content": " \n\t "})
+        db.commit()
+    blocked_reply = test_client.post("/mcp", headers=headers, json={
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": "search_knowledge", "arguments": {"query": "What runs on NODE-42?"}},
+    }).json()["result"]["structuredContent"]
+    assert blocked_reply["sources"] == []
+    assert blocked_reply["references"] == []
+    assert blocked_reply["insufficient_evidence"] is True
+
+
+def test_quality_gate_excludes_unusable_evidence_and_preserves_verified_registry_facts():
+    sources = [
+        {"citation_id": "S1", "excerpt": "unusable", "quality": {"status": "not_queryable"}},
+        {
+            "citation_id": "S2", "excerpt": "มาตรา 7 ถูกยกเลิก",
+            "quality": {"status": "not_queryable"},
+            "provenance": {"origin": "verified_legal_relation", "review_status": "verified"},
+        },
+    ]
+    warnings = []
+    blocked = exclude_not_queryable_sources(sources, warnings)
+    assert blocked == {"S1"}
+    assert [source["citation_id"] for source in sources] == ["S2"]
+    assert warnings[0]["code"] == "DATA_QUALITY_SOURCE_EXCLUDED"
+
+
+def test_quality_metadata_presence_rejects_blank_and_empty_values():
+    assert not _has_value(None)
+    assert not _has_value("")
+    assert not _has_value("   ")
+    assert not _has_value([])
+    assert not _has_value({})
+    assert _has_value("value")
+    assert _has_value(["value"])
+    assert _has_value(False)
+
+
+def test_empty_knowledge_base_quality_has_explicit_not_available_status():
+    test_client = next(client())
+    kb = test_client.post(
+        "/api/v1/knowledge-bases",
+        json={"name": "Empty Quality", "code": f"empty-quality-{uuid.uuid4().hex[:8]}"},
+    ).json()
+    quality = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/quality-readiness").json()
+    assert quality["score"] == 0
+    assert quality["status"] == "not_available"
+    assert quality["document_count"] == 0
+    assert quality["documents"] == []
+
+
+def test_knowledge_base_quality_paginates_uses_cache_and_excludes_deleted_documents():
+    test_client = next(client())
+    suffix = uuid.uuid4().hex[:8]
+    kb = test_client.post(
+        "/api/v1/knowledge-bases",
+        json={"name": f"Aggregate Quality {suffix}", "code": f"aggregate-quality-{suffix}"},
+    ).json()
+    assert test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/activate").status_code == 200
+    document_ids = []
+    for index in range(2):
+        uploaded = test_client.post(
+            f"/api/v1/knowledge-bases/{kb['id']}/documents",
+            files={"file": (f"quality-{index}.txt", f"Evidence document {index} with useful content.".encode(), "text/plain")},
+        ).json()
+        document_ids.append(uploaded["document_id"])
+    for _ in range(40):
+        statuses = [test_client.get(f"/api/v1/documents/{document_id}/text").json()["status"] for document_id in document_ids]
+        if all(status == "completed" for status in statuses):
+            break
+        test_client.post("/api/v1/internal/process-next")
+    else:
+        raise AssertionError("aggregate quality documents did not complete processing")
+
+    with SessionLocal() as db:
+        blocked = db.get(Document, document_ids[1])
+        blocked.extracted_text = ""
+        db.query(DocumentChunk).filter(DocumentChunk.document_id == blocked.id).update({"content": "   "})
+        db.commit()
+
+    first = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/quality-readiness?limit=1").json()
+    assert first["document_count"] == 2
+    assert first["document_limit"] == 1
+    assert first["document_offset"] == 0
+    assert len(first["documents"]) == 1
+    assert first["documents"][0]["document_id"] == document_ids[1]
+    assert first["documents"][0]["status"] == "not_queryable"
+
+    cached = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/quality-readiness?limit=1").json()
+    assert cached["documents"][0]["evaluated_at"] == first["documents"][0]["evaluated_at"]
+    second_page = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/quality-readiness?limit=1&offset=1").json()
+    assert second_page["documents"][0]["document_id"] == document_ids[0]
+
+    assert test_client.delete(f"/api/v1/documents/{document_ids[1]}").status_code == 200
+    after_delete = test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/quality-readiness?limit=1").json()
+    assert after_delete["document_count"] == 1
+    assert after_delete["documents"][0]["document_id"] == document_ids[0]
 
 
 def test_document_file_download_soft_deleted_returns_404():

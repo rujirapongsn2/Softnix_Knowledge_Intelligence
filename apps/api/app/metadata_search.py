@@ -14,7 +14,7 @@ class MetadataPredicate(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     template_id: str = Field(min_length=1, max_length=120)
     field_key: str = Field(min_length=1, max_length=80)
-    field_type: Literal["text", "textarea", "select", "boolean", "date", "number"]
+    field_type: Literal["text", "textarea", "select", "multi_select", "boolean", "date", "number"]
     operator: Literal["eq", "in", "gte", "lte"] = "eq"
     values: list[StrictStr | StrictInt | StrictFloat | StrictBool] = Field(min_length=1, max_length=30)
 
@@ -97,8 +97,8 @@ def describe_schema(db, kb_ids, offset=0, limit=200):
             count["available" if field["key"] in (doc.document_metadata or {}) else "unknown"] += 1
     return {"templates": list(definitions.values()), "total_documents": total, "offset": offset,
             "next_offset": offset + len(documents) if offset + len(documents) < total else None,
-            "coverage_scope": "document_page", "operators": {"text": ["eq", "in"], "textarea": ["eq", "in"], "select": ["eq", "in"], "boolean": ["eq", "in"], "date": ["eq", "in", "gte", "lte"], "number": ["eq", "in", "gte", "lte"]},
-            "guidance": "Use explicit user constraints as filters. Never filter on inferred document types. Unknown metadata is not evidence of absence. Follow next_offset for historical snapshots and coverage."}
+            "coverage_scope": "document_page", "operators": {"text": ["eq", "in"], "textarea": ["eq", "in"], "select": ["eq", "in"], "multi_select": ["eq", "in"], "boolean": ["eq", "in"], "date": ["eq", "in", "gte", "lte"], "number": ["eq", "in", "gte", "lte"]},
+            "guidance": "Use explicit user constraints as filters. For multi_select fields, eq/in matches documents containing any requested option. Never filter on inferred document types. Unknown metadata is not evidence of absence. Follow next_offset for historical snapshots and coverage."}
 
 
 def decorate_sources(db, sources, kb_ids, requested_keys=()):

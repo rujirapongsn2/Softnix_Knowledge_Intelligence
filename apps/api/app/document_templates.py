@@ -73,7 +73,15 @@ def metadata_search_text(fields: list[dict[str, Any]] | None, values: dict[str, 
     # useful for reproducible indexing, audits, and tests even though the
     # retrieval predicate treats it as plain text.
     keys = [field.get("key") for field in normalize_field_definitions(fields) if field.get("searchable", True)]
-    parts = [str(values[key]).strip() for key in keys if key and key in values and values[key] not in (None, "")]
+    parts = []
+    for key in keys:
+        if not key or key not in values or values[key] is None or values[key] == "":
+            continue
+        value = values[key]
+        if isinstance(value, list):
+            parts.extend(str(item).strip() for item in value if item is not None and str(item).strip())
+        else:
+            parts.append(str(value).strip())
     return " ".join(parts)[:10000]
 
 
@@ -131,7 +139,7 @@ def validate_metadata_values(fields: list[dict[str, Any]], values: dict[str, Any
     result: dict[str, Any] = {}
     for key, field in allowed.items():
         value = values.get(key)
-        if value in (None, ""):
+        if value is None or value == "" or value == []:
             if field.get("required") and not (allow_extraction_pending and field.get("fill_mode") == "extract"):
                 raise ValueError("DOCUMENT_METADATA_REQUIRED")
             continue
@@ -151,6 +159,12 @@ def validate_metadata_values(fields: list[dict[str, Any]], values: dict[str, Any
                 raise ValueError("DOCUMENT_METADATA_INVALID") from exc
         if kind == "select" and value not in field.get("options", []):
             raise ValueError("DOCUMENT_METADATA_INVALID")
+        if kind == "multi_select":
+            options = field.get("options", [])
+            if (not isinstance(value, list) or len(value) > len(options)
+                    or any(not isinstance(item, str) or item not in options for item in value)
+                    or len(set(value)) != len(value)):
+                raise ValueError("DOCUMENT_METADATA_INVALID")
         result[key] = value
     return result
 

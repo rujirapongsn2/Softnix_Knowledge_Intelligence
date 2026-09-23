@@ -70,10 +70,16 @@ curl "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documen
     "code": "supplier-invoice",
     "name": "Supplier invoice",
     "base_document_type": "general",
-    "fields": [{"key": "invoice_no", "label": "Invoice number", "field_type": "text"}]
+    "fields": [
+      {"key": "invoice_no", "label": "Invoice number", "field_type": "text"},
+      {"key": "categories", "label": "Categories", "field_type": "multi_select", "options": ["ประกาศ", "ที่ดิน"]}
+    ]
   }]
 }
 ```
+
+ฟิลด์ `multi_select` รับค่าเป็น JSON array ของ string โดยทุกค่าต้องตรงกับ `options`
+ที่ Document Type กำหนด เช่น `{"categories":["ประกาศ", "ที่ดิน"]}`
 
 ใช้ค่า `id` กับ `document_type_id` ในการนำเข้า ตัวอย่างชนิดมาตรฐานคือ `system:general`,
 `system:legal`, `system:regulation` และ `system:contract` ส่วนชนิดแบบกำหนดเองใช้ id ที่ endpoint นี้คืนมา
@@ -100,6 +106,10 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
   -F "document_type_id=system:contract" \
   -F "published_at=2026-01-15"
 ```
+
+สำหรับฟิลด์ `multi_select` ให้ส่ง `metadata_json` เป็น JSON object เช่น
+`-F 'metadata_json={"categories":["ประกาศ","ที่ดิน"]}'`
+API ปฏิเสธค่าที่ไม่ใช่ array, ตัวเลือกที่ไม่มีใน `options` หรือค่าซ้ำใน array
 
 ตอบ **`202 Accepted`** เพราะงานเพียงเข้าคิว ยังประมวลผลไม่เสร็จ
 

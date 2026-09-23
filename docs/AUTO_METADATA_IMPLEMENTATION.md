@@ -13,7 +13,7 @@ This release implements the upload/extraction/review workflow and extends MCP re
 ## Trust and limits
 
 - Candidate quotes must occur verbatim in the extracted text. Each candidate carries character offsets, a SHA-256 of the text version, and extractor/template versions; no page number is invented.
-- Only a single literal text/select value with valid evidence and no conflict can be auto-accepted. Dates, numbers, booleans, graph-mapped fields, and fields marked **Always require review** need confirmation. Automatic acceptance is a conservative heuristic, not a calibrated accuracy score.
+- Only a single literal text/select value with valid evidence and no conflict can be auto-accepted. Multi-select values are arrays and remain reviewable; dates, numbers, booleans, graph-mapped fields, and fields marked **Always require review** also need confirmation. Automatic acceptance is a conservative heuristic, not a calibrated accuracy score.
 - Candidate values remain separate from effective metadata. Graph projection accepts human-verified or legacy manual values; AI candidates are never labeled verified.
 - The first release processes up to four 12,000-character windows per extraction. Longer documents are explicitly marked partial and no values are auto-accepted from that partial pass. Missing values and conflicts remain reviewable. Extraction retries provider availability errors up to three attempts.
 - Values already entered by users remain effective. Reprocessing changed text invalidates unlocked automatic values and their exact-filter projection. Publication checks document revision, source text and template version to discard results made stale by concurrent editing.
@@ -57,7 +57,7 @@ This release implements the upload/extraction/review workflow and extends MCP re
 }
 ```
 
-Predicates are ANDed, require a filterable field and matching type, and use indexed date/number columns. `eq` and `in` work for all supported field types; `gte` and `lte` are date/number only. String equality is exact and case-sensitive. Template identity prevents unrelated custom fields with the same key from matching each other. The legacy key-only filter remains compatible.
+Predicates are ANDed, require a filterable field and matching type, and use indexed date/number columns. `eq` and `in` work for all supported field types; for `multi_select`, either operator matches a document containing any requested option. `gte` and `lte` are date/number only. String equality is exact and case-sensitive. Template identity prevents unrelated custom fields with the same key from matching each other. The legacy key-only filter remains compatible.
 
 Unknown values do not satisfy explicit filters, and filters are never relaxed silently. Results include status and per-predicate coverage for authorized non-deleted documents; this scope is broader than a particular query's temporal/searchable subset. These counts must not be described as complete legal/current-document counts.
 
@@ -65,7 +65,7 @@ Search sources include effective searchable metadata, trust, source evidence and
 
 ## Database rollout
 
-Migration `0031_auto_metadata` adds document observation/status/revision columns and typed filter projections, then backfills typed values for existing indexed fields. It handles fresh installations whose initial migration creates tables from current models. Run the migration before starting the updated API/worker; deploy the matching web build too.
+Migration `0034_multi_select_metadata` allows multiple indexed values for one document field; it follows `0033_knowledge_base_cover` (which follows the automatic metadata and quality migrations). Run the migrations before starting the updated API/worker; deploy the matching web build too.
 
 For this repository's Compose setup:
 

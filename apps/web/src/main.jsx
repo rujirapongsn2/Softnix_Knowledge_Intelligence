@@ -1,7 +1,7 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {Theme, AppShell, Badge, Button, Card, CheckboxInput, CommandPalette, EmptyState, FileInput, ProgressBar, SideNav, SideNavHeading, SideNavItem, SideNavSection, Selector, TextArea, TextInput, Toast, TopNav, TopNavHeading, useDialogFocus} from "./ui.jsx";
-import {AppWindow, BookOpen, Buildings, ChartLineUp, CirclesThree, Cloud, Compass, Database, FileText, Gavel, GitBranch, HardDrives, Key, Lightbulb, MagnifyingGlass, Rows, Scales, ShieldCheck, SquaresFour, User, Users, UsersThree} from "@phosphor-icons/react";
+import {AppWindow, BookOpen, Buildings, ChartLineUp, CirclesThree, Cloud, Compass, Database, FileText, Gavel, GitBranch, HardDrives, ImageSquare, Key, Lightbulb, MagnifyingGlass, Rows, Scales, ShieldCheck, SquaresFour, Trash, UploadSimple, User, Users, UsersThree} from "@phosphor-icons/react";
 import {Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow, ReactFlowProvider, useEdgesState, useNodesState, useReactFlow} from "@xyflow/react";
 import "./kumo.css";
 import "@xyflow/react/dist/style.css";
@@ -17,6 +17,7 @@ import "./logging.css";
 import "./documents.css";
 import "./admin.css";
 import "./cloudflare-overrides.css";
+import "./knowledge-base-cards.css";
 import {connectionHandles} from "./graph-geometry.mjs";
 import {buildFilePreviewSections, isFilePreviewEmptyValue, mapFilePreviewClassLabel, pickDocumentMetadataValue, pickFilePreviewValue} from "./file-preview.mjs";
 import {LanguageProvider, useLanguage} from "./language.jsx";
@@ -40,6 +41,7 @@ const DOCUMENT_TYPE_OPTIONS = [
   {value: "regulation", labelKey: "documentType.regulation.label", descriptionKey: "documentType.regulation.description"},
   {value: "contract", labelKey: "documentType.contract.label", descriptionKey: "documentType.contract.description"},
 ];
+const QUALITY_DIMENSIONS = ["content", "structure", "metadata", "retrieval", "citation", "graph"];
 const documentTypeLabel = (t, type) => t(DOCUMENT_TYPE_OPTIONS.find(option => option.value === type)?.labelKey || "documentType.general.label");
 const documentTypeDescription = (t, type) => t(DOCUMENT_TYPE_OPTIONS.find(option => option.value === type)?.descriptionKey || "documentType.general.description");
 
@@ -134,6 +136,8 @@ function App() {
   const [documentsLoading, setDocumentsLoading] = useState(false);
   const [processingDocumentsTotal, setProcessingDocumentsTotal] = useState(0);
   const [hasCompletedDocuments, setHasCompletedDocuments] = useState(false);
+  const [knowledgeBaseQuality, setKnowledgeBaseQuality] = useState(null);
+  const [knowledgeBaseQualityLoading, setKnowledgeBaseQualityLoading] = useState(false);
   const [documentPreview, setDocumentPreview] = useState(null);
   const [pdfPreview, setPdfPreview] = useState(null);
   const clearPdfPreview = useCallback(() => {
@@ -179,6 +183,8 @@ function App() {
   const [groups, setGroups] = useState([]);
   const selectedKb = useMemo(() => kbs.find(kb => kb.id === selectedKbId), [kbs, selectedKbId]);
   const loadRequestRef = useRef(0);
+  const qualityRequestRef = useRef(0);
+  const previousProcessingTotalRef = useRef(0);
 
   const notify = (body, type = "info") => setMessage({body, type, id: Date.now()});
   const userRole = user?.role || "user";
@@ -232,11 +238,23 @@ function App() {
     setKbs(rows);
     setSelectedKbId(current => rows.some(kb => kb.id === current) ? current : rows[0]?.id || "");
   };
+  const loadKnowledgeBaseQuality = async (id, offset = 0) => {
+    const requestId = ++qualityRequestRef.current;
+    if (!id) { setKnowledgeBaseQuality(null); setKnowledgeBaseQualityLoading(false); return null; }
+    setKnowledgeBaseQualityLoading(true);
+    try {
+      const quality = await api(`/v1/knowledge-bases/${id}/quality-readiness?limit=50&offset=${offset}`);
+      if (requestId === qualityRequestRef.current && id === selectedKbId) setKnowledgeBaseQuality(quality);
+      return quality;
+    } finally {
+      if (requestId === qualityRequestRef.current) setKnowledgeBaseQualityLoading(false);
+    }
+  };
   const loadKbData = async (id, includeDeleted = showDeletedDocuments, options = {}) => {
     const {background = false} = options;
     const requestId = ++loadRequestRef.current;
     const isCurrentRequest = () => requestId === loadRequestRef.current;
-    if (!id) { if (isCurrentRequest()) { setEntities([]); setRelationships([]); setDocuments([]); setDocumentTemplates([]); setDocumentTotal(0); setProcessingDocumentsTotal(0); setHasCompletedDocuments(false); setIsLegalGraph(false); setLegalInstruments([]); setDocumentsLoading(false); } return; }
+    if (!id) { if (isCurrentRequest()) { setEntities([]); setRelationships([]); setDocuments([]); setDocumentTemplates([]); setDocumentTotal(0); setProcessingDocumentsTotal(0); setHasCompletedDocuments(false); setKnowledgeBaseQuality(null); setIsLegalGraph(false); setLegalInstruments([]); setDocumentsLoading(false); } return; }
     const isDocumentsView = activeView === "documents";
     const params = new URLSearchParams({limit: "50", offset: String(isDocumentsView ? documentOffset : 0)});
     if (includeDeleted && isDocumentsView) params.set("include_deleted", "true");
@@ -276,15 +294,26 @@ function App() {
       if (isCurrentRequest()) throw error;
     } finally { if (isCurrentRequest()) setDocumentsLoading(false); }
   };
+  const reloadDocumentsAndQuality = async (includeDeleted = showDeletedDocuments) => {
+    await Promise.all([loadKbData(selectedKbId, includeDeleted), loadKnowledgeBaseQuality(selectedKbId)]);
+  };
   useEffect(() => { if (user) loadKbs().catch(showError); }, [user]);
   useEffect(() => { setLegalRebuildStatus(null); }, [selectedKbId]);
-  useEffect(() => { if (selectedKbId) { setDocumentOffset(0); setDocumentPreview(null); clearPdfPreview(); setDocumentJobs([]); setDocumentTypeFilter("all"); } }, [selectedKbId]);
+  useEffect(() => { setKnowledgeBaseQuality(null); setKnowledgeBaseQualityLoading(Boolean(selectedKbId)); if (selectedKbId) { setDocumentOffset(0); setDocumentPreview(null); clearPdfPreview(); setDocumentJobs([]); setDocumentTypeFilter("all"); } }, [selectedKbId]);
   useEffect(() => { if (user) loadKbData(selectedKbId).catch(showError); }, [selectedKbId, user, showDeletedDocuments, legalGraphView, activeView, documentOffset, documentSearch, documentStatusFilter, documentTypeFilter]);
+  useEffect(() => { if (user && activeView === "documents") loadKnowledgeBaseQuality(selectedKbId).catch(showError); }, [selectedKbId, user, activeView]);
   useEffect(() => {
     if (!user || activeView !== "documents" || !selectedKbId || processingDocumentsTotal === 0) return undefined;
     const timer = window.setInterval(() => loadKbData(selectedKbId, undefined, {background: true}).catch(showError), 5000);
     return () => window.clearInterval(timer);
   }, [activeView, selectedKbId, user, processingDocumentsTotal, showDeletedDocuments]);
+  useEffect(() => {
+    const previous = previousProcessingTotalRef.current;
+    previousProcessingTotalRef.current = processingDocumentsTotal;
+    if (previous > 0 && processingDocumentsTotal === 0 && user && activeView === "documents") {
+      loadKnowledgeBaseQuality(selectedKbId).catch(showError);
+    }
+  }, [processingDocumentsTotal, selectedKbId, user, activeView]);
   const hasActiveDocumentJobs = documentJobs.some(isActiveProcessingJob);
   useEffect(() => {
     const documentId = documentPreview?.document_id;
@@ -381,6 +410,31 @@ function App() {
       return false;
     }
   };
+  const uploadKnowledgeBaseCover = async (knowledgeBase, file) => {
+    if (!file) return false;
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const updated = await api(`/v1/knowledge-bases/${knowledgeBase.id}/cover`, {method: "POST", body: form});
+      setKbs(items => items.map(item => item.id === updated.id ? updated : item));
+      notify(t("app.notify.kbCoverUpdated"));
+      return true;
+    } catch (error) {
+      showError(error);
+      return false;
+    }
+  };
+  const deleteKnowledgeBaseCover = async knowledgeBase => {
+    try {
+      const updated = await api(`/v1/knowledge-bases/${knowledgeBase.id}/cover`, {method: "DELETE"});
+      setKbs(items => items.map(item => item.id === updated.id ? updated : item));
+      notify(t("app.notify.kbCoverDeleted"));
+      return true;
+    } catch (error) {
+      showError(error);
+      return false;
+    }
+  };
   const addEntity = async ({name, entityType}) => {
     if (!selectedKbId || !name?.trim()) return null;
     try {
@@ -416,18 +470,18 @@ function App() {
   const reviewLegalRelationship = async (relationshipId, status) => {
     try {
       await api(`/v1/relationships/${relationshipId}/legal-review`, {method: "PATCH", body: JSON.stringify({status})});
-      await loadKbData(selectedKbId); notify(status === "verified" ? t("app.notify.legalRelationshipApproved") : t("app.notify.legalRelationshipRejected"));
+      await reloadDocumentsAndQuality(); notify(status === "verified" ? t("app.notify.legalRelationshipApproved") : t("app.notify.legalRelationshipRejected"));
     } catch (error) { showError(error); }
   };
   const resolveLegalRegistry = async () => {
     if (!selectedKbId) return;
     try {
       const result = await api(`/v1/knowledge-bases/${selectedKbId}/legal-registry/resolve`, {method: "POST"});
-      await loadKbData(selectedKbId); notify(t("app.notify.legalRegistryResolved", {changed: result.changed, instruments: result.instruments}));
+      await reloadDocumentsAndQuality(); notify(t("app.notify.legalRegistryResolved", {changed: result.changed, instruments: result.instruments}));
     } catch (error) { showError(error); }
   };
   const updateLegalInstrument = async (instrumentId, payload) => {
-    try { await api(`/v1/legal-instruments/${instrumentId}`, {method: "PATCH", body: JSON.stringify(payload)}); await loadKbData(selectedKbId); notify(t("app.notify.legalInstrumentUpdated")); }
+    try { await api(`/v1/legal-instruments/${instrumentId}`, {method: "PATCH", body: JSON.stringify(payload)}); await reloadDocumentsAndQuality(); notify(t("app.notify.legalInstrumentUpdated")); }
     catch (error) { showError(error); }
   };
   const runQuery = async event => {
@@ -455,7 +509,7 @@ function App() {
     try {
       const result = await api(`/v1/knowledge-bases/${selectedKbId}/documents/batch`, {method: "POST", body: form});
       const selectedCount = uploadFile.length;
-      setUploadFile([]); setUploadTitle(""); setUploadDocumentType("general"); setUploadTemplateId("system:general"); setUploadMetadata({}); await loadKbData(selectedKbId);
+      setUploadFile([]); setUploadTitle(""); setUploadDocumentType("general"); setUploadTemplateId("system:general"); setUploadMetadata({}); await reloadDocumentsAndQuality();
       notify(result.failed_count ? t("app.notify.uploadPartialFailure", {queued: result.queued_count, total: selectedCount, failed: result.failed_count}) : t("app.notify.uploadQueued", {queued: result.queued_count}));
       return true;
     } catch (error) { showError(error); return false; }
@@ -471,12 +525,12 @@ function App() {
     catch (error) { showError(error); }
   };
   const saveLegalMetadata = async (document, metadata) => {
-    try { await api(`/v1/documents/${document.id}/legal-metadata`, {method: "PUT", body: JSON.stringify({metadata})}); await openDocument(document); await queueLegalGraphRebuild(); notify(t("app.notify.legalMetadataSaved")); }
+    try { await api(`/v1/documents/${document.id}/legal-metadata`, {method: "PUT", body: JSON.stringify({metadata})}); await openDocument(document); await queueLegalGraphRebuild(); await loadKnowledgeBaseQuality(selectedKbId); notify(t("app.notify.legalMetadataSaved")); }
     catch (error) { showError(error); throw error; }
   };
   const deleteLegalMetadata = async document => {
     if (!window.confirm(t("app.confirm.deleteLegalMetadata"))) return;
-    try { await api(`/v1/documents/${document.id}/legal-metadata`, {method: "DELETE"}); await openDocument(document); await queueLegalGraphRebuild(); notify(t("app.notify.legalMetadataDeleted")); }
+    try { await api(`/v1/documents/${document.id}/legal-metadata`, {method: "DELETE"}); await openDocument(document); await queueLegalGraphRebuild(); await loadKnowledgeBaseQuality(selectedKbId); notify(t("app.notify.legalMetadataDeleted")); }
     catch (error) { showError(error); }
   };
   const createDocumentTemplate = async payload => {
@@ -522,25 +576,25 @@ function App() {
     try { await api(`/v1/document-templates/${template.id}/activate`, {method: "POST"}); await loadKbData(selectedKbId); notify(t("app.notify.documentTypeActivated")); }
     catch (error) { showError(error); }
   };
-  const openDocument = async document => {
+  const openDocument = async (document, initialTab) => {
     try {
       const [preview, jobs] = await Promise.all([api(`/v1/documents/${document.id}/text`), api(`/v1/documents/${document.id}/jobs`)]);
       setDocumentJobPollError("");
-      setDocumentPreview({...preview, title: document.title || document.original_filename, original_filename: document.original_filename, mime_type: document.mime_type}); setDocumentJobs(jobs);
+      setDocumentPreview({...preview, title: document.title || document.original_filename, original_filename: document.original_filename, mime_type: document.mime_type, initial_tab: initialTab}); setDocumentJobs(jobs);
     } catch (error) { showError(error); }
   };
   const closePreview = useCallback(() => setDocumentPreview(null), []);
   const reprocessDocument = async document => {
-    try { await api(`/v1/documents/${document.id}/reprocess`, {method: "POST"}); await loadKbData(selectedKbId); notify(t("app.notify.documentQueuedForReprocessing")); }
+    try { await api(`/v1/documents/${document.id}/reprocess`, {method: "POST"}); await reloadDocumentsAndQuality(); notify(t("app.notify.documentQueuedForReprocessing")); }
     catch (error) { showError(error); }
   };
   const deleteDocument = async document => {
     if (!window.confirm(t("app.confirm.deleteDocument", {name: document.title || document.original_filename}))) return;
-    try { await api(`/v1/documents/${document.id}`, {method: "DELETE"}); await loadKbData(selectedKbId); notify(t("app.notify.documentMovedToDeleted")); }
+    try { await api(`/v1/documents/${document.id}`, {method: "DELETE"}); await reloadDocumentsAndQuality(); notify(t("app.notify.documentMovedToDeleted")); }
     catch (error) { showError(error); }
   };
   const restoreDocument = async document => {
-    try { await api(`/v1/documents/${document.id}/restore`, {method: "POST"}); await loadKbData(selectedKbId, true); notify(t("app.notify.documentRestored")); }
+    try { await api(`/v1/documents/${document.id}/restore`, {method: "POST"}); await reloadDocumentsAndQuality(true); notify(t("app.notify.documentRestored")); }
     catch (error) { showError(error); }
   };
   const fetchDocumentFileResponse = async (document, {disposition} = {}) => {
@@ -598,7 +652,7 @@ function App() {
     }
   };
   const reindexEmbeddings = async () => {
-    try { const result = await api(`/v1/knowledge-bases/${selectedKbId}/documents/reindex`, {method: "POST"}); await loadKbData(selectedKbId); notify(t("app.notify.embeddingReindexQueued", {count: result.count})); }
+    try { const result = await api(`/v1/knowledge-bases/${selectedKbId}/documents/reindex`, {method: "POST"}); await reloadDocumentsAndQuality(); notify(t("app.notify.embeddingReindexQueued", {count: result.count})); }
     catch (error) { showError(error); }
   };
   const loadAccess = async () => {
@@ -708,9 +762,9 @@ function App() {
       {message && <Toast body={message.body} type={message.type} isAutoHide={message.type !== "error"} autoHideDuration={5000} dismissLabel={t("ui.dismissNotification")} onDismiss={() => setMessage(null)}/>}
       <CommandPalette open={isCommandPaletteOpen} onClose={closeCommandPalette} items={commandItems} title={t("app.workspaceNavAriaLabel")} searchPlaceholder={t("ui.commandSearchPlaceholder")} searchLabel={t("ui.commandSearchLabel")} noMatchLabel={t("ui.commandNoMatch")}/>
       <WorkflowNavigation activeView={activeView} selectedKb={selectedKb} hasCompletedDocuments={hasCompletedDocuments} viewTrail={viewTrail} onNavigate={navigateToView} onBack={goBack} onNavigateNext={switchView}/>
-      {activeView === "knowledge-bases" && <KnowledgeBases kbs={kbs} selectedKbId={selectedKbId} setSelectedKbId={setSelectedKbId} newKbName={newKbName} setNewKbName={setNewKbName} createKb={createKb} manageKnowledgeBase={manageKnowledgeBase} updateRetrievalConfig={updateRetrievalConfig} updateKnowledgeBaseIcon={updateKnowledgeBaseIcon} renameKnowledgeBase={renameKnowledgeBase} onContinue={() => switchView("documents")}/>}
+      {activeView === "knowledge-bases" && <KnowledgeBases kbs={kbs} selectedKbId={selectedKbId} setSelectedKbId={setSelectedKbId} newKbName={newKbName} setNewKbName={setNewKbName} createKb={createKb} manageKnowledgeBase={manageKnowledgeBase} updateRetrievalConfig={updateRetrievalConfig} updateKnowledgeBaseIcon={updateKnowledgeBaseIcon} renameKnowledgeBase={renameKnowledgeBase} uploadKnowledgeBaseCover={uploadKnowledgeBaseCover} deleteKnowledgeBaseCover={deleteKnowledgeBaseCover} onContinue={() => switchView("documents")}/>}
       {activeView === "documents" && (
-        <Documents selectedKb={selectedKb} documents={documents} documentTotal={documentTotal} documentOffset={documentOffset} setDocumentOffset={setDocumentOffset} documentSearch={documentSearch} setDocumentSearch={setDocumentSearch} documentStatusFilter={documentStatusFilter} setDocumentStatusFilter={setDocumentStatusFilter} documentTypeFilter={documentTypeFilter} setDocumentTypeFilter={setDocumentTypeFilter} documentsLoading={documentsLoading} hasCompletedDocuments={hasCompletedDocuments} showDeletedDocuments={showDeletedDocuments} setShowDeletedDocuments={setShowDeletedDocuments} uploadFile={uploadFile} setUploadFile={setUploadFile} uploadTitle={uploadTitle} setUploadTitle={setUploadTitle} uploadDocumentType={uploadDocumentType} setUploadDocumentType={setUploadDocumentType} documentTemplates={documentTemplates} uploadTemplateId={uploadTemplateId} setUploadTemplateId={setUploadTemplateId} uploadMetadata={uploadMetadata} setUploadMetadata={setUploadMetadata} createDocumentTemplate={createDocumentTemplate} updateDocumentTemplate={updateDocumentTemplate} deactivateDocumentTemplate={deactivateDocumentTemplate} activateDocumentTemplate={activateDocumentTemplate} renameDocumentTemplate={renameDocumentTemplate} duplicateDocumentTemplate={duplicateDocumentTemplate} purgeDocumentTemplate={purgeDocumentTemplate} uploadDocument={uploadDocument} isUploading={isUploading} openDocument={openDocument} extractLegalMetadata={extractLegalMetadata} saveLegalMetadata={saveLegalMetadata} deleteLegalMetadata={deleteLegalMetadata} reprocessDocument={reprocessDocument} deleteDocument={deleteDocument} restoreDocument={restoreDocument} downloadOriginalDocument={downloadOriginalDocument} previewOriginalDocument={previewOriginalDocument} pdfPreview={pdfPreview} onClosePdfPreview={closePdfPreview} reindexEmbeddings={reindexEmbeddings} refreshDocuments={() => loadKbData(selectedKbId).catch(showError)} documentPreview={documentPreview} documentJobs={documentJobs} documentJobPolling={documentJobPolling} documentJobPollError={documentJobPollError} legalInstruments={legalInstruments} resolveLegalRegistry={resolveLegalRegistry} updateLegalInstrument={updateLegalInstrument} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={() => loadKbData(selectedKbId).catch(showError)} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship} onClosePreview={closePreview} onCreateKb={() => switchView("knowledge-bases")} onSearch={() => switchView("search")} onExplore={() => switchView("explore")}/>
+        <Documents selectedKb={selectedKb} documents={documents} documentTotal={documentTotal} documentOffset={documentOffset} setDocumentOffset={setDocumentOffset} documentSearch={documentSearch} setDocumentSearch={setDocumentSearch} documentStatusFilter={documentStatusFilter} setDocumentStatusFilter={setDocumentStatusFilter} documentTypeFilter={documentTypeFilter} setDocumentTypeFilter={setDocumentTypeFilter} documentsLoading={documentsLoading} hasCompletedDocuments={hasCompletedDocuments} knowledgeBaseQuality={knowledgeBaseQuality} knowledgeBaseQualityLoading={knowledgeBaseQualityLoading} loadKnowledgeBaseQualityPage={offset => loadKnowledgeBaseQuality(selectedKbId, offset).catch(showError)} showDeletedDocuments={showDeletedDocuments} setShowDeletedDocuments={setShowDeletedDocuments} uploadFile={uploadFile} setUploadFile={setUploadFile} uploadTitle={uploadTitle} setUploadTitle={setUploadTitle} uploadDocumentType={uploadDocumentType} setUploadDocumentType={setUploadDocumentType} documentTemplates={documentTemplates} uploadTemplateId={uploadTemplateId} setUploadTemplateId={setUploadTemplateId} uploadMetadata={uploadMetadata} setUploadMetadata={setUploadMetadata} createDocumentTemplate={createDocumentTemplate} updateDocumentTemplate={updateDocumentTemplate} deactivateDocumentTemplate={deactivateDocumentTemplate} activateDocumentTemplate={activateDocumentTemplate} renameDocumentTemplate={renameDocumentTemplate} duplicateDocumentTemplate={duplicateDocumentTemplate} purgeDocumentTemplate={purgeDocumentTemplate} uploadDocument={uploadDocument} isUploading={isUploading} openDocument={openDocument} extractLegalMetadata={extractLegalMetadata} saveLegalMetadata={saveLegalMetadata} deleteLegalMetadata={deleteLegalMetadata} reprocessDocument={reprocessDocument} deleteDocument={deleteDocument} restoreDocument={restoreDocument} downloadOriginalDocument={downloadOriginalDocument} previewOriginalDocument={previewOriginalDocument} pdfPreview={pdfPreview} onClosePdfPreview={closePdfPreview} reindexEmbeddings={reindexEmbeddings} refreshDocuments={() => reloadDocumentsAndQuality().catch(showError)} documentPreview={documentPreview} documentJobs={documentJobs} documentJobPolling={documentJobPolling} documentJobPollError={documentJobPollError} legalInstruments={legalInstruments} resolveLegalRegistry={resolveLegalRegistry} updateLegalInstrument={updateLegalInstrument} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={() => loadKbData(selectedKbId).catch(showError)} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship} onClosePreview={closePreview} onCreateKb={() => switchView("knowledge-bases")} onSearch={() => switchView("search")} onExplore={() => switchView("explore")}/>
       )}
       {activeView === "search" && (
         <SearchView selectedKb={selectedKb} documents={documents} completedDocuments={hasCompletedDocuments} query={query} setQuery={setQuery} queryAsOfDate={queryAsOfDate} setQueryAsOfDate={setQueryAsOfDate} queryIncludeHistorical={queryIncludeHistorical} setQueryIncludeHistorical={setQueryIncludeHistorical} runQuery={runQuery} isQuerying={isQuerying} queryResult={queryResult} submitFeedback={submitQueryFeedback} onDocuments={() => switchView("documents")} onOpenSource={document => { switchView("documents"); openDocument(document); }}/>
@@ -1262,12 +1316,13 @@ function KnowledgeBaseIconPicker({knowledgeBase, onChange}) {
   return <details ref={pickerRef} className="kb-icon-picker"><summary><KnowledgeBaseIcon knowledgeBase={knowledgeBase} size={16}/><span>{t("kb.icon.change")}</span></summary><div className="kb-icon-palette" role="group" aria-label={t("kb.icon.pickerLabel", {name: knowledgeBase.name})}>{KB_ICON_OPTIONS.map(option => <button key={option.id} type="button" className={option.id === selectedIcon ? "selected" : ""} aria-label={t(`kb.icon.${option.id}`)} title={t(`kb.icon.${option.id}`)} aria-pressed={option.id === selectedIcon} disabled={isSaving} onClick={() => selectIcon(option.id)}><KnowledgeBaseIcon knowledgeBase={knowledgeBase} icon={option.id} size={18}/></button>)}</div></details>;
 }
 
-function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKbName, createKb, manageKnowledgeBase, updateRetrievalConfig, updateKnowledgeBaseIcon, renameKnowledgeBase, onContinue}) {
+function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKbName, createKb, manageKnowledgeBase, updateRetrievalConfig, updateKnowledgeBaseIcon, renameKnowledgeBase, uploadKnowledgeBaseCover, deleteKnowledgeBaseCover, onContinue}) {
   const {t} = useLanguage();
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [isCreating, setIsCreating] = useState(false);
   const [renamingKb, setRenamingKb] = useState(null);
+  const [coverSavingId, setCoverSavingId] = useState("");
   const [hubView, setHubView] = useState(() => { try { return window.localStorage.getItem("kb.hub.view") === "table" ? "table" : "cards"; } catch { return "cards"; } });
   const changeHubView = view => { setHubView(view); try { window.localStorage.setItem("kb.hub.view", view); } catch { /* private mode etc. — view still works, just not persisted */ } };
   const normalizedSearch = searchTerm.trim().toLocaleLowerCase();
@@ -1277,6 +1332,20 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
   });
   const openKnowledgeBase = kb => { setSelectedKbId(kb.id); onContinue(); };
   const submitCreate = event => { createKb(event); setIsCreating(false); };
+  const changeCover = async (knowledgeBase, event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file || coverSavingId) return;
+    setCoverSavingId(knowledgeBase.id);
+    await uploadKnowledgeBaseCover(knowledgeBase, file);
+    setCoverSavingId("");
+  };
+  const removeCover = async knowledgeBase => {
+    if (coverSavingId || !window.confirm(t("kb.cover.removeConfirm", {name: knowledgeBase.name}))) return;
+    setCoverSavingId(knowledgeBase.id);
+    await deleteKnowledgeBaseCover(knowledgeBase);
+    setCoverSavingId("");
+  };
   return <>
     <section className="kb-hero">
       <p className="eyebrow">{t("kb.hero.eyebrow")}</p>
@@ -1320,11 +1389,25 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
     </section>}
     <section className="kb-hub-grid" hidden={hubView === "table"}>
       {visibleKnowledgeBases.map(kb => <article className={`kb-hub-card ${kb.id === selectedKbId ? "selected" : ""} kb-hub-card-${kb.status}`} key={kb.id}>
+        <div className={`kb-cover ${kb.cover_image_url ? "has-image" : ""}`}>
+          <button type="button" className="kb-cover-open" onClick={() => openKnowledgeBase(kb)} aria-label={t("kb.cover.open", {name: kb.name})}>
+            {kb.cover_image_url
+              ? <img src={kb.cover_image_url} alt="" loading="lazy"/>
+              : <span className="kb-cover-placeholder"><KnowledgeBaseIcon knowledgeBase={kb} size={44}/></span>}
+          </button>
+          <div className="kb-cover-actions">
+            <label className="kb-cover-action" title={kb.cover_image_url ? t("kb.cover.replace") : t("kb.cover.upload")} aria-label={kb.cover_image_url ? t("kb.cover.replace") : t("kb.cover.upload")}>
+              {coverSavingId === kb.id ? <span className="kb-cover-spinner"/> : <UploadSimple size={17} weight="bold"/>}
+              <span>{kb.cover_image_url ? t("kb.cover.replace") : t("kb.cover.upload")}</span>
+              <input type="file" accept="image/jpeg,image/png,image/webp" disabled={Boolean(coverSavingId)} onChange={event => changeCover(kb, event)}/>
+            </label>
+            {kb.cover_image_url && <button type="button" className="kb-cover-action kb-cover-remove" onClick={() => removeCover(kb)} disabled={Boolean(coverSavingId)} title={t("kb.cover.remove")} aria-label={t("kb.cover.remove")}><Trash size={17}/><span>{t("kb.cover.remove")}</span></button>}
+          </div>
+        </div>
         <button type="button" className="kb-hub-open" onClick={() => openKnowledgeBase(kb)}>
-          <span className="kb-hub-avatar"><KnowledgeBaseIcon knowledgeBase={kb} size={22}/></span>
-          <span className="kb-hub-title">{kb.name}</span>
+          <span className="kb-hub-title-row"><span className="kb-hub-avatar"><KnowledgeBaseIcon knowledgeBase={kb} size={18}/></span><span className="kb-hub-title">{kb.name}</span><KbStatusBadge status={kb.status}/></span>
+          <span className="kb-hub-description">{kb.description || t("kb.hub.noDescription")}</span>
           <span className="kb-hub-code">{kb.code}</span>
-          <KbStatusBadge status={kb.status}/>
           <span className="kb-hub-link">{t("kb.hub.open")}</span>
         </button>
         <div className="kb-hub-actions">
@@ -1338,7 +1421,7 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
       <article className={`kb-hub-card kb-hub-create ${isCreating ? "open" : ""}`}>
         {isCreating
           ? <form className="form-stack" onSubmit={submitCreate}><TextInput label={t("kb.hub.create.nameLabel")} value={newKbName} onChange={setNewKbName} placeholder={t("kb.hub.create.namePlaceholder")} isRequired hasAutoFocus/><div className="kb-hub-create-actions"><Button label={t("common.cancel")} type="button" variant="ghost" size="sm" onClick={() => setIsCreating(false)}/><Button label={t("common.create")} type="submit" variant="primary" size="sm"/></div></form>
-          : <button type="button" className="kb-hub-create-trigger" onClick={() => setIsCreating(true)}><span className="kb-hub-create-icon">+</span><span>{t("sideNav.newKnowledgeBase")}</span></button>}
+          : <button type="button" className="kb-hub-create-trigger" onClick={() => setIsCreating(true)}><span className="kb-hub-create-preview"><ImageSquare size={34}/></span><span className="kb-hub-create-icon">+</span><span>{t("sideNav.newKnowledgeBase")}</span></button>}
       </article>
     </section>
     {kbs.length > 0 && !visibleKnowledgeBases.length && <EmptyState isCompact title={t("kb.hub.noMatch.title")} description={t("kb.hub.noMatch.description")}/>}
@@ -1398,6 +1481,7 @@ function MetadataFields({fields = [], values = {}, onChange, isDisabled = false}
     if (field.field_type === "textarea") return <TextArea key={field.key} label={label} value={value} onChange={next => setValue(field.key, next)} rows={3} description={field.help_text} isDisabled={isDisabled}/>;
     if (field.field_type === "boolean") return <Selector key={field.key} label={label} value={values[field.key] === undefined ? "" : String(values[field.key])} onChange={next => setValue(field.key, next === "" ? undefined : next === "true")} options={[{value: "", label: t("common.selectPlaceholder")}, {value: "true", label: t("autoMetadata.yes")}, {value: "false", label: t("autoMetadata.no")}]} isDisabled={isDisabled}/>;
     if (field.field_type === "select") return <Selector key={field.key} label={label} value={value} onChange={next => setValue(field.key, next)} options={[{value: "", label: t("common.selectPlaceholder")}, ...(field.options || []).map(option => ({value: option, label: option}))]} isDisabled={isDisabled} description={field.help_text}/>;
+    if (field.field_type === "multi_select") return <fieldset className="metadata-multi-select" key={field.key} disabled={isDisabled}><legend>{label}</legend><div>{(field.options || []).map(option => <label key={option}><input type="checkbox" checked={(Array.isArray(values[field.key]) ? values[field.key] : []).includes(option)} onChange={event => { const selected = new Set(Array.isArray(values[field.key]) ? values[field.key] : []); event.target.checked ? selected.add(option) : selected.delete(option); setValue(field.key, [...selected]); }}/><span>{option}</span></label>)}</div>{field.help_text && <small>{field.help_text}</small>}</fieldset>;
     if (field.field_type === "date") return <label className="metadata-native-field" key={field.key}><span>{label}</span><input type="date" value={value} onChange={event => setValue(field.key, event.target.value)} disabled={isDisabled}/>{field.help_text && <small>{field.help_text}</small>}</label>;
     return <TextInput key={field.key} label={label} value={String(value)} onChange={next => setValue(field.key, field.field_type === "number" && next !== "" ? Number(next) : next)} type={field.field_type === "number" ? "number" : "text"} description={field.help_text} isDisabled={isDisabled}/>;
   })}</div>;
@@ -1417,13 +1501,13 @@ function DocumentTypeEditor({draft, setDraft, editing, error, setError, onSubmit
     <div className="template-field-builder"><div><b>{t("documentType.editor.metadataFields")}</b><span className="template-field-actions"><Button label={t("documentType.editor.useProfileDefaults")} type="button" size="sm" variant="ghost" onClick={copyProfileDefaults} isDisabled={!profileDefaults[draft.base_document_type]?.length}/><Button label={t("documentType.editor.addField")} type="button" size="sm" variant="ghost" onClick={addField}/></span></div>{draft.fields.map((field, index) => <div className="template-field-row" key={`metadata-field-${index}`}>
       <div className="template-field-control"><TextInput label={t("documentType.editor.fieldKey")} value={field.key} onChange={key => updateField(index, {key})} placeholder="issuer" isRequired/></div>
       <div className="template-field-control"><TextInput label={t("documentType.editor.label")} value={field.label} onChange={label => updateField(index, {label})} placeholder={t("documentType.editor.labelPlaceholder")} isRequired/></div>
-      <div className="template-field-control"><Selector label={t("documentType.editor.fieldType")} value={field.field_type} onChange={field_type => updateField(index, {field_type})} options={["text", "textarea", "date", "number", "select", "boolean"].map(value => ({value, label: value}))}/></div>
+      <div className="template-field-control"><Selector label={t("documentType.editor.fieldType")} value={field.field_type} onChange={field_type => updateField(index, {field_type})} options={["text", "textarea", "date", "number", "select", "multi_select", "boolean"].map(value => ({value, label: value}))}/></div>
       <div className="template-field-control"><Selector label={t("autoMetadata.fillMode")} value={field.fill_mode || "manual"} onChange={fill_mode => updateField(index, {fill_mode})} options={[{value: "extract", label: t("autoMetadata.extractMode")}, {value: "manual", label: t("autoMetadata.manualMode")}]}/></div>
       {field.fill_mode === "extract" && <div className="template-field-control template-field-extraction"><TextArea label={t("autoMetadata.extractionInstruction")} value={field.extraction_description || ""} onChange={extraction_description => updateField(index, {extraction_description})} placeholder={t("autoMetadata.extractionInstructionPlaceholder")} description={t("autoMetadata.extractionInstructionDescription")} isRequired/><DesignSystemCheckbox label={t("autoMetadata.alwaysReview")} checked={field.review_policy === "always"} onChange={checked => updateField(index, {review_policy: checked ? "always" : "evidence"})}/></div>}
       {field.fill_mode !== "extract" && <DesignSystemCheckbox label={t("autoMetadata.batchAllowed")} checked={Boolean(field.batch_default_allowed)} onChange={batch_default_allowed => updateField(index, {batch_default_allowed})}/>}
       <div className="template-field-control template-field-required"><DesignSystemCheckbox label={t(field.fill_mode === "extract" ? "autoMetadata.requiredReview" : "documentType.editor.required")} checked={field.required} onChange={required => updateField(index, {required})}/></div>
       <div className="template-field-control template-field-help"><TextInput label={t("documentType.editor.helpText")} value={field.help_text || ""} onChange={help_text => updateField(index, {help_text})} placeholder={t("documentType.editor.helpTextPlaceholder")} isOptional optionalLabel={t("common.optional")}/></div>
-      {field.field_type === "select" && <div className="template-field-control template-field-options"><TextInput label={t("documentType.editor.options")} value={(field.options || []).join(", ")} onChange={value => updateField(index, {options: value.split(",").map(item => item.trim()).filter(Boolean)})} placeholder={t("documentType.editor.optionsPlaceholder")}/></div>}
+      {["select", "multi_select"].includes(field.field_type) && <div className="template-field-control template-field-options"><TextInput label={t("documentType.editor.options")} value={(field.options || []).join(", ")} onChange={value => updateField(index, {options: value.split(",").map(item => item.trim()).filter(Boolean)})} placeholder={t("documentType.editor.optionsPlaceholder")}/></div>}
       <details className="template-field-advanced"><summary>{t("documentType.editor.capabilitiesSummary")}</summary><div className="template-field-capabilities"><DesignSystemCheckbox label={t("documentType.editor.searchCapability")} checked={field.searchable !== false} onChange={searchable => updateField(index, {searchable})}/><DesignSystemCheckbox label={t("documentType.editor.filterCapability")} checked={Boolean(field.filterable)} onChange={filterable => updateField(index, {filterable})}/><DesignSystemCheckbox label={t("documentType.editor.graphCapability")} checked={Boolean(field.graph_relationship)} onChange={enabled => updateField(index, enabled ? {graph_entity_type: field.graph_entity_type || "Entity", graph_relationship: field.graph_relationship || "RELATED_TO"} : {graph_entity_type: "", graph_relationship: ""})}/></div>{field.graph_relationship && <div className="template-field-control template-field-graph"><TextInput label={t("documentType.editor.graphEntityType")} value={field.graph_entity_type || ""} onChange={graph_entity_type => updateField(index, {graph_entity_type})} placeholder={t("documentType.editor.graphEntityTypePlaceholder")}/><TextInput label={t("documentType.editor.relationship")} value={field.graph_relationship || ""} onChange={graph_relationship => updateField(index, {graph_relationship: graph_relationship.toUpperCase().replace(/[^A-Z0-9_]/g, "")})} placeholder="ISSUED_BY"/></div>}</details>
       <div className="template-field-action"><Button label={t("documentType.editor.remove")} type="button" size="sm" variant="destructive" onClick={() => removeField(index)}/></div>
     </div>)}</div>
@@ -1587,13 +1671,43 @@ function DocumentRowOverflowMenu({document: doc, processing, onReprocess, onDele
   </div>;
 }
 
-function Documents({selectedKb, documents, documentTotal, documentOffset, setDocumentOffset, documentSearch, setDocumentSearch, documentStatusFilter, setDocumentStatusFilter, documentTypeFilter, setDocumentTypeFilter, documentsLoading, hasCompletedDocuments, showDeletedDocuments, setShowDeletedDocuments, uploadFile, setUploadFile, uploadTitle, setUploadTitle, uploadDocumentType, setUploadDocumentType, documentTemplates, uploadTemplateId, setUploadTemplateId, uploadMetadata, setUploadMetadata, createDocumentTemplate, updateDocumentTemplate, deactivateDocumentTemplate, activateDocumentTemplate, renameDocumentTemplate, duplicateDocumentTemplate, purgeDocumentTemplate, uploadDocument, isUploading, openDocument, extractLegalMetadata, saveLegalMetadata, deleteLegalMetadata, reprocessDocument, deleteDocument, restoreDocument, downloadOriginalDocument, previewOriginalDocument, pdfPreview, onClosePdfPreview, reindexEmbeddings, refreshDocuments, documentPreview, documentJobs, documentJobPolling, documentJobPollError, legalInstruments, resolveLegalRegistry, updateLegalInstrument, entities, relationships, addEntity, addRelationship, impact, analyzeImpact, syncGraphFromDocuments, refreshGraph, isLegalGraph, legalGraphView, setLegalGraphView, queueLegalGraphRebuild, legalRebuildStatus, reviewLegalRelationship, onClosePreview, onCreateKb, onSearch, onExplore}) {
+function KnowledgeBaseQualityDrawer({open, quality, loading, onClose, onOpenDocument, onLoadPage}) {
+  const {t} = useLanguage();
+  const drawerRef = useRef(null);
+  const headingRef = useRef(null);
+  useDialogFocus({open, dialogRef: drawerRef, initialFocusRef: headingRef, onClose});
+  if (!open) return null;
+  const statusCounts = quality?.status_counts || {};
+  return <div className="document-type-drawer-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
+    <aside ref={drawerRef} className="document-type-drawer kb-quality-drawer" role="dialog" aria-modal="true" aria-labelledby="kb-quality-title" onMouseDown={event => event.stopPropagation()}>
+      <header className="document-type-drawer-header"><div><p className="eyebrow">{t("quality.eyebrow")}</p><h2 id="kb-quality-title" tabIndex={-1} ref={headingRef}>{t("kbQuality.title")}</h2><p>{t("kbQuality.description")}</p></div><button type="button" className="drawer-close" onClick={onClose} aria-label={t("kbQuality.close")}>×</button></header>
+      {loading && !quality ? <p className="section-copy" role="status">{t("documents.loading")}</p> : quality?.document_count ? <div className="kb-quality-content">
+        <section className="quality-summary kb-quality-summary">
+          <div className={`quality-score quality-${quality.status}`} style={{"--quality-score": `${quality.score || 0}%`}}><strong>{quality.score ?? 0}</strong><span>/100</span></div>
+          <div><h3>{t(`quality.status.${quality.status}`)}</h3><p className="section-copy">{t("kbQuality.method", {count: quality.document_count})}</p></div>
+        </section>
+        <div className="kb-quality-status-counts">
+          <div><b>{statusCounts.ai_ready || 0}</b><span>{t("quality.status.ai_ready")}</span></div>
+          <div><b>{statusCounts.verified || 0}</b><span>{t("quality.status.verified")}</span></div>
+          <div><b>{statusCounts.needs_review || 0}</b><span>{t("quality.status.needs_review")}</span></div>
+          <div><b>{statusCounts.not_queryable || 0}</b><span>{t("quality.status.not_queryable")}</span></div>
+        </div>
+        <div className="quality-dimensions">{QUALITY_DIMENSIONS.map(key => <div className="quality-dimension" key={key}><div><span>{t(`quality.dimension.${key}`)}</span><b>{quality.dimensions?.[key] ?? 0}</b></div><progress max="100" value={quality.dimensions?.[key] ?? 0}/></div>)}</div>
+        <section className="kb-quality-documents"><div className="section-title"><div><h3>{t("kbQuality.documents.title")}</h3><p>{t("kbQuality.documents.description")}</p></div></div><div className="kb-quality-document-list">{quality.documents.map(document => <button type="button" className="kb-quality-document" key={document.document_id} onClick={() => onOpenDocument(document)}><span className="kb-quality-document-main"><b>{document.title}</b><small>{t(`quality.status.${document.status}`)}{document.blockers.length ? ` · ${t("kbQuality.blockers", {count: document.blockers.length})}` : document.warnings.length ? ` · ${t("kbQuality.warnings", {count: document.warnings.length})}` : ""}</small></span><span className={`kb-quality-document-score quality-text-${document.status}`}>{document.score}<small>/100</small></span><span aria-hidden="true">→</span></button>)}</div>{quality.document_count > quality.document_limit && <div className="document-pagination"><Button label={t("common.previous")} variant="ghost" size="sm" isDisabled={loading || quality.document_offset === 0} onClick={() => onLoadPage(Math.max(0, quality.document_offset - quality.document_limit))}/><span>{quality.document_offset + 1}–{Math.min(quality.document_offset + quality.documents.length, quality.document_count)} / {quality.document_count}</span><Button label={t("common.next")} variant="secondary" size="sm" isDisabled={loading || quality.document_offset + quality.documents.length >= quality.document_count} onClick={() => onLoadPage(quality.document_offset + quality.document_limit)}/></div>}</section>
+      </div> : <EmptyState title={t("kbQuality.empty.title")} description={t("kbQuality.empty.description")}/>}
+    </aside>
+  </div>;
+}
+
+function Documents({selectedKb, documents, documentTotal, documentOffset, setDocumentOffset, documentSearch, setDocumentSearch, documentStatusFilter, setDocumentStatusFilter, documentTypeFilter, setDocumentTypeFilter, documentsLoading, hasCompletedDocuments, knowledgeBaseQuality, knowledgeBaseQualityLoading, loadKnowledgeBaseQualityPage, showDeletedDocuments, setShowDeletedDocuments, uploadFile, setUploadFile, uploadTitle, setUploadTitle, uploadDocumentType, setUploadDocumentType, documentTemplates, uploadTemplateId, setUploadTemplateId, uploadMetadata, setUploadMetadata, createDocumentTemplate, updateDocumentTemplate, deactivateDocumentTemplate, activateDocumentTemplate, renameDocumentTemplate, duplicateDocumentTemplate, purgeDocumentTemplate, uploadDocument, isUploading, openDocument, extractLegalMetadata, saveLegalMetadata, deleteLegalMetadata, reprocessDocument, deleteDocument, restoreDocument, downloadOriginalDocument, previewOriginalDocument, pdfPreview, onClosePdfPreview, reindexEmbeddings, refreshDocuments, documentPreview, documentJobs, documentJobPolling, documentJobPollError, legalInstruments, resolveLegalRegistry, updateLegalInstrument, entities, relationships, addEntity, addRelationship, impact, analyzeImpact, syncGraphFromDocuments, refreshGraph, isLegalGraph, legalGraphView, setLegalGraphView, queueLegalGraphRebuild, legalRebuildStatus, reviewLegalRelationship, onClosePreview, onCreateKb, onSearch, onExplore}) {
   const {t} = useLanguage();
   const [isTypeDrawerOpen, setIsTypeDrawerOpen] = useState(false);
   const [isUploadDrawerOpen, setIsUploadDrawerOpen] = useState(false);
+  const [isQualityDrawerOpen, setIsQualityDrawerOpen] = useState(false);
   const [libraryTab, setLibraryTab] = useState("files");
   const typeManagerTriggerRef = useRef(null);
   const uploadTriggerRef = useRef(null);
+  const qualityTriggerRef = useRef(null);
   const uploadDrawerRef = useRef(null);
   const uploadDrawerHeadingRef = useRef(null);
   const documentTriggerRef = useRef(null);
@@ -1605,6 +1719,10 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
     setIsUploadDrawerOpen(false);
     window.requestAnimationFrame(() => uploadTriggerRef.current?.focus());
   }, []);
+  const closeQualityDrawer = useCallback(() => {
+    setIsQualityDrawerOpen(false);
+    window.requestAnimationFrame(() => qualityTriggerRef.current?.focus());
+  }, []);
   const openDocumentFromLibrary = (document, event) => {
     documentTriggerRef.current = event?.currentTarget || null;
     openDocument(document);
@@ -1613,7 +1731,7 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
     onClosePreview();
     window.requestAnimationFrame(() => documentTriggerRef.current?.focus());
   }, [onClosePreview]);
-  useEffect(() => { setLibraryTab("files"); }, [selectedKb?.id]);
+  useEffect(() => { setLibraryTab("files"); setIsQualityDrawerOpen(false); }, [selectedKb?.id]);
   useDialogFocus({open: isUploadDrawerOpen, dialogRef: uploadDrawerRef, initialFocusRef: uploadDrawerHeadingRef, onClose: closeUploadDrawer});
   if (!selectedKb) return <EmptyState title={t("documents.emptyKb.title")} description={t("documents.emptyKb.description")} actions={<Button label={t("documents.emptyKb.action")} variant="primary" onClick={onCreateKb}/>}/>;
   const pageSize = 50;
@@ -1645,7 +1763,7 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
     </div>}
     <div className="upload-actions"><Button label={uploadFile.length > 1 ? t("documents.upload.submitMultiple", {count: uploadFile.length}) : t("documents.upload.submitSingle")} type="submit" variant="primary" isDisabled={!uploadFile.length || isUploading} isLoading={isUploading}/></div>
   </form>;
-  return <><PageHeading eyebrow={t("documents.pageHeading.eyebrow")} title={t("documents.pageHeading.title", {name: selectedKb.name})} description={t("documents.pageHeading.description")} actions={<><Button ref={uploadTriggerRef} label={t("documents.upload.addDocuments")} variant="primary" onClick={() => { setIsUploadDrawerOpen(true); }}/><Button ref={typeManagerTriggerRef} label={t("documents.manageTypes")} variant="secondary" onClick={() => setIsTypeDrawerOpen(true)}/><Button label={showDeletedDocuments ? t("documents.hideDeleted") : t("documents.showDeleted")} variant="ghost" onClick={() => { setDocumentOffset(0); setShowDeletedDocuments(value => !value); }}/><Button label={t("documents.reindex")} variant="secondary" onClick={reindexEmbeddings}/><Button label={t("documents.refreshStatus")} variant="ghost" onClick={refreshDocuments}/></>}/>
+  return <><PageHeading eyebrow={t("documents.pageHeading.eyebrow")} title={t("documents.pageHeading.title", {name: selectedKb.name})} description={t("documents.pageHeading.description")} actions={<><Button ref={uploadTriggerRef} label={t("documents.upload.addDocuments")} variant="primary" onClick={() => { setIsUploadDrawerOpen(true); }}/><Button ref={qualityTriggerRef} label={t("kbQuality.button", {score: knowledgeBaseQuality?.score ?? "—"})} variant="secondary" isDisabled={knowledgeBaseQualityLoading && !knowledgeBaseQuality} onClick={() => { setIsQualityDrawerOpen(true); loadKnowledgeBaseQualityPage(0); }}/><Button ref={typeManagerTriggerRef} label={t("documents.manageTypes")} variant="secondary" onClick={() => setIsTypeDrawerOpen(true)}/><Button label={showDeletedDocuments ? t("documents.hideDeleted") : t("documents.showDeleted")} variant="ghost" onClick={() => { setDocumentOffset(0); setShowDeletedDocuments(value => !value); }}/><Button label={t("documents.reindex")} variant="secondary" onClick={reindexEmbeddings}/><Button label={t("documents.refreshStatus")} variant="ghost" onClick={refreshDocuments}/></>}/>
     {hasCompletedDocuments && <section className="next-step-card"><div><p className="eyebrow">{t("documents.nextStep.eyebrow")}</p><h2>{t("documents.nextStep.title")}</h2><p>{t("documents.nextStep.description")}</p></div><div className="next-step-actions"><Button label={t("documents.nextStep.search")} variant="primary" onClick={onSearch}/><Button label={t("workflow.explore")} variant="secondary" onClick={onExplore}/></div></section>}
     {isUploadDrawerOpen && <div className="document-type-drawer-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) closeUploadDrawer(); }}><aside ref={uploadDrawerRef} className="document-type-drawer upload-drawer" role="dialog" aria-modal="true" aria-labelledby="upload-drawer-title" onMouseDown={event => event.stopPropagation()}><header className="document-type-drawer-header"><div><p className="eyebrow">{t("documents.pageHeading.eyebrow")}</p><h2 id="upload-drawer-title" tabIndex={-1} ref={uploadDrawerHeadingRef}>{t("documents.upload.addDocuments")}</h2><p>{t("documents.upload.formatNote")}</p></div><button type="button" className="drawer-close" onClick={closeUploadDrawer} aria-label={t("documentPreview.closeAriaLabel")}>×</button></header>{uploadForm}</aside></div>}
     {legalInstruments?.length > 0 && <div className="log-tabs" role="tablist"><button role="tab" aria-selected={libraryTab === "files"} className={libraryTab === "files" ? "selected" : ""} onClick={() => setLibraryTab("files")}>{t("documents.tabs.files")}</button><button role="tab" aria-selected={libraryTab === "legal"} className={libraryTab === "legal" ? "selected" : ""} onClick={() => setLibraryTab("legal")}>{t("documents.tabs.legal")}</button></div>}
@@ -1683,7 +1801,8 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
       {documentTotal > pageSize && <div className="document-pagination"><Button label={t("common.previous")} variant="ghost" size="sm" isDisabled={!hasPrevious || documentsLoading} onClick={() => setDocumentOffset(Math.max(0, documentOffset - pageSize))}/><span>{pageStart}–{pageEnd} / {documentTotal}</span><Button label={t("common.next")} variant="secondary" size="sm" isDisabled={!hasNext || documentsLoading} onClick={() => setDocumentOffset(documentOffset + pageSize)}/></div>}
     </section>}
     {libraryTab === "legal" && legalInstruments?.length > 0 && <LegalInstrumentsTab knowledgeBaseId={selectedKb.id} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={refreshGraph} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship} resolveLegalRegistry={resolveLegalRegistry} onOpenDocument={openDocumentFromLibrary}/>}
-    {pdfPreview && <PdfFilePreview preview={pdfPreview} onClose={onClosePdfPreview} onDownload={downloadOriginalDocument}/>}{documentPreview && <DocumentPreview preview={documentPreview} jobs={documentJobs} isPollingJobs={documentJobPolling} pollingError={documentJobPollError} templates={documentTemplates} legalInstrument={legalInstruments?.find(row => row.document_id === documentPreview.document_id)} onExtractLegal={extractLegalMetadata} onSaveLegal={saveLegalMetadata} onDeleteLegal={deleteLegalMetadata} onDownloadOriginal={downloadOriginalDocument} onRefreshMetadata={async () => { await openDocument({id: documentPreview.document_id, title: documentPreview.title, original_filename: documentPreview.original_filename, mime_type: documentPreview.mime_type}); await refreshDocuments(); }} onUpdateLegalInstrument={updateLegalInstrument} onClose={closeDocumentPreview}/>}<DocumentTypeDrawer open={isTypeDrawerOpen} templates={documentTemplates} onClose={closeTypeDrawer} onCreate={createDocumentTemplate} onUpdate={updateDocumentTemplate} onDeactivate={deactivateDocumentTemplate} onActivate={activateDocumentTemplate} onRename={renameDocumentTemplate} onDuplicate={duplicateDocumentTemplate} onPurge={purgeDocumentTemplate}/></>
+    <KnowledgeBaseQualityDrawer open={isQualityDrawerOpen} quality={knowledgeBaseQuality} loading={knowledgeBaseQualityLoading} onLoadPage={loadKnowledgeBaseQualityPage} onClose={closeQualityDrawer} onOpenDocument={document => { setIsQualityDrawerOpen(false); openDocument({id: document.document_id, title: document.title, original_filename: document.original_filename, mime_type: document.mime_type}, "quality"); }}/>
+    {pdfPreview && <PdfFilePreview preview={pdfPreview} onClose={onClosePdfPreview} onDownload={downloadOriginalDocument}/>}{documentPreview && <DocumentPreview preview={documentPreview} jobs={documentJobs} isPollingJobs={documentJobPolling} pollingError={documentJobPollError} templates={documentTemplates} legalInstrument={legalInstruments?.find(row => row.document_id === documentPreview.document_id)} onExtractLegal={extractLegalMetadata} onSaveLegal={saveLegalMetadata} onDeleteLegal={deleteLegalMetadata} onDownloadOriginal={downloadOriginalDocument} onRefreshMetadata={async () => { await openDocument({id: documentPreview.document_id, title: documentPreview.title, original_filename: documentPreview.original_filename, mime_type: documentPreview.mime_type}, documentPreview.initial_tab); await refreshDocuments(); }} onUpdateLegalInstrument={updateLegalInstrument} onClose={closeDocumentPreview}/>}<DocumentTypeDrawer open={isTypeDrawerOpen} templates={documentTemplates} onClose={closeTypeDrawer} onCreate={createDocumentTemplate} onUpdate={updateDocumentTemplate} onDeactivate={deactivateDocumentTemplate} onActivate={activateDocumentTemplate} onRename={renameDocumentTemplate} onDuplicate={duplicateDocumentTemplate} onPurge={purgeDocumentTemplate}/></>
 }
 
 const legalStatusLabel = (labels, status) => labels.status[status] || labels.status.unknown;
@@ -2785,8 +2904,6 @@ function PdfFilePreview({preview, onClose, onDownload}) {
   </div>;
 }
 
-const QUALITY_DIMENSIONS = ["content", "structure", "metadata", "retrieval", "citation", "graph"];
-
 function DocumentQualityPanel({quality}) {
   const {t} = useLanguage();
   if (!quality) return <p className="section-copy">{t("quality.unavailable")}</p>;
@@ -2806,7 +2923,7 @@ function DocumentQualityPanel({quality}) {
       <div><b>{metrics.metadata_populated || 0}/{metrics.metadata_fields || 0}</b><span>{t("quality.metric.metadata")}</span></div>
       <div><b>{Math.round((metrics.section_locator_coverage || 0) * 100)}%</b><span>{t("quality.metric.locators")}</span></div>
     </div>
-    {!!metrics.pages?.length && <div className="quality-page-map"><h3>{t("quality.pageMap")}</h3><div>{metrics.pages.map(page => <span key={page.page} className={`quality-page quality-page-${page.status}`} title={t(`quality.pageStatus.${page.status}`, {page: page.page, characters: page.characters})}>{page.page}</span>)}</div></div>}
+    {!!metrics.pages?.length && <div className="quality-page-map"><h3>{t("quality.pageMap")}</h3><div className="quality-page-legend"><span>✓ {t("quality.pageLegend.good")}</span><span>! {t("quality.pageLegend.warning")}</span><span>× {t("quality.pageLegend.empty")}</span></div><div>{metrics.pages.map((page, index) => { const label = t(`quality.pageStatus.${page.status}`, {page: page.page, characters: page.characters}); const marker = page.status === "good" ? "✓" : page.status === "warning" ? "!" : "×"; return <span key={`${page.page}:${index}`} className={`quality-page quality-page-${page.status}`} title={label} aria-label={label}><span aria-hidden="true">{marker} {page.page}</span></span>; })}</div></div>}
     <div className="quality-findings"><h3>{t("quality.findings")}</h3>{issues.length ? <ul>{issues.map(({code, severity}) => <li className={`quality-finding-${severity}`} key={`${severity}:${code}`}><span aria-hidden="true">{severity === "blocker" ? "×" : "!"}</span><div><b>{t(`quality.issue.${code}`)}</b><small>{t(`quality.issueHelp.${code}`)}</small></div></li>)}</ul> : <p className="quality-all-clear">✓ {t("quality.allClear")}</p>}</div>
     <p className="quality-evaluated">{t("quality.evaluated", {date: new Date(quality.evaluated_at).toLocaleString()})}</p>
   </section>;
@@ -2817,13 +2934,14 @@ function DocumentPreview({onRefreshMetadata, preview, jobs, isPollingJobs, polli
   const [editingLegal, setEditingLegal] = useState(false);
   const [legalDraft, setLegalDraft] = useState("");
   const [legalError, setLegalError] = useState("");
-  const [tab, setTab] = useState(["needs_review", "failed"].includes(preview.metadata_status) ? "metadata" : "content");
+  const defaultTab = () => preview.initial_tab || (["needs_review", "failed"].includes(preview.metadata_status) ? "metadata" : "content");
+  const [tab, setTab] = useState(defaultTab);
   const headingRef = useRef(null);
   const modalRef = useRef(null);
   const hasLegalMetadata = Boolean(preview.legal_metadata && Object.keys(preview.legal_metadata).length);
   const hasActiveExtraction = jobs.some(job => job.type === "EXTRACT_LEGAL_METADATA" && isActiveProcessingJob(job));
   const isExtracting = hasActiveExtraction;
-  useEffect(() => { setEditingLegal(false); setLegalError(""); setTab(["needs_review", "failed"].includes(preview.metadata_status) ? "metadata" : "content"); }, [preview.document_id]);
+  useEffect(() => { setEditingLegal(false); setLegalError(""); setTab(defaultTab()); }, [preview.document_id, preview.initial_tab]);
   useEffect(() => { if (!editingLegal) setLegalDraft(JSON.stringify(preview.legal_metadata || {articles: [], amendments: []}, null, 2)); }, [preview.legal_metadata, editingLegal]);
   useEffect(() => {
     headingRef.current?.focus();

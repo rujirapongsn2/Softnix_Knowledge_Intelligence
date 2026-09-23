@@ -1,13 +1,15 @@
 """Deterministic document quality signals for AI retrieval and citations."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import case, func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from .config import get_settings
 from .models import Document, DocumentChunk, Entity, EntitySource, LegalInstrument
@@ -61,6 +63,16 @@ def _normal(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+def _has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return bool(value)
+    return True
+
+
 def _metadata_consistency(document: Document) -> list[str]:
     custom = document.document_metadata or {}
     legal = document.legal_metadata or {}
@@ -77,17 +89,39 @@ def _metadata_consistency(document: Document) -> list[str]:
     return conflicts
 
 
-def build_document_quality_report(db: Session, document: Document) -> dict[str, Any]:
-    """Return explainable readiness dimensions without an LLM quality judge."""
-    text = document.extracted_text or ""
-    is_legal = document.document_type in LEGAL_TYPES
-    source_available = _file_available(document)
-    chunks = db.query(
+def _quality_context(db: Session, document_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not document_ids:
+        return {}
+    context = {document_id: {} for document_id in document_ids}
+    normalized_chunk_content = func.replace(func.replace(func.replace(func.replace(
+        DocumentChunk.content, " ", "",
+    ), "\n", ""), "\r", ""), "\t", "")
+    chunk_rows = db.query(
+        DocumentChunk.document_id,
         func.count(DocumentChunk.id),
         func.count(DocumentChunk.embedding),
         func.sum(case((DocumentChunk.section_label.is_not(None), 1), else_=0)),
-        func.sum(case((DocumentChunk.content != "", 1), else_=0)),
-    ).filter(DocumentChunk.document_id == document.id).one()
+        func.sum(case((func.length(normalized_chunk_content) > 0, 1), else_=0)),
+    ).filter(DocumentChunk.document_id.in_(document_ids)).group_by(DocumentChunk.document_id).all()
+    for document_id, chunks, embeddings, sections, content_chunks in chunk_rows:
+        context[document_id]["chunks"] = (chunks, embeddings, sections, content_chunks)
+    for instrument in db.query(LegalInstrument).filter(LegalInstrument.document_id.in_(document_ids)).all():
+        context[instrument.document_id]["instrument"] = instrument
+    legal_source_rows = db.query(EntitySource.document_id, func.count(EntitySource.id)).join(
+        Entity, Entity.id == EntitySource.entity_id,
+    ).filter(
+        EntitySource.document_id.in_(document_ids), Entity.is_legal.is_(True), Entity.deleted_at.is_(None),
+    ).group_by(EntitySource.document_id).all()
+    for document_id, count in legal_source_rows:
+        context[document_id]["legal_sources"] = int(count or 0)
+    return context
+
+
+def _build_document_quality_report(document: Document, context: dict[str, Any], *, include_page_details: bool) -> dict[str, Any]:
+    text = document.extracted_text or ""
+    is_legal = document.document_type in LEGAL_TYPES
+    source_available = _file_available(document)
+    chunks = context.get("chunks", (0, 0, 0, 0))
     chunk_count = int(chunks[0] or 0)
     embedding_count = int(chunks[1] or 0)
     section_count = int(chunks[2] or 0)
@@ -118,8 +152,8 @@ def build_document_quality_report(db: Session, document: Document) -> dict[str, 
     values = document.document_metadata or {}
     observations = document.metadata_observations or {}
     required = [field for field in fields if field.get("required")]
-    populated = [field for field in fields if values.get(field["key"]) not in (None, "")]
-    required_populated = [field for field in required if values.get(field["key"]) not in (None, "")]
+    populated = [field for field in fields if _has_value(values.get(field["key"]))]
+    required_populated = [field for field in required if _has_value(values.get(field["key"]))]
     conflicts = [key for key, observation in observations.items() if isinstance(observation, dict) and observation.get("status") in {"conflict", "invalid_evidence"}]
     consistency_conflicts = _metadata_consistency(document)
     verified = [key for key, observation in observations.items() if isinstance(observation, dict) and observation.get("status") in {"human_verified", "not_found_confirmed"}]
@@ -148,12 +182,8 @@ def build_document_quality_report(db: Session, document: Document) -> dict[str, 
         citation_score += 25 * (content_chunk_count / chunk_count)
         citation_score += 25 * section_coverage if is_legal else 25
 
-    instrument = db.query(LegalInstrument).filter_by(document_id=document.id).first() if is_legal else None
-    legal_sources = 0
-    if is_legal:
-        legal_sources = db.query(func.count(EntitySource.id)).join(Entity, Entity.id == EntitySource.entity_id).filter(
-            EntitySource.document_id == document.id, Entity.is_legal.is_(True), Entity.deleted_at.is_(None),
-        ).scalar() or 0
+    instrument = context.get("instrument") if is_legal else None
+    legal_sources = context.get("legal_sources", 0) if is_legal else 0
     graph_score = 100 if not is_legal else (100 if instrument and legal_sources else 55 if instrument else 0)
 
     dimensions = {
@@ -170,9 +200,14 @@ def build_document_quality_report(db: Session, document: Document) -> dict[str, 
     warnings: list[str] = []
     if document.status != "completed": blockers.append("processing_incomplete")
     if not source_available: blockers.append("source_file_missing")
-    if not text.strip(): blockers.append("text_missing")
+    # Some ingestion paths persist normalized chunks without retaining the
+    # full extracted-text copy. Those chunks are still usable retrieval
+    # evidence, so missing extracted_text is only fatal when no usable chunk
+    # content exists either.
+    if not text.strip() and not content_chunk_count: blockers.append("text_missing")
+    elif not text.strip(): warnings.append("text_missing")
     if not chunk_count: blockers.append("chunks_missing")
-    if chunk_count and not embedding_count: blockers.append("embeddings_missing")
+    if chunk_count and not embedding_count: warnings.append("embeddings_missing")
     if 0 < embedding_count < chunk_count: warnings.append("embedding_coverage_partial")
     if anomaly_count: warnings.append("ocr_anomaly_detected")
     if empty_pages: warnings.append("empty_ocr_pages")
@@ -210,7 +245,7 @@ def build_document_quality_report(db: Session, document: Document) -> dict[str, 
             "text_characters": len(text),
             "ocr_pages": page_count,
             "empty_ocr_pages": empty_pages,
-            "pages": pages,
+            **({"pages": pages} if include_page_details else {}),
             "text_anomalies": anomaly_count,
             "chunks": chunk_count,
             "embedded_chunks": embedding_count,
@@ -223,5 +258,137 @@ def build_document_quality_report(db: Session, document: Document) -> dict[str, 
         },
         "content_revision": document.checksum_sha256,
         "metadata_revision": document.metadata_revision,
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _quality_fingerprint(document: Document, context: dict[str, Any]) -> str:
+    """Hash every persisted signal that can change a summary quality score."""
+    instrument = context.get("instrument")
+    payload = {
+        "status": document.status,
+        "checksum": document.checksum_sha256,
+        "indexed_at": document.indexed_at.isoformat() if document.indexed_at else None,
+        "document_type": document.document_type,
+        "metadata_revision": document.metadata_revision,
+        "metadata_status": document.metadata_status,
+        "metadata_template_fields": document.metadata_template_fields or [],
+        "document_metadata": document.document_metadata or {},
+        "metadata_observations": document.metadata_observations or {},
+        "legal_metadata": document.legal_metadata,
+        "source_available": _file_available(document),
+        "chunks": context.get("chunks", (0, 0, 0, 0)),
+        "instrument": {
+            "id": instrument.id,
+            "review_status": instrument.review_status,
+            "updated_at": instrument.updated_at.isoformat() if instrument.updated_at else None,
+        } if instrument else None,
+        "legal_sources": context.get("legal_sources", 0),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_document_quality_reports(db: Session, documents: list[Document], *, include_page_details: bool = False,
+                                   use_cache: bool = False) -> dict[str, dict[str, Any]]:
+    """Build reports with a fixed three-query context, independent of document count."""
+    context = _quality_context(db, [document.id for document in documents])
+    reports = {}
+    evaluated_at = datetime.now(timezone.utc)
+    fingerprints = {
+        document.id: _quality_fingerprint(document, context.get(document.id, {}))
+        for document in documents
+    } if use_cache and not include_page_details else {}
+    stale_ids = [
+        document.id for document in documents
+        if not fingerprints.get(document.id)
+        or document.quality_fingerprint != fingerprints[document.id]
+        or not isinstance(document.quality_report, dict)
+    ]
+    fresh_documents = {
+        document.id: document for document in db.query(Document).filter(Document.id.in_(stale_ids))
+        .execution_options(populate_existing=True).all()
+    } if stale_ids and use_cache else {}
+    for document in documents:
+        document_context = context.get(document.id, {})
+        fingerprint = fingerprints.get(document.id)
+        if fingerprint and document.quality_fingerprint == fingerprint and isinstance(document.quality_report, dict):
+            reports[document.id] = document.quality_report
+            continue
+        document = fresh_documents.get(document.id, document)
+        report = _build_document_quality_report(document, document_context, include_page_details=include_page_details)
+        reports[document.id] = report
+        if fingerprint:
+            document.quality_report = report
+            document.quality_fingerprint = fingerprint
+            document.quality_evaluated_at = evaluated_at
+    return reports
+
+
+def build_document_quality_report(db: Session, document: Document, *, include_page_details: bool = True) -> dict[str, Any]:
+    """Return explainable readiness dimensions without an LLM quality judge."""
+    return build_document_quality_reports(db, [document], include_page_details=include_page_details)[document.id]
+
+
+def build_knowledge_base_quality_report(db: Session, knowledge_base_id: str, *, limit: int = 50,
+                                        offset: int = 0) -> dict[str, Any]:
+    """Aggregate every active document's readiness using an equal-weight mean."""
+    documents = db.query(Document).options(load_only(
+        Document.id, Document.title, Document.original_filename, Document.mime_type, Document.storage_path,
+        Document.status, Document.checksum_sha256, Document.indexed_at, Document.document_type,
+        Document.metadata_revision, Document.metadata_status, Document.metadata_template_fields,
+        Document.document_metadata, Document.metadata_observations, Document.legal_metadata,
+        Document.quality_report, Document.quality_fingerprint, Document.quality_evaluated_at,
+    )).filter(
+        Document.knowledge_base_id == knowledge_base_id,
+        Document.deleted_at.is_(None),
+    ).order_by(Document.created_at.desc()).all()
+    reports = build_document_quality_reports(db, documents, include_page_details=False, use_cache=True)
+    dimensions = ("content", "structure", "metadata", "retrieval", "citation", "graph")
+    document_rows = [{
+        "document_id": document.id,
+        "title": document.title or document.original_filename,
+        "original_filename": document.original_filename,
+        "mime_type": document.mime_type,
+        "document_status": document.status,
+        "score": reports[document.id]["score"],
+        "status": reports[document.id]["status"],
+        "dimensions": reports[document.id]["dimensions"],
+        "blockers": reports[document.id]["blockers"],
+        "warnings": reports[document.id]["warnings"],
+        "evaluated_at": reports[document.id]["evaluated_at"],
+    } for document in documents]
+    count = len(document_rows)
+    status_counts = {status: sum(row["status"] == status for row in document_rows) for status in (
+        "not_queryable", "needs_review", "ai_ready", "verified",
+    )}
+    score = round(sum(row["score"] for row in document_rows) / count) if count else 0
+    dimension_scores = {
+        dimension: round(sum(row["dimensions"][dimension] for row in document_rows) / count) if count else 0
+        for dimension in dimensions
+    }
+    if not count:
+        status = "not_available"
+    elif status_counts["verified"] == count:
+        status = "verified"
+    elif status_counts["not_queryable"] == count:
+        status = "not_queryable"
+    elif status_counts["not_queryable"] or status_counts["needs_review"] or score < 80:
+        status = "needs_review"
+    else:
+        status = "ai_ready"
+    document_rows.sort(key=lambda row: (row["score"], row["title"].casefold()))
+    return {
+        "schema_version": "ski.kb-quality.v1",
+        "knowledge_base_id": knowledge_base_id,
+        "score": score,
+        "status": status,
+        "dimensions": dimension_scores,
+        "document_count": count,
+        "status_counts": status_counts,
+        "aggregation_method": "equal_weight_mean",
+        "documents": document_rows[offset:offset + limit] if limit else [],
+        "document_limit": limit,
+        "document_offset": offset,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
     }

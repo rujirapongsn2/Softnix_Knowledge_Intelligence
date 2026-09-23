@@ -6,6 +6,7 @@ import json
 import re
 import time
 import unicodedata
+import uuid
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,7 +23,7 @@ from .graph_store import Neo4jGraphStore
 from .legal_registry import provision_number_matches, resolve_instrument_statuses
 from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, Group, KbOwner, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, ROLE_ADMIN, TokenKey, TraceRun, TraceSpan, User
 from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, custom_template_fields, list_templates, merge_profile_fields, metadata_search_text, resolve_template, template_code, validate_metadata_values
-from .data_quality import build_document_quality_report
+from .data_quality import build_document_quality_report, build_knowledge_base_quality_report
 from .metadata_search import describe_schema
 from .metadata_extraction import queue_metadata_extraction, update_status as update_metadata_status
 from .observability import metrics, now
@@ -542,6 +543,104 @@ def update_kb_icon(kb_id: str, payload: KnowledgeBaseIconUpdate, user: User = De
     return kb
 
 
+KB_COVER_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _valid_png(data: bytes) -> bool:
+    return (len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR"
+            and int.from_bytes(data[16:20], "big") > 0 and int.from_bytes(data[20:24], "big") > 0)
+
+
+def _valid_jpeg(data: bytes) -> bool:
+    return len(data) >= 11 and data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9")
+
+
+def _valid_webp(data: bytes) -> bool:
+    return (len(data) >= 20 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+            and data[12:16] in {b"VP8 ", b"VP8L", b"VP8X"}
+            and int.from_bytes(data[4:8], "little") + 8 == len(data))
+
+
+KB_COVER_FORMATS = {
+    "image/jpeg": (".jpg", _valid_jpeg),
+    "image/png": (".png", _valid_png),
+    "image/webp": (".webp", _valid_webp),
+}
+
+
+def _knowledge_base_cover_path(relative_path: str) -> Path:
+    root = get_settings().file_root.resolve()
+    candidate = (root / relative_path).resolve()
+    if root not in candidate.parents:
+        raise HTTPException(404, "Knowledge Base cover not found")
+    return candidate
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/cover", response_model=KnowledgeBaseOut)
+async def upload_kb_cover(kb_id: str, file: UploadFile = File(...), user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
+    mime_type = (file.content_type or "").lower()
+    format_config = KB_COVER_FORMATS.get(mime_type)
+    if not format_config:
+        raise HTTPException(415, {"code": "KB_COVER_TYPE_UNSUPPORTED", "message": "Use a JPEG, PNG, or WebP image.", "retryable": False})
+    content = await file.read(KB_COVER_MAX_BYTES + 1)
+    if len(content) > KB_COVER_MAX_BYTES:
+        raise HTTPException(413, {"code": "KB_COVER_TOO_LARGE", "message": "Cover images must be 5 MB or smaller.", "retryable": False})
+    suffix, signature_matches = format_config
+    if not content or not signature_matches(content):
+        raise HTTPException(400, {"code": "KB_COVER_INVALID", "message": "The uploaded file is not a valid image of the selected type.", "retryable": False})
+
+    relative_path = f"knowledge-base-covers/{kb.id}/{uuid.uuid4().hex}{suffix}"
+    destination = _knowledge_base_cover_path(relative_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(content)
+    previous_path = kb.cover_image_path
+    try:
+        kb.cover_image_path = relative_path
+        kb.cover_image_mime_type = mime_type
+        record_audit(db, "knowledge_base.cover.update", user.id, "knowledge_base", kb.id,
+                     {"mime_type": mime_type, "size_bytes": len(content)})
+        db.commit(); db.refresh(kb)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    if previous_path:
+        _knowledge_base_cover_path(previous_path).unlink(missing_ok=True)
+    return kb
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/cover")
+def get_kb_cover(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at or not kb.cover_image_path:
+        raise HTTPException(404, "Knowledge Base cover not found")
+    assert_kb_access(db, user, kb_id)
+    path = _knowledge_base_cover_path(kb.cover_image_path)
+    if not path.is_file():
+        raise HTTPException(404, "Knowledge Base cover not found")
+    return FileResponse(path, media_type=kb.cover_image_mime_type or "application/octet-stream",
+                        headers={"Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff"})
+
+
+@app.delete("/api/v1/knowledge-bases/{kb_id}/cover", response_model=KnowledgeBaseOut)
+def delete_kb_cover(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
+    previous_path = kb.cover_image_path
+    kb.cover_image_path = None
+    kb.cover_image_mime_type = None
+    record_audit(db, "knowledge_base.cover.delete", user.id, "knowledge_base", kb.id)
+    db.commit(); db.refresh(kb)
+    if previous_path:
+        _knowledge_base_cover_path(previous_path).unlink(missing_ok=True)
+    return kb
+
+
 @app.patch("/api/v1/knowledge-bases/{kb_id}/rename", response_model=KnowledgeBaseOut)
 def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     """Rename a Knowledge Base without touching its stable code.
@@ -592,7 +691,10 @@ def delete_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Dep
     assert_kb_access(db, user, kb_id)
     if db.query(Document.id).filter_by(knowledge_base_id=kb.id).filter(Document.deleted_at.is_(None)).first():
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_NOT_EMPTY", "message": "Delete or move all documents before deleting this Knowledge Base.", "retryable": False})
+    cover_path = kb.cover_image_path
     kb.deleted_at, kb.status = datetime.utcnow(), "deleted"
+    kb.cover_image_path = None
+    kb.cover_image_mime_type = None
     # Tokens scoped (either axis) to a deleted KB are revoked immediately —
     # leaving them active would grant access to a KB that no longer resolves.
     revoked = 0
@@ -603,6 +705,8 @@ def delete_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Dep
             revoked += 1
     record_audit(db, "knowledge_base.delete", user.id, "knowledge_base", kb.id, {"revoked_tokens": revoked})
     db.commit()
+    if cover_path:
+        _knowledge_base_cover_path(cover_path).unlink(missing_ok=True)
     return {"status": "deleted", "knowledge_base_id": kb.id, "revoked_tokens": revoked}
 
 
@@ -957,6 +1061,19 @@ def list_documents(kb_id: str, include_deleted: bool = False, user: User = Depen
                         processing_job_stage=job.current_stage, processing_job_progress_percent=job.progress_percent)
         result.append(item)
     return result
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/quality-readiness")
+def knowledge_base_quality_readiness(kb_id: str, limit: int = 50, offset: int = 0,
+                                     user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    if not db.get(KnowledgeBase, kb_id):
+        raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
+    if limit < 0 or limit > 100 or offset < 0:
+        raise HTTPException(400, {"code": "QUALITY_PAGE_INVALID", "message": "limit must be 0-100 and offset must be non-negative.", "retryable": False})
+    report = build_knowledge_base_quality_report(db, kb_id, limit=limit, offset=offset)
+    db.commit()
+    return report
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/documents/reindex")

@@ -85,6 +85,7 @@ class KnowledgeBaseOut(ORMModel):
     name: str
     description: str | None
     icon: str
+    cover_image_url: str | None = None
     default_language: str
     status: str
     retrieval_config: dict[str, Any]
@@ -170,7 +171,7 @@ class DocumentMetadataUpdate(BaseModel):
 class MetadataFieldDefinition(BaseModel):
     key: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
     label: str = Field(min_length=1, max_length=160)
-    field_type: Literal["text", "textarea", "date", "number", "select", "boolean"] = "text"
+    field_type: Literal["text", "textarea", "date", "number", "select", "multi_select", "boolean"] = "text"
     required: bool = False
     fill_mode: Literal["manual", "extract"] = "manual"
     extraction_description: str | None = Field(default=None, max_length=1000)
@@ -207,7 +208,7 @@ class MetadataFieldDefinition(BaseModel):
     @model_validator(mode="after")
     def validate_options(self):
         self.options = [option.strip() for option in self.options if option.strip()]
-        if self.field_type == "select" and not self.options:
+        if self.field_type in {"select", "multi_select"} and not self.options:
             raise ValueError("Select fields must define at least one option.")
         if len(set(self.options)) != len(self.options):
             raise ValueError("Select field options must be unique.")

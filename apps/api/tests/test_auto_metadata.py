@@ -208,6 +208,47 @@ def test_typed_filters_schema_scope_and_inventory():
     assert "error" in denied
 
 
+def test_multi_select_upload_validation_indexing_and_typed_filters():
+    import json
+
+    api = next(client())
+    values = {"categories": ["Policy", "Guidance"]}
+    categories = field("categories", field_type="multi_select", options=["Policy", "Guidance", "Notice"])
+    kb, template, doc_id = setup_document(api, [categories], values)
+
+    # Arrays must contain distinct values from the field's configured options.
+    for invalid_values in (["Unknown"], ["Policy", "Policy"]):
+        response = api.post(
+            f"/api/v1/knowledge-bases/{kb['id']}/documents",
+            data={"template_id": template["id"], "metadata_json": json.dumps({"categories": invalid_values})},
+            files={"file": ("invalid.txt", b"Category test", "text/plain")},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "DOCUMENT_METADATA_INVALID"
+
+    with SessionLocal() as db:
+        sync_document_metadata_values(db, db.get(Document, doc_id))
+        db.commit()
+        indexed = db.query(DocumentMetadataValue.value_text).filter_by(
+            document_id=doc_id, field_key="categories", value_type="multi_select",
+        ).order_by(DocumentMetadataValue.value_text).all()
+        assert indexed == [("Guidance",), ("Policy",)]
+
+        def matching_ids(operator, operands):
+            predicate = MetadataPredicate(
+                template_id=template["id"], field_key="categories", field_type="multi_select",
+                operator=operator, values=operands,
+            )
+            return apply_typed_predicates(
+                db.query(Document.id).filter(Document.knowledge_base_id == kb["id"]), [predicate],
+            ).all()
+
+        assert matching_ids("eq", ["Policy"]) == [(doc_id,)]
+        assert matching_ids("in", ["Notice", "Guidance"]) == [(doc_id,)]
+        assert matching_ids("eq", ["Notice"]) == []
+        assert describe_schema(db, [kb["id"]])["operators"]["multi_select"] == ["eq", "in"]
+
+
 def test_main_pipeline_queues_metadata_after_index(monkeypatch):
     api = next(client())
     _, _, doc_id = setup_document(api)

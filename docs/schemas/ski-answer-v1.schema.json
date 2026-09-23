@@ -48,7 +48,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "citation_id", "document_id", "title", "file", "locator"],
+        "required": ["id", "citation_id", "document_id", "title", "file", "locator", "quality"],
         "properties": {
           "id": { "type": "string" },
           "citation_id": { "type": ["string", "null"] },

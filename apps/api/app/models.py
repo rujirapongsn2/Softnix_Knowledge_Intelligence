@@ -67,12 +67,26 @@ class KnowledgeBase(Timestamped, Base):
     # A small, allow-listed UI key.  The browser maps it to its own inline SVG
     # rather than accepting user-supplied markup or external image URLs.
     icon: Mapped[str] = mapped_column(String(40), default="auto")
+    # Stored as a path relative to FILE_STORAGE_PATH.  API responses expose a
+    # protected same-origin URL instead of leaking the server filesystem.
+    cover_image_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    cover_image_mime_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
     default_language: Mapped[str] = mapped_column(String(20), default="auto")
     status: Mapped[str] = mapped_column(String(20), default="draft")
     retrieval_config: Mapped[dict] = mapped_column(JSON, default=dict)
     entity_schema: Mapped[dict] = mapped_column(JSON, default=dict)
     relationship_schema: Mapped[dict] = mapped_column(JSON, default=dict)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def cover_image_url(self) -> str | None:
+        if not self.cover_image_path:
+            return None
+        # The generated filename changes for every replacement, so the browser
+        # cannot reuse an earlier private cached image even when two uploads
+        # happen within the same second.
+        version = self.cover_image_path.rsplit("/", 1)[-1].split(".", 1)[0]
+        return f"/api/v1/knowledge-bases/{self.id}/cover?v={version}"
 
 
 class DocumentMetadataTemplate(Timestamped, Base):
@@ -141,6 +155,9 @@ class Document(Timestamped, Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     legal_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     indexed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    quality_report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    quality_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    quality_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     external_engine_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
@@ -158,7 +175,6 @@ class DocumentMetadataValue(Base):
     value_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     __table_args__ = (
-        UniqueConstraint("document_id", "field_key", name="uq_document_metadata_value"),
         Index("ix_document_metadata_number", "knowledge_base_id", "field_key", "value_number"),
         Index("ix_document_metadata_date", "knowledge_base_id", "field_key", "value_date"),
         Index("ix_document_metadata_filter", "knowledge_base_id", "field_key", "value_text"),

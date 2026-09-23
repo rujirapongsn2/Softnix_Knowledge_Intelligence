@@ -50,9 +50,9 @@ export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFi
       const status = observation.status || (values[field.key] !== undefined ? "legacy_manual" : "not_started");
       return <article className="metadata-review-field" key={field.key}>
         <div className="preview-heading"><strong>{field.label}</strong><span className="metadata-status">{t(`autoMetadata.${status}`)}</span></div>
-        {values[field.key] !== undefined && <p className="metadata-effective-value">{String(values[field.key])}</p>}
+        {values[field.key] !== undefined && <p className="metadata-effective-value">{Array.isArray(values[field.key]) ? values[field.key].join(", ") : String(values[field.key])}</p>}
         {(observation.candidates || []).map((candidate, index) => <div className="metadata-candidate" key={index}>
-          <div><span>{String(candidate.value)}</span>{needsReview(field) && <Button label={t("autoMetadata.confirm")} size="sm" variant="secondary" isDisabled={busy || running} onClick={() => review(field, "confirm", {candidate_index: index})}/>}</div>
+          <div><span>{Array.isArray(candidate.value) ? candidate.value.join(", ") : String(candidate.value)}</span>{needsReview(field) && <Button label={t("autoMetadata.confirm")} size="sm" variant="secondary" isDisabled={busy || running} onClick={() => review(field, "confirm", {candidate_index: index})}/>}</div>
           <blockquote>{candidate.evidence.quote}</blockquote>
           <details><summary>{t("autoMetadata.sourceContext")}</summary><pre>{preview.text?.slice(Math.max(0, candidate.evidence.char_start - 220), candidate.evidence.char_end + 220)}</pre></details>
         </div>)}

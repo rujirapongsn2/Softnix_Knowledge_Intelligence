@@ -184,6 +184,38 @@ def test_knowledge_base_icon_is_allow_listed_and_persistent():
     assert invalid.status_code == 422
 
 
+def test_knowledge_base_cover_can_be_uploaded_served_replaced_and_removed():
+    test_client = next(client())
+    kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Visual library", "code": "visual-library"}).json()
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d4944415408d763f8cfc0f01f00050001ff89993d1d0000000049454e44ae426082"
+    )
+
+    uploaded = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/cover",
+        files={"file": ("cover.png", png, "image/png")},
+    )
+    assert uploaded.status_code == 200
+    assert uploaded.json()["cover_image_url"].startswith(f"/api/v1/knowledge-bases/{kb['id']}/cover?v=")
+    served = test_client.get(uploaded.json()["cover_image_url"])
+    assert served.status_code == 200
+    assert served.headers["content-type"] == "image/png"
+    assert served.content == png
+
+    rejected = test_client.post(
+        f"/api/v1/knowledge-bases/{kb['id']}/cover",
+        files={"file": ("fake.png", b"not an image", "image/png")},
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "KB_COVER_INVALID"
+    assert test_client.get(uploaded.json()["cover_image_url"]).content == png
+
+    removed = test_client.delete(f"/api/v1/knowledge-bases/{kb['id']}/cover")
+    assert removed.status_code == 200 and removed.json()["cover_image_url"] is None
+    assert test_client.get(f"/api/v1/knowledge-bases/{kb['id']}/cover").status_code == 404
+
+
 def test_retrieval_policy_can_be_updated_and_is_returned_in_kb_contract():
     test_client = next(client())
     kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Planner policy", "code": "planner-policy"}).json()

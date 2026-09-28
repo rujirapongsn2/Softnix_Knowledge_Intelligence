@@ -1,6 +1,7 @@
 import os
 import tempfile
 import uuid
+from pathlib import Path
 
 _TEST_ROOT = tempfile.mkdtemp()
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_ROOT}/skip.db"
@@ -142,6 +143,64 @@ def test_reference_pdf_can_attach_after_text_ingest_without_creating_pdf_job():
     with SessionLocal() as db:
         assert db.query(Document).filter_by(knowledge_base_id=kb_id).count() == 1
         assert db.query(ProcessingJob).filter_by(document_id=doc_id).count() == 1
+
+
+def test_saved_answer_and_references_refresh_when_pdf_is_attached_later():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-late-evidence-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    uploaded = test_client.post(
+        f"/api/v1/ingest/knowledge-bases/{kb_id}/documents/text",
+        headers=_headers(secret), json={"title": "QRA 927", "text": "# QRA 927\nThe docket code is QRA-927."},
+    )
+    assert uploaded.status_code == 202
+    doc_id = uploaded.json()["document_id"]
+    _drain(test_client)
+    mcp_token = test_client.post("/api/v1/tokens", json={
+        "name": "late-pdf-reader", "allowed_knowledge_base_ids": [kb_id],
+        "allowed_tools": ["search_knowledge", "get_sources"],
+    }).json()["token"]
+    searched = test_client.post("/mcp", headers=_headers(mcp_token), json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "search_knowledge", "arguments": {"query": "What is the docket code QRA-927?"}},
+    }).json()["result"]["structuredContent"]
+    assert "/file" in searched["answer"]
+    assert "?variant=reference_pdf" not in searched["answer"]
+
+    attached = test_client.post(f"/api/v1/ingest/documents/{doc_id}/reference-pdf",
+                                headers=_headers(secret), files={"file": ("qra.pdf", b"%PDF-1.4\nevidence", "application/pdf")})
+    assert attached.status_code == 200
+    result_id = searched["result_id"]
+    for refreshed in (
+        test_client.get(f"/api/v1/query/results/{result_id}/sources").json(),
+        test_client.post("/mcp", headers=_headers(mcp_token), json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "get_sources", "arguments": {"result_id": result_id}},
+        }).json()["result"]["structuredContent"],
+    ):
+        assert "?variant=reference_pdf" in refreshed["answer"]
+        assert refreshed["references"][0]["file"]["role"] == "reference_pdf"
+        assert refreshed["references"][0]["file"]["download_url"] in refreshed["answer"]
+
+
+def test_reference_pdf_remains_citable_if_markdown_blob_is_missing():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-missing-md-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    uploaded = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents",
+                                headers=_headers(secret), files={
+                                    "file": ("source.md", b"# Source", "text/markdown"),
+                                    "reference_pdf": ("source.pdf", b"%PDF-1.4\nevidence", "application/pdf"),
+                                })
+    assert uploaded.status_code == 202
+    doc_id = uploaded.json()["document_id"]
+    with SessionLocal() as db:
+        Path(db.get(Document, doc_id).storage_path).unlink()
+        sources = enrich_sources_with_file_links(db, [{"document_id": doc_id, "citation_id": "S1"}])
+    assert sources[0]["content_file"] is None
+    assert sources[0]["reference_pdf"]["available"] is True
+    assert sources[0]["download_url"].endswith("?variant=reference_pdf")
+    assert build_structured_references(sources)[0]["file"]["role"] == "reference_pdf"
 
 
 def test_reference_pdf_rejects_non_markdown_and_invalid_pdf():

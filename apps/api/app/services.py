@@ -1219,16 +1219,16 @@ def enrich_sources_with_file_links(db: Session, sources: list[dict], *, base_url
         document = documents.get(source.get("document_id"))
         if document and not isinstance(source.get("quality"), dict):
             source["quality"] = quality_by_document[document.id]
-        if not document or not document_file_available(document):
+        if not document:
             source["original_filename"] = None
             source["mime_type"] = None
             source["download_url"] = None
             source["content_file"] = None
             source["reference_pdf"] = None
             continue
-        content_url = document_download_url(document.id, base_url=base_url)
+        content_url = document_download_url(document.id, base_url=base_url) if document_file_available(document) else None
         source["content_file"] = {"name": document.original_filename, "mime_type": document.mime_type,
-                                  "download_url": content_url}
+                                  "download_url": content_url} if content_url else None
         source["reference_pdf"] = None
         if document.reference_pdf_path:
             pdf_url = document_download_url(document.id, base_url=base_url, variant="reference_pdf") if reference_pdf_available(document) else None
@@ -1239,8 +1239,8 @@ def enrich_sources_with_file_links(db: Session, sources: list[dict], *, base_url
                 source["mime_type"] = "application/pdf"
                 source["download_url"] = pdf_url
                 continue
-        source["original_filename"] = document.original_filename
-        source["mime_type"] = document.mime_type
+        source["original_filename"] = document.original_filename if content_url else None
+        source["mime_type"] = document.mime_type if content_url else None
         source["download_url"] = content_url
     return sources
 
@@ -3871,6 +3871,21 @@ def _render_citation_details(sources: list[dict]) -> str:
             detail += f" — {uri}"
         lines.append(detail)
     return "\n".join(lines)
+
+
+def refresh_saved_answer_citations(answer: str | None, stored_sources: list[dict], current_sources: list[dict]) -> str | None:
+    """Keep citation prose consistent with links refreshed for a saved result."""
+    if not answer or not stored_sources:
+        return answer
+    previous_details = _render_citation_details(stored_sources)
+    if not previous_details:
+        return answer
+    current_details = _render_citation_details(current_sources)
+    for heading in ("รายละเอียดแหล่งอ้างอิง:", "แหล่งอ้างอิง:"):
+        previous_block = f"{heading}\n{previous_details}"
+        if previous_block in answer:
+            return answer.replace(previous_block, f"{heading}\n{current_details}", 1)
+    return answer
 
 
 def compose_cited_answer(evidence: RetrievalEvidence, warnings: list[dict] | None = None) -> str:

@@ -1,5 +1,6 @@
 import os
 import tempfile
+import uuid
 
 _TEST_ROOT = tempfile.mkdtemp()
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_ROOT}/skip.db"
@@ -12,6 +13,9 @@ os.environ["EXT_OCR_KEY"] = ""
 
 from fastapi.testclient import TestClient
 from app.main import app
+from app.db import SessionLocal
+from app.models import Document, ProcessingJob
+from app.services import build_structured_references, enrich_sources_with_file_links
 
 INGEST_SCOPE = "documents:write"
 
@@ -64,6 +68,99 @@ def _drain(test_client) -> None:
 def _upload(test_client, secret: str, kb_id: str, name: str = "note.txt", body: bytes = b"Customer Portal runs on APP-01."):
     return test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents",
                             headers=_headers(secret), files={"file": (name, body, "text/plain")})
+
+
+def test_markdown_and_reference_pdf_are_one_document_with_pdf_citation():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-md-evidence-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    markdown = b"# Land law\nAtlas-741 runs on NODE-42."
+    pdf = b"%PDF-1.4\nreference-only evidence"
+    uploaded = test_client.post(
+        f"/api/v1/ingest/knowledge-bases/{kb_id}/documents",
+        headers=_headers(secret),
+        files={"file": ("land-law.md", markdown, "text/markdown"),
+               "reference_pdf": ("land-law.pdf", pdf, "application/pdf")},
+    )
+    assert uploaded.status_code == 202, uploaded.text
+    doc_id = uploaded.json()["document_id"]
+    assert uploaded.json()["reference_pdf"]["filename"] == "land-law.pdf"
+    with SessionLocal() as db:
+        docs = db.query(Document).filter_by(knowledge_base_id=kb_id).all()
+        assert len(docs) == 1 and docs[0].id == doc_id
+        assert db.query(ProcessingJob).filter_by(document_id=doc_id).count() == 1
+    assert test_client.get(f"/api/v1/ingest/documents/{doc_id}/file", headers=_headers(secret)).content == markdown
+    pdf_response = test_client.get(f"/api/v1/ingest/documents/{doc_id}/file?variant=reference_pdf", headers=_headers(secret))
+    assert pdf_response.status_code == 200 and pdf_response.content == pdf
+    assert pdf_response.headers["content-type"].startswith("application/pdf")
+    _drain(test_client)
+    detail = test_client.get(f"/api/v1/documents/{doc_id}/text").json()
+    assert detail["status"] == "completed"
+    assert detail["text"] == markdown.decode()
+    assert detail["reference_pdf"]["filename"] == "land-law.pdf"
+    with SessionLocal() as db:
+        sources = enrich_sources_with_file_links(db, [{"document_id": doc_id, "citation_id": "S1", "title": "Land law"}])
+    assert sources[0]["download_url"].endswith("?variant=reference_pdf")
+    reference = build_structured_references(sources)[0]
+    assert reference["file"]["role"] == "reference_pdf"
+    assert reference["file"]["name"] == "land-law.pdf"
+    assert reference["content_file"]["name"] == "land-law.md"
+    mcp_token = test_client.post("/api/v1/tokens", json={
+        "name": "reference-pdf-reader", "allowed_knowledge_base_ids": [kb_id],
+        "allowed_tools": ["search_knowledge", "get_sources"],
+    }).json()["token"]
+    reply = test_client.post("/mcp", headers=_headers(mcp_token), json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "search_knowledge", "arguments": {"query": "What runs on NODE-42?"}},
+    })
+    assert reply.status_code == 200, reply.text
+    structured = reply.json()["result"]["structuredContent"]
+    cited = next(item for item in structured["references"] if item["document_id"] == doc_id)
+    assert cited["file"]["role"] == "reference_pdf"
+    assert cited["file"]["download_url"].endswith("?variant=reference_pdf")
+    assert cited["content_file"]["name"] == "land-law.md"
+    pdf_for_agent = test_client.get(cited["file"]["download_url"], headers=_headers(mcp_token))
+    assert pdf_for_agent.status_code == 200 and pdf_for_agent.content == pdf
+
+
+def test_reference_pdf_can_attach_after_text_ingest_without_creating_pdf_job():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-text-evidence-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    uploaded = test_client.post(
+        f"/api/v1/ingest/knowledge-bases/{kb_id}/documents/text",
+        headers=_headers(secret), json={"title": "Land act", "text": "# Land act\nSource text."},
+    )
+    assert uploaded.status_code == 202
+    doc_id = uploaded.json()["document_id"]
+    attached = test_client.post(f"/api/v1/ingest/documents/{doc_id}/reference-pdf",
+                                headers=_headers(secret), files={"file": ("land-act.pdf", b"%PDF-1.4\nevidence", "application/pdf")})
+    assert attached.status_code == 200, attached.text
+    assert attached.json()["reference_pdf"]["download_url"].startswith("/api/v1/ingest/")
+    assert test_client.post(f"/api/v1/ingest/documents/{doc_id}/reference-pdf",
+                            headers=_headers(secret), files={"file": ("again.pdf", b"%PDF-1.4\nagain", "application/pdf")}).status_code == 409
+    with SessionLocal() as db:
+        assert db.query(Document).filter_by(knowledge_base_id=kb_id).count() == 1
+        assert db.query(ProcessingJob).filter_by(document_id=doc_id).count() == 1
+
+
+def test_reference_pdf_rejects_non_markdown_and_invalid_pdf():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-evidence-invalid-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    route = f"/api/v1/ingest/knowledge-bases/{kb_id}/documents"
+    non_md = test_client.post(route, headers=_headers(secret), files={
+        "file": ("notes.txt", b"notes", "text/plain"),
+        "reference_pdf": ("evidence.pdf", b"%PDF-1.4\nevidence", "application/pdf")})
+    assert non_md.status_code == 400
+    assert non_md.json()["error"]["code"] == "REFERENCE_PDF_REQUIRES_MARKDOWN"
+    invalid = test_client.post(route, headers=_headers(secret), files={
+        "file": ("notes.md", b"notes", "text/markdown"),
+        "reference_pdf": ("fake.pdf", b"not a pdf", "application/pdf")})
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["code"] == "REFERENCE_PDF_INVALID"
+    with SessionLocal() as db:
+        assert db.query(Document).filter_by(knowledge_base_id=kb_id).count() == 0
 
 
 def test_token_without_ingest_scope_cannot_write():

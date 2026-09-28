@@ -1017,6 +1017,20 @@ def store_upload(upload, knowledge_base_id: str) -> tuple[str, str, int, str, st
     return str(destination), stored_name, size, digest.hexdigest(), mime_type
 
 
+def store_reference_pdf(upload, knowledge_base_id: str) -> tuple[str, str, int, str]:
+    """Store evidence bytes only; never create a processing job for them."""
+    if Path(upload.filename or "").suffix.lower() != ".pdf":
+        raise ValueError("REFERENCE_PDF_INVALID")
+    path, _stored, size, checksum, _mime = store_upload(upload, knowledge_base_id)
+    with Path(path).open("rb") as stored_pdf:
+        header = stored_pdf.read(5)
+    if size < 5 or header != b"%PDF-":
+        Path(path).unlink(missing_ok=True)
+        raise ValueError("REFERENCE_PDF_INVALID")
+    filename = (upload.filename or "reference.pdf").replace("\\", "/").rsplit("/", 1)[-1]
+    return path, filename, size, checksum
+
+
 DOCUMENT_TYPES = {"general", "legal", "regulation", "contract"}
 LEGAL_DOCUMENT_TYPES = {"legal", "regulation", "contract"}
 
@@ -1146,13 +1160,26 @@ def document_file_available(document: Document) -> bool:
     return file_path.is_file()
 
 
-def document_download_url(document_id: str, *, base_url: str | None = None) -> str:
+def reference_pdf_available(document: Document) -> bool:
+    if not document or not document.reference_pdf_path:
+        return False
+    try:
+        file_path = Path(document.reference_pdf_path).resolve()
+        file_path.relative_to(get_settings().file_root.resolve())
+    except (OSError, ValueError):
+        return False
+    return file_path.is_file()
+
+
+def document_download_url(document_id: str, *, base_url: str | None = None, variant: str = "original") -> str:
     """Root-relative download path Agents call with the same MCP Bearer token.
 
     Absolute URLs are used only when a request base_url is supplied; otherwise
     Agents prepend the Softnix host. Authorization: Bearer <MCP token> is required.
     """
     relative = f"/api/v1/documents/{document_id}/file"
+    if variant == "reference_pdf":
+        relative += "?variant=reference_pdf"
     if base_url:
         return f"{base_url.rstrip('/')}{relative}"
     return relative
@@ -1171,12 +1198,9 @@ def enrich_sources_with_file_links(db: Session, sources: list[dict], *, base_url
         source.get("document_id") for source in sources
         if source.get("document_id") and not isinstance(source.get("quality"), dict)
     }
-    doc_ids = {
-        source.get("document_id") for source in sources
-        if source.get("document_id") and (
-            source.get("document_id") in unresolved_doc_ids or "download_url" not in source
-        )
-    }
+    # Refresh file links even for a stored result: a PDF may have been attached
+    # after the original query, or a file/document may have been removed.
+    doc_ids = {source.get("document_id") for source in sources if source.get("document_id")}
     if not doc_ids:
         return sources
     documents = {}
@@ -1196,13 +1220,28 @@ def enrich_sources_with_file_links(db: Session, sources: list[dict], *, base_url
         if document and not isinstance(source.get("quality"), dict):
             source["quality"] = quality_by_document[document.id]
         if not document or not document_file_available(document):
-            source.setdefault("original_filename", None)
-            source.setdefault("mime_type", None)
-            source.setdefault("download_url", None)
+            source["original_filename"] = None
+            source["mime_type"] = None
+            source["download_url"] = None
+            source["content_file"] = None
+            source["reference_pdf"] = None
             continue
+        content_url = document_download_url(document.id, base_url=base_url)
+        source["content_file"] = {"name": document.original_filename, "mime_type": document.mime_type,
+                                  "download_url": content_url}
+        source["reference_pdf"] = None
+        if document.reference_pdf_path:
+            pdf_url = document_download_url(document.id, base_url=base_url, variant="reference_pdf") if reference_pdf_available(document) else None
+            source["reference_pdf"] = {"name": document.reference_pdf_filename, "mime_type": "application/pdf",
+                                       "download_url": pdf_url, "available": bool(pdf_url)}
+            if pdf_url:
+                source["original_filename"] = document.reference_pdf_filename
+                source["mime_type"] = "application/pdf"
+                source["download_url"] = pdf_url
+                continue
         source["original_filename"] = document.original_filename
         source["mime_type"] = document.mime_type
-        source["download_url"] = document_download_url(document.id, base_url=base_url)
+        source["download_url"] = content_url
     return sources
 
 
@@ -2001,7 +2040,8 @@ def build_document_inventory_result(db: Session, query: str, kb_ids: list[str], 
 
 
 def create_document_job(db: Session, knowledge_base_id: str, upload, title: str | None = None, document_type: str = "general", published_at=None,
-                        metadata_template: dict | None = None, document_metadata: dict | None = None) -> tuple[Document, ProcessingJob]:
+                        metadata_template: dict | None = None, document_metadata: dict | None = None,
+                        reference_pdf=None) -> tuple[Document, ProcessingJob]:
     if document_type not in DOCUMENT_TYPES:
         raise ValueError("DOCUMENT_TYPE_INVALID")
     path, stored, size, checksum, mime = store_upload(upload, knowledge_base_id)
@@ -2009,6 +2049,16 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
     if duplicate:
         Path(path).unlink(missing_ok=True)
         raise ValueError("FILE_DUPLICATE")
+    reference = None
+    if reference_pdf is not None:
+        if Path(upload.filename or "").suffix.lower() != ".md":
+            Path(path).unlink(missing_ok=True)
+            raise ValueError("REFERENCE_PDF_REQUIRES_MARKDOWN")
+        try:
+            reference = store_reference_pdf(reference_pdf, knowledge_base_id)
+        except Exception:
+            Path(path).unlink(missing_ok=True)
+            raise
     fields = normalize_field_definitions((metadata_template or {}).get("fields") or [])
     values = document_metadata or {}
     doc = Document(knowledge_base_id=knowledge_base_id, original_filename=upload.filename or stored,
@@ -2020,7 +2070,11 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
                    metadata_template_version=(metadata_template or {}).get("version"),
                    metadata_template_fields=fields,
                    document_metadata=values,
-                   metadata_search_text=metadata_search_text(fields, values))
+                   metadata_search_text=metadata_search_text(fields, values),
+                   reference_pdf_path=reference[0] if reference else None,
+                   reference_pdf_filename=reference[1] if reference else None,
+                   reference_pdf_size=reference[2] if reference else None,
+                   reference_pdf_checksum_sha256=reference[3] if reference else None)
     db.add(doc)
     try:
         db.flush()
@@ -2034,12 +2088,25 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
         # Postgres (constraint_name lives in exc.orig.diag on PG only).
         detail = str(exc)
         if "uq_document_checksum" not in detail and "checksum_sha256" not in detail:
+            db.rollback()
+            Path(path).unlink(missing_ok=True)
+            if reference:
+                Path(reference[0]).unlink(missing_ok=True)
             raise
         db.rollback()
         Path(path).unlink(missing_ok=True)
+        if reference:
+            Path(reference[0]).unlink(missing_ok=True)
         raise ValueError("FILE_DUPLICATE") from None
     job = ProcessingJob(document_id=doc.id, knowledge_base_id=knowledge_base_id)
-    db.add(job); db.commit(); db.refresh(doc); db.refresh(job)
+    try:
+        db.add(job); db.commit(); db.refresh(doc); db.refresh(job)
+    except Exception:
+        db.rollback()
+        Path(path).unlink(missing_ok=True)
+        if reference:
+            Path(reference[0]).unlink(missing_ok=True)
+        raise
     return doc, job
 
 
@@ -3683,6 +3750,7 @@ def build_structured_references(sources: list[dict]) -> list[dict]:
             "title": source.get("title") or source.get("original_filename") or "Document",
             "file": {
                 "available": bool(download_url),
+                "role": "reference_pdf" if download_url and (source.get("reference_pdf") or {}).get("download_url") == download_url else "source",
                 "name": source.get("original_filename"),
                 "mime_type": source.get("mime_type"),
                 "download_url": download_url,
@@ -3692,6 +3760,8 @@ def build_structured_references(sources: list[dict]) -> list[dict]:
                     "disposition_parameter": "inline|attachment",
                 } if download_url else None,
             },
+            "content_file": source.get("content_file"),
+            "reference_pdf": source.get("reference_pdf"),
             "locator": {
                 "chunk_id": source.get("chunk_id"),
                 "section": source.get("section_label"),

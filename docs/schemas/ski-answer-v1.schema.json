@@ -66,6 +66,8 @@
             },
             "additionalProperties": true
           },
+          "content_file": {"type": ["object", "null"]},
+          "reference_pdf": {"type": ["object", "null"]},
           "locator": {
             "type": "object",
             "required": ["chunk_id", "section", "section_kind", "section_number", "page_start", "page_end"],

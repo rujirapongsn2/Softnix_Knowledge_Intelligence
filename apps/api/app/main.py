@@ -34,7 +34,7 @@ from .retention import prune_observability
 from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
-from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, apply_answer_reference_contract, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, entity_graph, process_next_job, queue_embedding_reindex, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
+from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, apply_answer_reference_contract, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, enrich_sources_with_file_links, entity_graph, process_next_job, public_document_base_url, queue_embedding_reindex, reference_pdf_available, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8080", "http://localhost:8081"], allow_credentials=True,
@@ -1095,13 +1095,27 @@ def document_text(document_id: str, user: User = Depends(current_admin), db: Ses
             "metadata_template_name": doc.metadata_template_name, "metadata_template_version": doc.metadata_template_version,
             "metadata_template_fields": doc.metadata_template_fields or [],
             "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata,
-            "quality": build_document_quality_report(db, doc)}
+            "quality": build_document_quality_report(db, doc),
+            "reference_pdf": reference_pdf_view(doc)}
 
 
-def resolve_document_file(doc: Document) -> Path:
+def reference_pdf_view(doc: Document, *, ingest: bool = False) -> dict | None:
+    if not doc.reference_pdf_path:
+        return None
+    route = "ingest/documents" if ingest else "documents"
+    available = reference_pdf_available(doc)
+    return {"filename": doc.reference_pdf_filename, "size": doc.reference_pdf_size,
+            "available": available,
+            "download_url": f"/api/v1/{route}/{doc.id}/file?variant=reference_pdf" if available else None}
+
+
+def resolve_document_file(doc: Document, variant: str = "original") -> Path:
     """Return the on-disk original if it exists under FILE_STORAGE_PATH; else 404."""
     try:
-        file_path = Path(doc.storage_path).resolve()
+        stored_path = doc.reference_pdf_path if variant == "reference_pdf" else doc.storage_path
+        if not stored_path:
+            raise ValueError("File not configured")
+        file_path = Path(stored_path).resolve()
         file_path.relative_to(get_settings().file_root.resolve())
     except (OSError, ValueError):
         raise HTTPException(404, "Original file not found")
@@ -1164,14 +1178,15 @@ def document_file(
     document_id: str,
     request: Request,
     disposition: str = Query("attachment", pattern="^(attachment|inline)$"),
+    variant: str = Query("original", pattern="^(original|reference_pdf)$"),
     db: Session = Depends(get_db),
 ):
     doc = load_document_for_file_download(document_id, request, db)
-    file_path = resolve_document_file(doc)
+    file_path = resolve_document_file(doc, variant)
     return FileResponse(
         path=file_path,
-        media_type=doc.mime_type or "application/octet-stream",
-        filename=doc.original_filename,
+        media_type="application/pdf" if variant == "reference_pdf" else doc.mime_type or "application/octet-stream",
+        filename=doc.reference_pdf_filename if variant == "reference_pdf" else doc.original_filename,
         content_disposition_type=disposition,
     )
 
@@ -2320,7 +2335,7 @@ def get_sources(result_id: str, _: User = Depends(current_admin), db: Session = 
         "status": "success",
         "result_id": result_id,
         "answer": saved.result_json.get("answer"),
-        "sources": sanitize_source_reference_urls(saved.result_json.get("sources", [])),
+        "sources": sanitize_source_reference_urls(enrich_sources_with_file_links(db, [dict(source) for source in saved.result_json.get("sources", [])], base_url=public_document_base_url())),
     }
     return apply_answer_reference_contract(result)
 
@@ -2670,7 +2685,7 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
                     "status": "success",
                     "result_id": saved.id,
                     "answer": saved.result_json.get("answer"),
-                    "sources": sanitize_source_reference_urls(saved.result_json.get("sources", [])),
+                    "sources": sanitize_source_reference_urls(enrich_sources_with_file_links(db, [dict(source) for source in saved.result_json.get("sources", [])], base_url=public_document_base_url())),
                 } if saved else {"status": "success", "result_id": arguments.get("result_id"), "answer": None, "sources": []}
                 apply_answer_reference_contract(result)
                 result["metadata"] = {"retrieval_trace": [{"channel": "result_sources", "system": "PostgreSQL query result store", "status": "used", "result_count": len(result["sources"]), "detail": "stored cited sources"}]}
@@ -2832,7 +2847,8 @@ def ingest_document_view(db: Session, doc: Document) -> dict:
             "filename": doc.original_filename, "status": doc.status, "document_type": doc.document_type,
             "document_type_id": doc.metadata_template_id,
             "error_code": doc.error_code, "created_at": doc.created_at,
-            "latest_job": ingest_job_view(job) if job else None}
+            "latest_job": ingest_job_view(job) if job else None,
+            "reference_pdf": reference_pdf_view(doc, ingest=True)}
 
 
 def ingest_upload_error(exc: ValueError) -> HTTPException:
@@ -2886,12 +2902,14 @@ def ingest_upload_document(kb_id: str, file: UploadFile = File(...), title: str 
                            document_type: str = Form("general"), template_id: str | None = Form(None),
                            document_type_id: str | None = Form(None),
                            metadata_json: str | None = Form(None), published_at: date | None = Form(None),
+                           reference_pdf: UploadFile | None = File(None),
                            token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
     ingest_knowledge_base(db, token, kb_id)
     try:
         selected_type_id = ingest_document_type_id(document_type_id, template_id)
         template, profile, metadata = _upload_metadata(selected_type_id, document_type, metadata_json, db, kb_id)
-        doc, job = create_document_job(db, kb_id, file, title, profile, published_at, template, metadata)
+        doc, job = create_document_job(db, kb_id, file, title, profile, published_at, template, metadata,
+                                       reference_pdf=reference_pdf)
     except ValueError as exc:
         record_ingest_rejection(db, token, kb_id, file.filename, str(exc))
         raise ingest_upload_error(exc)
@@ -2904,7 +2922,35 @@ def ingest_upload_document(kb_id: str, file: UploadFile = File(...), title: str 
     except Exception:
         db.rollback()
     return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type,
-            "document_type_id": doc.metadata_template_id, "template_id": doc.metadata_template_id}
+            "document_type_id": doc.metadata_template_id, "template_id": doc.metadata_template_id,
+            "reference_pdf": reference_pdf_view(doc, ingest=True)}
+
+
+@app.post("/api/v1/ingest/documents/{document_id}/reference-pdf")
+def ingest_attach_reference_pdf(document_id: str, file: UploadFile = File(...),
+                                token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    """Attach evidence to an already ingested Markdown document without OCR."""
+    from .services import store_reference_pdf
+    doc = ingest_document_row(db, token, document_id)
+    doc = db.query(Document).filter_by(id=doc.id).with_for_update().one()
+    if Path(doc.original_filename).suffix.lower() != ".md":
+        raise ingest_upload_error(ValueError("REFERENCE_PDF_REQUIRES_MARKDOWN"))
+    if doc.reference_pdf_path:
+        raise HTTPException(409, {"code": "REFERENCE_PDF_ALREADY_EXISTS", "message": "Reference PDF already attached.", "retryable": False})
+    try:
+        path, filename, size, checksum = store_reference_pdf(file, doc.knowledge_base_id)
+    except ValueError as exc:
+        raise ingest_upload_error(exc)
+    try:
+        doc.reference_pdf_path, doc.reference_pdf_filename = path, filename
+        doc.reference_pdf_size, doc.reference_pdf_checksum_sha256 = size, checksum
+        record_audit(db, "document.reference_pdf.attach", None, "document", doc.id, {"transport": "ingest_api"})
+        db.commit()
+    except Exception:
+        db.rollback()
+        Path(path).unlink(missing_ok=True)
+        raise
+    return {"status": "attached", "document_id": doc.id, "reference_pdf": reference_pdf_view(doc, ingest=True)}
 
 
 class IngestTextRequest(BaseModel):
@@ -3039,15 +3085,16 @@ def ingest_document_jobs(document_id: str, token: TokenKey = Depends(ingest_budg
 def ingest_document_file(
     document_id: str,
     disposition: str = Query("attachment", pattern="^(attachment|inline)$"),
+    variant: str = Query("original", pattern="^(original|reference_pdf)$"),
     token: TokenKey = Depends(ingest_budget),
     db: Session = Depends(get_db),
 ):
     doc = ingest_document_row(db, token, document_id)
-    file_path = resolve_document_file(doc)
+    file_path = resolve_document_file(doc, variant)
     return FileResponse(
         path=file_path,
-        media_type=doc.mime_type or "application/octet-stream",
-        filename=doc.original_filename,
+        media_type="application/pdf" if variant == "reference_pdf" else doc.mime_type or "application/octet-stream",
+        filename=doc.reference_pdf_filename if variant == "reference_pdf" else doc.original_filename,
         content_disposition_type=disposition,
     )
 

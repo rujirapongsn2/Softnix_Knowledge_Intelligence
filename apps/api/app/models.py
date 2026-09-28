@@ -132,6 +132,12 @@ class Document(Timestamped, Base):
     mime_type: Mapped[str] = mapped_column(String(150))
     file_size: Mapped[int] = mapped_column(Integer)
     checksum_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    # Optional evidence PDF for a Markdown source. It is never processed as a
+    # second document; retrieval and metadata extraction use storage_path.
+    reference_pdf_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    reference_pdf_filename: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    reference_pdf_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reference_pdf_checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     title: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # This is an authoring choice, not a MIME-type inference.  It controls
     # post-processing such as the legal metadata extraction workflow.

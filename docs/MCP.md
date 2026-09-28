@@ -131,6 +131,8 @@ JSON Schema อยู่ที่ [`docs/schemas/ski-answer-v1.schema.json`](sch
 - `mime_type` — เช่น `application/pdf`
 - `download_url` — path แบบ root-relative เช่น `/api/v1/documents/{document_id}/file` (หรือ absolute เมื่อตั้ง `PUBLIC_APP_URL`)
 
+หากเอกสาร Markdown มี PDF หลักฐานที่แนบผ่าน Ingest API, `references[].file` จะชี้ไปที่ PDF และมี `role: "reference_pdf"`; `references[].content_file` ยังคงลิงก์ Markdown ที่ใช้สร้างดัชนี ส่วน `references[].reference_pdf` ระบุสถานะและลิงก์ PDF แยกชัดเจน PDF นี้เก็บเป็นหลักฐานเท่านั้นและไม่ถูก OCR หรือสร้างดัชนีซ้ำ ลิงก์ PDF ใช้ `?variant=reference_pdf` และสิทธิ์อ่านแบบเดียวกับไฟล์ต้นฉบับ
+
 ในบล็อกข้อความ «รายละเอียดแหล่งอ้างอิง» ของคำตอบ: ระบบใส่ URL ไฟล์ใน SKI (`download_url`) เมื่อมีไฟล์ต้นฉบับที่เก็บไว้ (PDF หรือข้อความ) — **ไม่ใช้**ลิงก์ OCS / searchlaw / council-of-state จาก `source_uri` ใน citation prose; ถ้าไม่มี `download_url` และไม่มี `source_uri` ที่ปลอดภัย จะแสดงเฉพาะชื่อเอกสาร
 
 Agent backend ต้องเรียก `GET references[].file.download_url` พร้อม header เดียวกับ MCP:

@@ -67,6 +67,7 @@
             "additionalProperties": true
           },
           "content_file": {"type": ["object", "null"]},
+          "reference_file": {"type": ["object", "null"]},
           "reference_pdf": {"type": ["object", "null"]},
           "locator": {
             "type": "object",

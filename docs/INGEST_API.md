@@ -97,7 +97,8 @@ curl "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documen
 | `template_id` | | ชื่อเดิมที่ยังรองรับเพื่อความเข้ากันได้ ใช้แทน `document_type_id` เท่านั้น |
 | `metadata_json` | | JSON object ของค่า metadata ตาม template |
 | `published_at` | | วันที่ประกาศใช้ รูปแบบ `YYYY-MM-DD` |
-| `reference_pdf` | | PDF หลักฐานสำหรับไฟล์ `.md` เท่านั้น เก็บคู่กับเอกสารเดียวกันโดยไม่ OCR ไม่แยกสร้างดัชนี และไม่สร้างเอกสาร PDF อีกชิ้น |
+| `reference_file` | | ไฟล์อ้างอิงสำหรับ `.md` รองรับ PDF, DOCX, DOC, XLSX, XLS และ TXT เก็บกับเอกสารเดียวกันโดยไม่ OCR หรือสร้างดัชนีซ้ำ |
+| `reference_pdf` | | ฟิลด์เดิมสำหรับ PDF; ยังใช้ได้เพื่อความเข้ากันได้ ห้ามส่งพร้อม `reference_file` |
 
 ```bash
 curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documents" \
@@ -112,17 +113,17 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
 `-F 'metadata_json={"categories":["ประกาศ","ที่ดิน"]}'`
 API ปฏิเสธค่าที่ไม่ใช่ array, ตัวเลือกที่ไม่มีใน `options` หรือค่าซ้ำใน array
 
-หากมีข้อความ Markdown ที่ OCR มาแล้วและต้องการเก็บ PDF ต้นฉบับเป็นหลักฐาน ให้ส่งทั้งสองไฟล์ใน request เดียว:
+หากมีข้อความ Markdown ที่ OCR มาแล้วและต้องการเก็บไฟล์ต้นฉบับเป็นหลักฐาน ให้ส่งทั้งสองไฟล์ใน request เดียว:
 
 ```bash
 curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documents" \
   -H "Authorization: Bearer $SOFTNIX_INGEST_TOKEN" \
   -F "file=@./land-law.md;type=text/markdown" \
-  -F "reference_pdf=@./land-law.pdf;type=application/pdf" \
+  -F "reference_file=@./land-law.pdf;type=application/pdf" \
   -F "document_type_id=$LEGAL_DOCUMENT_TYPE_ID"
 ```
 
-ระบบอ่านและสกัด metadata จาก `.md` เท่านั้น ส่วน PDF ไม่ผ่าน OCR/chunk/embed/index และถูกส่งเป็น `references[].file` ในคำตอบ MCP โดยมี `role=reference_pdf` (ไฟล์ Markdown ยังอยู่ใน `references[].content_file`) อย่าอัปโหลด PDF เป็น `file` อีก request เพราะจะกลายเป็นเอกสารอีกชิ้นที่เข้ากระบวนการ PDF ตามปกติ
+เปลี่ยนชื่อไฟล์และ MIME ใน `reference_file` เป็น DOCX, DOC, XLSX, XLS หรือ TXT ได้ตามต้องการ ระบบอ่านและสกัด metadata จาก `.md` เท่านั้น ไฟล์อ้างอิงไม่ผ่าน OCR/chunk/embed/index และถูกส่งเป็น `references[].file` ในคำตอบ MCP โดยมี `role=reference_file` (PDF ยังคง `role=reference_pdf` เพื่อความเข้ากันได้) ไฟล์ Markdown อยู่ใน `references[].content_file` อย่าอัปโหลดไฟล์อ้างอิงเป็น `file` อีก request เพราะจะกลายเป็นเอกสารอีกชิ้นที่เข้ากระบวนการตามชนิดไฟล์
 
 ตอบ **`202 Accepted`** เพราะงานเพียงเข้าคิว ยังประมวลผลไม่เสร็จ
 
@@ -181,7 +182,7 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
 
 สำหรับระบบ Machine-to-Machine ที่ทำการสกัดข้อความ (OCR/LLM) มาแล้ว เช่น InsightDOC Custom API หรือ pipeline ภายนอก โดยไม่ต้องส่งไฟล์ไบนารี ข้อความจะถูกจัดเก็บเป็น Markdown document และเข้าสู่ pipeline ปกติ (chunk, embed, index)
 
-ถ้าฝั่งส่งข้อมูลใช้ JSON endpoint นี้และมี PDF หลักฐาน ให้เรียก `POST /api/v1/ingest/documents/{document_id}/reference-pdf` หลังได้รับ `document_id` โดยส่ง `multipart/form-data` ฟิลด์ `file` เป็น PDF ด้วย ingest token เดิม PDF จะถูกแนบกับเอกสารเดิมโดยไม่ประมวลผลซ้ำ รองรับ PDF หนึ่งไฟล์ต่อเอกสาร; ดาวน์โหลดผ่าน `GET /api/v1/ingest/documents/{document_id}/file?variant=reference_pdf` หรือ MCP read token ใช้ `GET /api/v1/documents/{document_id}/file?variant=reference_pdf`
+ถ้าฝั่งส่งข้อมูลใช้ JSON endpoint นี้และมีไฟล์หลักฐาน ให้เรียก `POST /api/v1/ingest/documents/{document_id}/reference-file` หลังได้รับ `document_id` โดยส่ง `multipart/form-data` ฟิลด์ `file` ด้วย ingest token เดิม รองรับไฟล์อ้างอิงหนึ่งไฟล์ต่อเอกสารและไม่ประมวลผลซ้ำ ดาวน์โหลดผ่าน `GET /api/v1/ingest/documents/{document_id}/file?variant=reference_file` หรือ MCP read token ใช้ `GET /api/v1/documents/{document_id}/file?variant=reference_file` เส้นทางเดิม `reference-pdf` และ `variant=reference_pdf` ยังใช้ได้สำหรับ PDF
 
 | Field | ต้องมี | คำอธิบาย |
 |---|---|---|

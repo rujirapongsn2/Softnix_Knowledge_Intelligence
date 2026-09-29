@@ -2,6 +2,7 @@ import os
 import tempfile
 import uuid
 from pathlib import Path
+import pytest
 
 _TEST_ROOT = tempfile.mkdtemp()
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_ROOT}/skip.db"
@@ -145,6 +146,69 @@ def test_reference_pdf_can_attach_after_text_ingest_without_creating_pdf_job():
         assert db.query(ProcessingJob).filter_by(document_id=doc_id).count() == 1
 
 
+@pytest.mark.parametrize("extension,mime,body", [
+    ("pdf", "application/pdf", b"%PDF-1.4\nevidence"),
+    ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", b"PK\x03\x04docx"),
+    ("doc", "application/msword", b"\xd0\xcf\x11\xe0doc"),
+    ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", b"PK\x03\x04xlsx"),
+    ("xls", "application/vnd.ms-excel", b"\xd0\xcf\x11\xe0xls"),
+    ("txt", "text/plain", b"Original evidence text"),
+])
+def test_reference_file_types_share_markdown_document_without_processing(extension, mime, body):
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ref-{extension}-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    uploaded = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents",
+                                headers=_headers(secret), files={
+                                    "file": ("source.md", b"# Indexed Markdown", "text/markdown"),
+                                    "reference_file": (f"evidence.{extension}", body, mime),
+                                })
+    assert uploaded.status_code == 202, uploaded.text
+    doc_id = uploaded.json()["document_id"]
+    assert uploaded.json()["reference_file"]["mime_type"] == mime
+    assert (uploaded.json()["reference_pdf"] is not None) == (extension == "pdf")
+    with SessionLocal() as db:
+        assert db.query(Document).filter_by(knowledge_base_id=kb_id).count() == 1
+        assert db.query(ProcessingJob).filter_by(document_id=doc_id).count() == 1
+        sources = enrich_sources_with_file_links(db, [{"document_id": doc_id, "citation_id": "S1"}])
+    assert sources[0]["reference_file"]["mime_type"] == mime
+    reference = build_structured_references(sources)[0]
+    assert reference["file"]["role"] == ("reference_pdf" if extension == "pdf" else "reference_file")
+    assert reference["file"]["mime_type"] == mime
+    assert reference["content_file"]["name"] == "source.md"
+    downloaded = test_client.get(f"/api/v1/ingest/documents/{doc_id}/file?variant=reference_file", headers=_headers(secret))
+    assert downloaded.status_code == 200 and downloaded.content == body
+    assert downloaded.headers["content-type"].startswith(mime)
+    legacy = test_client.get(f"/api/v1/ingest/documents/{doc_id}/file?variant=reference_pdf", headers=_headers(secret))
+    assert legacy.status_code == (200 if extension == "pdf" else 404)
+    if extension == "docx":
+        mcp_token = test_client.post("/api/v1/tokens", json={
+            "name": "docx-reference-reader", "allowed_knowledge_base_ids": [kb_id],
+            "allowed_tools": ["search_knowledge"],
+        }).json()["token"]
+        agent_file = test_client.get(reference["file"]["download_url"], headers=_headers(mcp_token))
+        assert agent_file.status_code == 200 and agent_file.content == body
+
+
+def test_reference_file_can_attach_after_json_text_ingest():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ref-attach-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    uploaded = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents/text",
+                                headers=_headers(secret), json={"title": "Policy", "text": "# Policy\nIndexed content"})
+    assert uploaded.status_code == 202
+    doc_id = uploaded.json()["document_id"]
+    attached = test_client.post(f"/api/v1/ingest/documents/{doc_id}/reference-file",
+                                headers=_headers(secret), files={"file": ("policy.doc", b"\xd0\xcf\x11\xe0doc", "application/msword")})
+    assert attached.status_code == 200, attached.text
+    assert attached.json()["reference_file"]["mime_type"] == "application/msword"
+    assert attached.json()["reference_pdf"] is None
+    assert test_client.post(f"/api/v1/ingest/documents/{doc_id}/reference-file",
+                            headers=_headers(secret), files={"file": ("again.txt", b"again", "text/plain")}).status_code == 409
+    with SessionLocal() as db:
+        assert db.query(ProcessingJob).filter_by(document_id=doc_id).count() == 1
+
+
 def test_saved_answer_and_references_refresh_when_pdf_is_attached_later():
     test_client = next(client())
     kb_id = _knowledge_base(test_client, f"ingest-late-evidence-{uuid.uuid4().hex[:8]}")
@@ -218,6 +282,17 @@ def test_reference_pdf_rejects_non_markdown_and_invalid_pdf():
         "reference_pdf": ("fake.pdf", b"not a pdf", "application/pdf")})
     assert invalid.status_code == 400
     assert invalid.json()["error"]["code"] == "REFERENCE_PDF_INVALID"
+    unsupported = test_client.post(route, headers=_headers(secret), files={
+        "file": ("notes.md", b"notes", "text/markdown"),
+        "reference_file": ("script.exe", b"unsafe", "application/octet-stream")})
+    assert unsupported.status_code == 400
+    assert unsupported.json()["error"]["code"] == "REFERENCE_FILE_TYPE_NOT_SUPPORTED"
+    conflict = test_client.post(route, headers=_headers(secret), files={
+        "file": ("notes.md", b"notes", "text/markdown"),
+        "reference_file": ("source.txt", b"source", "text/plain"),
+        "reference_pdf": ("source.pdf", b"%PDF-1.4\nevidence", "application/pdf")})
+    assert conflict.status_code == 400
+    assert conflict.json()["error"]["code"] == "REFERENCE_FILE_CONFLICT"
     with SessionLocal() as db:
         assert db.query(Document).filter_by(knowledge_base_id=kb_id).count() == 0
 

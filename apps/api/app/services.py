@@ -5,6 +5,7 @@ import mimetypes
 import re
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from datetime import date, datetime, timedelta
@@ -1006,7 +1007,7 @@ def store_upload(upload, knowledge_base_id: str) -> tuple[str, str, int, str, st
     extension = Path(upload.filename or "").suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         raise ValueError("FILE_TYPE_NOT_SUPPORTED")
-    reported_mime = (upload.content_type or "").lower()
+    reported_mime = (upload.content_type or "").split(";", 1)[0].strip().lower()
     if reported_mime and reported_mime not in {"application/octet-stream", "binary/octet-stream"} and reported_mime not in ALLOWED_MIME_TYPES[extension]:
         raise ValueError("FILE_MIME_TYPE_NOT_SUPPORTED")
     root = settings.file_root / knowledge_base_id
@@ -1023,8 +1024,55 @@ def store_upload(upload, knowledge_base_id: str) -> tuple[str, str, int, str, st
                 raise ValueError("FILE_TOO_LARGE")
             digest.update(chunk)
             output.write(chunk)
-    mime_type = upload.content_type or mimetypes.guess_type(upload.filename or "")[0] or "application/octet-stream"
+    mime_type = reported_mime or mimetypes.guess_type(upload.filename or "")[0] or "application/octet-stream"
     return str(destination), stored_name, size, digest.hexdigest(), mime_type
+
+
+_HTML_MARKERS = (b"<html", b"<table", b"<!doctype", b"<?xml", b"<head", b"<meta")
+
+
+def _text_header(header: bytes) -> bytes:
+    """Normalize a BOM-prefixed text header to lower-case ASCII-compatible bytes."""
+    if header.startswith(b"\xef\xbb\xbf"):
+        header = header[3:]
+    elif header.startswith((b"\xff\xfe", b"\xfe\xff")):
+        header = header.decode("utf-16", errors="ignore").encode("utf-8", errors="ignore")
+    return header.lstrip().lower()
+
+
+def _valid_reference_file(path: Path, extension: str, size: int) -> bool:
+    if size == 0:
+        return False
+    try:
+        return _valid_reference_content(path, extension)
+    except OSError:
+        return False
+
+
+def _valid_reference_content(path: Path, extension: str) -> bool:
+    if extension == ".pdf":
+        with path.open("rb") as stored_file:
+            return stored_file.read(5) == b"%PDF-"
+    if extension in {".doc", ".xls"}:
+        with path.open("rb") as stored_file:
+            header = stored_file.read(256)
+        if header.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+            return True
+        text_header = _text_header(header)
+        # Government spreadsheet exports can be HTML tables with an .xls suffix;
+        # Word files saved as RTF or HTML keep a .doc suffix.
+        if extension == ".xls":
+            return text_header.startswith(_HTML_MARKERS)
+        return text_header.startswith((b"{\\rtf",) + _HTML_MARKERS)
+    if extension in {".docx", ".xlsx"}:
+        required_member = "word/document.xml" if extension == ".docx" else "xl/workbook.xml"
+        try:
+            with zipfile.ZipFile(path) as package:
+                package.getinfo("[Content_Types].xml")
+                package.getinfo(required_member)
+        except (OSError, KeyError, zipfile.BadZipFile):
+            return False
+    return True
 
 
 def store_reference_file(upload, knowledge_base_id: str) -> tuple[str, str, int, str, str]:
@@ -1033,12 +1081,9 @@ def store_reference_file(upload, knowledge_base_id: str) -> tuple[str, str, int,
     if extension not in REFERENCE_FILE_EXTENSIONS:
         raise ValueError("REFERENCE_FILE_TYPE_NOT_SUPPORTED")
     path, _stored, size, checksum, _mime = store_upload(upload, knowledge_base_id)
-    if extension == ".pdf":
-        with Path(path).open("rb") as stored_pdf:
-            header = stored_pdf.read(5)
-        if size < 5 or header != b"%PDF-":
-            Path(path).unlink(missing_ok=True)
-            raise ValueError("REFERENCE_FILE_INVALID")
+    if not _valid_reference_file(Path(path), extension, size):
+        Path(path).unlink(missing_ok=True)
+        raise ValueError("REFERENCE_FILE_INVALID")
     filename = (upload.filename or "reference").replace("\\", "/").rsplit("/", 1)[-1]
     return path, filename, size, checksum, REFERENCE_FILE_MIME_TYPES[extension]
 

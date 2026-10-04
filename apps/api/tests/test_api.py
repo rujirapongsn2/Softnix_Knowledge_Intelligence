@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from pptx import Presentation
 from app import services
+from app.config import get_settings
 from app.db import SessionLocal
 from app.main import app
 from app.models import Document, DocumentChunk, KnowledgeBase, LegalInstrument, LegalInstrumentRelation
@@ -298,8 +299,12 @@ def test_auto_retrieval_fixture_exercises_scopes_exact_dates_and_rerank_policy(m
             ("land-transfer.txt", "ขั้นตอนการโอนกรรมสิทธิ์หรือสิทธิครอบครองในที่ดินที่มีโฉนดที่ดินหรือหนังสือรับรองการทำประโยชน์ ต้องยื่นคำขอต่อสำนักงานที่ดินและแสดงเอกสารสิทธิ์.", None),
         ]):
             digest = hashlib.sha256(f"{name}:{text}".encode()).hexdigest()
+            # A real stored file keeps this evidence past the source_file_missing quality gate.
+            stored_path = get_settings().file_root / kb["id"] / name
+            stored_path.parent.mkdir(parents=True, exist_ok=True)
+            stored_path.write_text(text, encoding="utf-8")
             doc = Document(knowledge_base_id=kb["id"], original_filename=name, stored_filename=name,
-                           storage_path=f"/tmp/{name}", mime_type="text/plain", file_size=len(text), checksum_sha256=digest,
+                           storage_path=str(stored_path), mime_type="text/plain", file_size=len(text), checksum_sha256=digest,
                            title=name.removesuffix(".txt"), document_type="general", published_at=published_at,
                            tags=[], status="completed", extracted_text=text, indexed_at=datetime.utcnow())
             db.add(doc); db.flush()

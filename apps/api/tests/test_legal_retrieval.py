@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from app import services
 from app.services import compose_cited_answer
+from app.config import get_settings
 from app.db import Base, SessionLocal, engine
 from app.legal_resolver import resolve_legal_context
 from app.main import app
@@ -30,6 +31,14 @@ def client():
     with TestClient(app) as test_client:
         assert test_client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-horse-battery-staple"}).status_code == 200
         yield test_client
+
+
+def _stored_file(knowledge_base_id: str, name: str, text: str = "") -> str:
+    """Write a real source file so seeded evidence passes the source_file_missing quality gate."""
+    path = get_settings().file_root / knowledge_base_id / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(path)
 
 
 def _plan(**overrides) -> RetrievalPlan:
@@ -515,10 +524,10 @@ def test_query_endpoint_prefers_current_version_and_reports_conflict_warning():
         db.add(family); db.flush()
         old_text = "มาตรา 15 ค่าชดเชยเดิมเท่ากับค่าจ้างหกสิบวัน"
         new_text = "มาตรา 15 ค่าชดเชยใหม่เท่ากับค่าจ้างเก้าสิบวัน"
-        old_doc = Document(knowledge_base_id=kb["id"], original_filename="old.txt", stored_filename="old.txt", storage_path="/tmp/old.txt",
+        old_doc = Document(knowledge_base_id=kb["id"], original_filename="old.txt", stored_filename="old.txt", storage_path=_stored_file(kb["id"], "old.txt", old_text),
                            mime_type="text/plain", file_size=1, checksum_sha256="f1" * 32, title="พระราชบัญญัติค่าชดเชย พ.ศ. 2541",
                            document_type="legal", status="completed", extracted_text=old_text)
-        new_doc = Document(knowledge_base_id=kb["id"], original_filename="new.txt", stored_filename="new.txt", storage_path="/tmp/new.txt",
+        new_doc = Document(knowledge_base_id=kb["id"], original_filename="new.txt", stored_filename="new.txt", storage_path=_stored_file(kb["id"], "new.txt", new_text),
                            mime_type="text/plain", file_size=1, checksum_sha256="f2" * 32, title="พระราชบัญญัติค่าชดเชย (ฉบับที่ 2) พ.ศ. 2562",
                            document_type="legal", status="completed", extracted_text=new_text)
         db.add_all([old_doc, new_doc]); db.flush()
@@ -558,10 +567,10 @@ def test_query_endpoint_as_of_past_date_returns_the_earlier_version():
         db.add(family); db.flush()
         old_text = "มาตรา 9 กำหนดวิธีเดิม"
         new_text = "มาตรา 9 กำหนดวิธีใหม่"
-        old_doc = Document(knowledge_base_id=kb["id"], original_filename="old3.txt", stored_filename="old3.txt", storage_path="/tmp/old3.txt",
+        old_doc = Document(knowledge_base_id=kb["id"], original_filename="old3.txt", stored_filename="old3.txt", storage_path=_stored_file(kb["id"], "old3.txt", old_text),
                            mime_type="text/plain", file_size=1, checksum_sha256="f3" * 32, title="พระราชบัญญัติเวลา พ.ศ. 2540",
                            document_type="legal", status="completed", extracted_text=old_text)
-        new_doc = Document(knowledge_base_id=kb["id"], original_filename="new3.txt", stored_filename="new3.txt", storage_path="/tmp/new3.txt",
+        new_doc = Document(knowledge_base_id=kb["id"], original_filename="new3.txt", stored_filename="new3.txt", storage_path=_stored_file(kb["id"], "new3.txt", new_text),
                            mime_type="text/plain", file_size=1, checksum_sha256="f4" * 32, title="พระราชบัญญัติเวลา (ฉบับที่ 2) พ.ศ. 2564",
                            document_type="legal", status="completed", extracted_text=new_text)
         db.add_all([old_doc, new_doc]); db.flush()
@@ -598,7 +607,7 @@ def test_query_endpoint_regression_general_knowledge_base_is_unaffected():
     with SessionLocal() as db:
         text = "Customer Portal runs on APP-01."
         doc = Document(knowledge_base_id=kb["id"], original_filename="architecture.txt",
-                       stored_filename="architecture.txt", storage_path="/tmp/architecture.txt",
+                       stored_filename="architecture.txt", storage_path=_stored_file(kb["id"], "architecture.txt", text),
                        mime_type="text/plain", file_size=len(text), checksum_sha256="ab" * 32,
                        title="Architecture", document_type="general", status="completed", extracted_text=text)
         db.add(doc)
@@ -650,7 +659,7 @@ def _provenance_kb(db, code):
     family = LegalFamily(knowledge_base_id=kb.id, base_title="ประมวลกฎหมายที่ดิน", normalized_key="ประมวลกฎหมายที่ดิน")
     db.add(family); db.flush()
     current_doc = Document(knowledge_base_id=kb.id, original_filename="latest.txt", stored_filename="latest.txt",
-                           storage_path="/tmp/latest.txt", mime_type="text/plain", file_size=1,
+                           storage_path=_stored_file(kb.id, "latest.txt"), mime_type="text/plain", file_size=1,
                            checksum_sha256="a1" * 32, title="ฉบับปรับปรุงล่าสุด", document_type="legal", status="completed")
     db.add(current_doc); db.flush()
     current = LegalInstrument(document_id=current_doc.id, knowledge_base_id=kb.id, family_id=family.id,

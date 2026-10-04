@@ -2,7 +2,7 @@ import logging
 import time
 
 from .db import SessionLocal
-from .remote_index import recover_unavailable_documents
+from .document_recovery import recover_unavailable_documents
 from .retention import prune_observability
 from .retrieval import LightRAGRetrievalEngine
 from .services import process_next_graph_projection, process_next_job

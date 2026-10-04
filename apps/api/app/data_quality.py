@@ -341,7 +341,7 @@ def build_knowledge_base_quality_report(db: Session, knowledge_base_id: str, *, 
         Document.quality_report, Document.quality_fingerprint, Document.quality_evaluated_at,
     )).filter(
         Document.knowledge_base_id == knowledge_base_id,
-        Document.deleted_at.is_(None),
+        Document.live(),
     ).order_by(Document.created_at.desc()).all()
     reports = build_document_quality_reports(db, documents, include_page_details=False, use_cache=True)
     dimensions = ("content", "structure", "metadata", "retrieval", "citation", "graph")

@@ -90,7 +90,7 @@ def list_templates(db: Session, knowledge_base_id: str, *, include_inactive: boo
     if not include_inactive:
         query = query.filter_by(is_active=True)
     usage_rows = (db.query(Document.metadata_template_id, Document.document_type, func.count(Document.id))
-                  .filter(Document.knowledge_base_id == knowledge_base_id, Document.deleted_at.is_(None))
+                  .filter(Document.knowledge_base_id == knowledge_base_id, Document.live())
                   .group_by(Document.metadata_template_id, Document.document_type).all())
     usage_by_template = {template_id: int(count) for template_id, _, count in usage_rows if template_id}
     usage_by_profile = {profile: int(count) for template_id, profile, count in usage_rows if not template_id}

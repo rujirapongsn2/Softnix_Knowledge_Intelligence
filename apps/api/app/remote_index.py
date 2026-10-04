@@ -11,12 +11,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from .models import Document, KnowledgeBase, ProcessingJob
+from .models import Document, KnowledgeBase
 from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, duplicate_original_id
 
 logger = logging.getLogger(__name__)
@@ -26,14 +26,19 @@ _IN_FLIGHT_STATUSES = {"pending", "parsing", "analyzing", "processing", "preproc
 
 
 def _is_orphan(document: Document | None) -> bool:
-    return document is None or document.deleted_at is not None
+    return document is None or not document.is_live
 
 
-def resolve_remote_duplicate(db: Session, engine: LightRAGRetrievalEngine, doc: Document, error: str | None) -> str:
+class HealOutcome(StrEnum):
+    CLEARED = "cleared"
+    ALREADY_INDEXED = "already_indexed"
+
+
+def resolve_remote_duplicate(db: Session, engine: LightRAGRetrievalEngine, doc: Document, error: str | None) -> HealOutcome:
     """Handle LightRAG's "identical content already exists" rejection for ``doc``.
 
-    Returns ``"already_indexed"`` when the colliding record is this very document
-    (nothing to ingest) or ``"cleared"`` when a stale record was removed and the
+    Returns ``ALREADY_INDEXED`` when the colliding record is this very document
+    (nothing to ingest) or ``CLEARED`` when a stale record was removed and the
     caller should ingest again. Raises ``RETRIEVAL_ENGINE_DUPLICATE`` when the
     content genuinely lives on under another live document, or when the owner of
     the colliding record cannot be established (unknown records are never deleted).
@@ -43,12 +48,12 @@ def resolve_remote_duplicate(db: Session, engine: LightRAGRetrievalEngine, doc: 
     if original is None:
         if original_id:
             # The colliding record vanished between the insert and this lookup.
-            return "cleared"
+            return HealOutcome.CLEARED
         raise RetrievalEngineError("RETRIEVAL_ENGINE_DUPLICATE", error or "Identical content already exists.")
     owner_id = original.get("document_id")
     if owner_id == doc.id:
         if original.get("status") == "processed":
-            return "already_indexed"
+            return HealOutcome.ALREADY_INDEXED
         raise RetrievalEngineError("RETRIEVAL_ENGINE_DUPLICATE", error)
     if not owner_id:
         raise RetrievalEngineError("RETRIEVAL_ENGINE_DUPLICATE", f"{error} (the existing record is not managed by this platform)")
@@ -62,10 +67,21 @@ def resolve_remote_duplicate(db: Session, engine: LightRAGRetrievalEngine, doc: 
         "document_id": doc.id, "stale_remote_id": original["id"], "stale_document_id": owner_id})
     _delete_unless_gone(engine, original["id"])
     # The rejected insert left its own FAILED record under this document's label.
-    own = engine.find_document(doc.id, doc.knowledge_base_id)
-    if own and str(own.get("status") or "").lower() == "failed":
-        _delete_unless_gone(engine, own["id"])
-    return "cleared"
+    purge_remote_record(engine, doc, only_status="failed")
+    return HealOutcome.CLEARED
+
+
+def purge_remote_record(engine: LightRAGRetrievalEngine, doc: Document, *, only_status: str | None = None) -> bool:
+    """Delete this document's record from the retrieval index. Returns whether a record was deleted.
+
+    The one place that finds and removes a document's remote record: the purge job, the permanent
+    purge and duplicate healing all go through it.
+    """
+    record = engine.find_document(doc.id, doc.knowledge_base_id)
+    if not record or (only_status and str(record.get("status") or "").lower() != only_status):
+        return False
+    _delete_unless_gone(engine, record["id"])
+    return True
 
 
 def _delete_unless_gone(engine: LightRAGRetrievalEngine, remote_id: str) -> None:
@@ -78,44 +94,6 @@ def _delete_unless_gone(engine: LightRAGRetrievalEngine, remote_id: str) -> None
     except RuntimeError as exc:
         if str(exc) == "RETRIEVAL_ENGINE_BUSY" or engine.get_remote_document(remote_id) is not None:
             raise
-
-
-RECOVERY_JOB_TYPE = "AUTO_RETRY_DOCUMENT"
-MAX_AUTO_RECOVERIES = 3
-
-
-def recover_unavailable_documents(db: Session, engine: LightRAGRetrievalEngine, *, limit: int = 5, max_age_days: int = 30) -> int:
-    """Queue documents that failed only because the engine was unreachable, once it is back.
-
-    The worker's own retries give up after about half an hour; a longer outage then
-    leaves healthy documents stuck in ``failed``. When LightRAG answers its health
-    check again this re-queues them, a few at a time (so recovery cannot flood the
-    engine) and at most ``MAX_AUTO_RECOVERIES`` times per document (so a document
-    that keeps failing is eventually left for a person to look at).
-    """
-    if not engine.is_healthy():
-        return 0
-    cutoff = datetime.utcnow() - timedelta(days=max_age_days)
-    candidates = db.query(Document).filter(
-        Document.status == "failed", Document.error_code == "RETRIEVAL_ENGINE_UNAVAILABLE",
-        Document.deleted_at.is_(None), Document.updated_at >= cutoff,
-    ).order_by(Document.updated_at.asc()).all()
-    queued = 0
-    for doc in candidates:
-        if queued >= limit:
-            break
-        busy = db.query(ProcessingJob.id).filter(
-            ProcessingJob.document_id == doc.id, ProcessingJob.status.in_(["queued", "running"])).first()
-        attempts = db.query(ProcessingJob.id).filter_by(document_id=doc.id, job_type=RECOVERY_JOB_TYPE).count()
-        if busy or attempts >= MAX_AUTO_RECOVERIES:
-            continue
-        doc.status, doc.error_code, doc.error_message = "queued", None, None
-        db.add(ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type=RECOVERY_JOB_TYPE))
-        queued += 1
-        logger.info("re-queued a document that failed while the retrieval engine was unavailable", extra={"document_id": doc.id})
-    if queued:
-        db.commit()
-    return queued
 
 
 @dataclass

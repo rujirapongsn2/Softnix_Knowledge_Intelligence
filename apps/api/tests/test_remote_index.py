@@ -7,9 +7,10 @@ from sqlalchemy.pool import StaticPool
 from datetime import datetime
 
 from app import services
-from app.models import Base, Document, KnowledgeBase, ProcessingJob
+from app.models import Base, Document, JobType, KnowledgeBase, ProcessingJob
 from app.remote_index import find_orphan_remote_documents, purge_orphan_remote_documents, resolve_remote_duplicate
-from app.retrieval import LightRAGRetrievalEngine, RetrievalEngineError, duplicate_original_id, is_duplicate_content_error
+from app.retrieval import LightRAGRetrievalEngine, RetrievalEngineError, classify_track_failure, duplicate_original_id, is_duplicate_content_error
+from app.retry_policy import ENGINE_DOWN_RETRY
 
 DUPLICATE_ERROR = "Identical content already exists under another filename. Original doc_id: doc-ghost, Status: DocStatus.PROCESSED"
 
@@ -71,8 +72,8 @@ def row(remote_id, document_id, status="processed", title="Ghost"):
 def test_duplicate_error_helpers_and_classification():
     assert is_duplicate_content_error(DUPLICATE_ERROR) and is_duplicate_content_error("x [DUPLICATE:content_hash] y")
     assert duplicate_original_id(DUPLICATE_ERROR) == "doc-ghost" and duplicate_original_id("nothing") is None
-    assert services.classify_track_failure(DUPLICATE_ERROR) == "RETRIEVAL_ENGINE_DUPLICATE"
-    assert services.classify_track_failure("402 in_flight_budget_exhausted " + DUPLICATE_ERROR) == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
+    assert classify_track_failure(DUPLICATE_ERROR) == "RETRIEVAL_ENGINE_DUPLICATE"
+    assert classify_track_failure("402 in_flight_budget_exhausted " + DUPLICATE_ERROR) == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
 
 
 def test_stale_record_of_a_deleted_document_is_removed(db):
@@ -280,11 +281,11 @@ def test_worker_survives_a_reingest_that_returns_no_track(db, monkeypatch):
 
 from datetime import timedelta
 
-from app.remote_index import MAX_AUTO_RECOVERIES, RECOVERY_JOB_TYPE, recover_unavailable_documents
+from app.document_recovery import MAX_AUTO_RECOVERIES, recover_unavailable_documents
 
 
 def test_unavailable_retry_delay_backs_off_to_five_minutes():
-    assert [services.engine_unavailable_retry_delay(n) for n in range(1, 9)] == [30, 60, 120, 240, 300, 300, 300, 300]
+    assert [ENGINE_DOWN_RETRY.delay(n) for n in range(1, 9)] == [30, 60, 120, 240, 300, 300, 300, 300]
 
 
 class DownEngine(FakeEngine):
@@ -300,15 +301,15 @@ def test_worker_keeps_retrying_while_the_engine_is_unreachable_then_gives_up(db,
     job = ProcessingJob(document_id="new-doc", knowledge_base_id="kb-1")
     db.add(job)
     db.commit()
-    for attempt in range(1, services.MAX_ENGINE_UNAVAILABLE_ATTEMPTS + 1):
+    for attempt in range(1, ENGINE_DOWN_RETRY.max_attempts + 1):
         job.next_attempt_at = datetime.utcnow() - timedelta(seconds=1)
         db.commit()
         assert services.process_next_job(db) is True
         db.refresh(job)
-        if attempt < services.MAX_ENGINE_UNAVAILABLE_ATTEMPTS:
+        if attempt < ENGINE_DOWN_RETRY.max_attempts:
             wait = (job.next_attempt_at - datetime.utcnow()).total_seconds()
-            assert job.status == "queued" and abs(wait - services.engine_unavailable_retry_delay(attempt)) < 5
-    assert (job.status, job.attempt_count, job.error_code) == ("failed", services.MAX_ENGINE_UNAVAILABLE_ATTEMPTS, "RETRIEVAL_ENGINE_UNAVAILABLE")
+            assert job.status == "queued" and abs(wait - ENGINE_DOWN_RETRY.delay(attempt)) < 5
+    assert (job.status, job.attempt_count, job.error_code) == ("failed", ENGINE_DOWN_RETRY.max_attempts, "RETRIEVAL_ENGINE_UNAVAILABLE")
     assert db.get(Document, "new-doc").status == "failed"
 
 
@@ -335,7 +336,7 @@ def test_recovery_requeues_documents_that_failed_only_because_the_engine_was_dow
     assert recover_unavailable_documents(db, HealthEngine(True)) == 1
     doc = db.get(Document, "down-1")
     assert (doc.status, doc.error_code) == ("queued", None)
-    assert [j.job_type for j in db.query(ProcessingJob).filter_by(document_id="down-1")] == [RECOVERY_JOB_TYPE]
+    assert [j.job_type for j in db.query(ProcessingJob).filter_by(document_id="down-1")] == [JobType.AUTO_RETRY_DOCUMENT]
     assert db.get(Document, "other-error").status == "failed" and db.get(Document, "deleted").status == "failed"
     assert recover_unavailable_documents(db, HealthEngine(True)) == 0  # nothing left to re-queue
 
@@ -350,7 +351,7 @@ def test_recovery_is_bounded_per_sweep_per_document_and_by_age(db):
     assert recover_unavailable_documents(db, HealthEngine(True), limit=50) == 2 and db.get(Document, "stale").status == "failed"
     # a document that keeps failing stops being re-queued after MAX_AUTO_RECOVERIES
     for _ in range(MAX_AUTO_RECOVERIES):
-        db.add(ProcessingJob(document_id="stale", knowledge_base_id="kb-1", job_type=RECOVERY_JOB_TYPE, status="failed"))
+        db.add(ProcessingJob(document_id="stale", knowledge_base_id="kb-1", job_type=JobType.AUTO_RETRY_DOCUMENT, status="failed"))
     db.query(Document).filter_by(id="stale").update({"updated_at": datetime.utcnow()})
     db.commit()
     assert recover_unavailable_documents(db, HealthEngine(True)) == 0

@@ -1,5 +1,6 @@
 from app.retrieval import RetrievalEvidence
-from app.services import apply_answer_reference_contract, compose_cited_answer, fuse_evidence, processing_retry_delay, sanitize_source_reference_urls
+from app.retry_policy import DEFAULT_RETRY
+from app.services import apply_answer_reference_contract, compose_cited_answer, fuse_evidence, sanitize_source_reference_urls
 
 
 def source(document_id: str, relevance: float = 1.0) -> dict:
@@ -49,7 +50,7 @@ def test_cited_answer_does_not_duplicate_existing_platform_citations():
 
 
 def test_processing_retry_delay_is_bounded_exponential_backoff():
-    assert [processing_retry_delay(attempt) for attempt in (1, 2, 3, 10)] == [2, 4, 8, 60]
+    assert [DEFAULT_RETRY.delay(attempt) for attempt in (1, 2, 3, 10)] == [2, 4, 8, 60]
 
 
 def test_duplicate_hits_cannot_outvote_independent_channels():

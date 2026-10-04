@@ -21,7 +21,8 @@ from .audit import record_audit, record_mcp_error_trace, record_retrieval_execut
 from .db import Base, engine, get_db, SessionLocal
 from .graph_store import Neo4jGraphStore
 from .legal_registry import provision_number_matches, resolve_instrument_statuses
-from .models import AuditLog, Document, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, Group, KbOwner, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, ROLE_ADMIN, TokenKey, TraceRun, TraceSpan, User
+from .graph_retirement import delete_entity_with_edges, retire_relationship
+from .models import AuditLog, Document, DocumentLifecycle, DocumentMetadataTemplate, Entity, EntitySource, GraphNodeLayout, GraphProjectionEvent, Group, JobType, KbOwner, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryFeedback, QueryResult, Relationship, RelationshipSource, TokenKey, TraceRun, TraceSpan, User, ROLE_ADMIN
 from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, custom_template_fields, list_templates, merge_profile_fields, metadata_search_text, resolve_template, template_code, validate_metadata_values
 from .data_quality import build_document_quality_report, build_knowledge_base_quality_report
 from .metadata_search import describe_schema
@@ -689,7 +690,7 @@ def delete_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Dep
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
     assert_kb_access(db, user, kb_id)
-    if db.query(Document.id).filter_by(knowledge_base_id=kb.id).filter(Document.deleted_at.is_(None)).first():
+    if db.query(Document.id).filter_by(knowledge_base_id=kb.id).filter(Document.live()).first():
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_NOT_EMPTY", "message": "Delete or move all documents before deleting this Knowledge Base.", "retryable": False})
     cover_path = kb.cover_image_path
     kb.deleted_at, kb.status = datetime.utcnow(), "deleted"
@@ -738,7 +739,7 @@ def create_document_template(kb_id: str, payload: DocumentMetadataTemplateCreate
     db.add(row)
     record_audit(db, "document_template.create", user.id, "document_template", row.id, {"knowledge_base_id": kb_id, "code": code, "base_document_type": row.base_document_type})
     db.commit(); db.refresh(row)
-    usage_count = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.deleted_at.is_(None)).scalar() or 0
+    usage_count = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.live()).scalar() or 0
     return {"id": row.id, "code": row.code, "name": row.name, "description": row.description, "base_document_type": row.base_document_type,
             "fields": merge_profile_fields(row.base_document_type, custom_template_fields(row)), "version": row.version, "is_active": row.is_active, "is_system": False, "usage_count": usage_count}
 
@@ -769,7 +770,7 @@ def update_document_template(template_id: str, payload: DocumentMetadataTemplate
         row.version += 1
     record_audit(db, "document_template.update", user.id, "document_template", row.id, {"fields": sorted(values), "version": row.version})
     db.commit(); db.refresh(row)
-    usage_count = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.deleted_at.is_(None)).scalar() or 0
+    usage_count = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.live()).scalar() or 0
     return {"id": row.id, "code": row.code, "name": row.name, "description": row.description, "base_document_type": row.base_document_type,
             "fields": merge_profile_fields(row.base_document_type, custom_template_fields(row)), "version": row.version, "is_active": row.is_active, "is_system": False, "usage_count": usage_count}
 
@@ -808,7 +809,7 @@ def rename_document_template(template_id: str, payload: DocumentTemplateRename, 
         row.description = payload.description.strip() or None
     record_audit(db, "document_template.rename", user.id, "document_template", row.id, {"name": row.name})
     db.commit(); db.refresh(row)
-    usage_count = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.deleted_at.is_(None)).scalar() or 0
+    usage_count = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.live()).scalar() or 0
     return {"id": row.id, "code": row.code, "name": row.name, "description": row.description, "base_document_type": row.base_document_type,
             "fields": merge_profile_fields(row.base_document_type, custom_template_fields(row)), "version": row.version, "is_active": row.is_active, "is_system": False, "usage_count": usage_count}
 
@@ -867,7 +868,7 @@ def purge_document_template(template_id: str, user: User = Depends(current_admin
     if not row:
         raise HTTPException(404, "Document template not found")
     assert_kb_access(db, user, row.knowledge_base_id)
-    live_documents = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.deleted_at.is_(None)).scalar() or 0
+    live_documents = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.live()).scalar() or 0
     if live_documents:
         raise HTTPException(409, {"code": "DOCUMENT_TEMPLATE_IN_USE", "message": f"{live_documents} document(s) still use this type. Archive it instead.", "retryable": False, "usage_count": live_documents})
     code, name = row.code, row.name
@@ -975,7 +976,7 @@ def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, o
         raise HTTPException(400, {"code": "DOCUMENT_PAGE_INVALID", "message": "limit must be 1-100 and offset must be non-negative.", "retryable": False})
     rows = db.query(Document).filter(Document.knowledge_base_id == kb_id)
     if not include_deleted:
-        rows = rows.filter(Document.deleted_at.is_(None))
+        rows = rows.filter(Document.live())
     if search and search.strip():
         term = f"%{search.strip()}%"
         rows = rows.filter(or_(Document.title.ilike(term), Document.original_filename.ilike(term)))
@@ -1002,18 +1003,18 @@ def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, o
     has_legal_documents = db.query(Document.id).filter(
         Document.knowledge_base_id == kb_id,
         Document.document_type.in_(["legal", "regulation", "contract"]),
-        Document.deleted_at.is_(None),
+        Document.live(),
     ).first() is not None
     has_completed_documents = db.query(Document.id).filter(
         Document.knowledge_base_id == kb_id,
         Document.status == "completed",
-        Document.deleted_at.is_(None),
+        Document.live(),
     ).first() is not None
     processing_count = db.query(ProcessingJob.document_id).join(
         Document, Document.id == ProcessingJob.document_id
     ).filter(
         Document.knowledge_base_id == kb_id,
-        Document.deleted_at.is_(None),
+        Document.live(),
         ProcessingJob.status.in_(["queued", "running"]),
     ).distinct().count()
     document_ids = [document.id for document in documents]
@@ -1042,7 +1043,7 @@ def list_documents(kb_id: str, include_deleted: bool = False, user: User = Depen
     assert_kb_access(db, user, kb_id)
     rows = db.query(Document).filter_by(knowledge_base_id=kb_id)
     if not include_deleted:
-        rows = rows.filter(Document.deleted_at.is_(None))
+        rows = rows.filter(Document.live())
     documents = rows.order_by(Document.created_at.desc()).limit(200).all()
     document_ids = [document.id for document in documents]
     latest_jobs = {}
@@ -1165,7 +1166,7 @@ def load_document_for_file_download(document_id: str, request: Request, db: Sess
     use Authorization: Bearer with KB-scoped read access.
     """
     doc = db.get(Document, document_id)
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     # Prefer Bearer when present so MCP Agents (and tests that are also logged
     # into the admin UI) hit the token KB scope rather than session RBAC.
@@ -1213,15 +1214,15 @@ def document_jobs(document_id: str, user: User = Depends(current_admin), db: Ses
 @app.post("/api/v1/documents/{document_id}/legal-extract")
 def extract_legal_metadata(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     assert_kb_access(db, user, doc.knowledge_base_id)
     if doc.status != "completed" or not doc.extracted_text:
         raise HTTPException(409, {"code": "DOCUMENT_NOT_READY", "message": "Process the document before legal extraction.", "retryable": False})
-    active = db.query(ProcessingJob.id).filter(ProcessingJob.document_id == doc.id, ProcessingJob.job_type == "EXTRACT_LEGAL_METADATA", ProcessingJob.status.in_(["queued", "running"])).first()
+    active = db.query(ProcessingJob.id).filter(ProcessingJob.document_id == doc.id, ProcessingJob.job_type == JobType.EXTRACT_LEGAL_METADATA, ProcessingJob.status.in_(["queued", "running"])).first()
     if active:
         return {"status": "queued", "document_id": doc.id, "job_id": active[0]}
-    job = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type="EXTRACT_LEGAL_METADATA")
+    job = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type=JobType.EXTRACT_LEGAL_METADATA)
     db.add(job)
     record_audit(db, "document.legal_metadata.extract", user.id, "document", doc.id)
     db.commit(); db.refresh(job)
@@ -1232,7 +1233,7 @@ def extract_legal_metadata(document_id: str, user: User = Depends(current_admin)
 def update_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     current = doc.legal_metadata or {}
     current.update(payload.metadata)
@@ -1246,7 +1247,7 @@ def update_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: 
 def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     if "published_at" in payload.model_fields_set:
         doc.published_at = payload.published_at
@@ -1295,7 +1296,7 @@ class MetadataReviewRequest(BaseModel):
 @app.post("/api/v1/documents/{document_id}/metadata-extract")
 def extract_custom_metadata(document_id: str, payload: MetadataExtractionRequest, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc.extracted_text:
@@ -1314,7 +1315,7 @@ def extract_custom_metadata(document_id: str, payload: MetadataExtractionRequest
 @app.post("/api/v1/documents/{document_id}/metadata-review")
 def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     assert_kb_access(db, user, doc.knowledge_base_id)
     if payload.revision != doc.metadata_revision:
@@ -1359,7 +1360,7 @@ def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, use
 @app.put("/api/v1/documents/{document_id}/legal-metadata")
 def replace_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     doc.legal_metadata = payload.metadata
     record_audit(db, "document.legal_metadata.replace", user.id, "document", doc.id)
@@ -1371,7 +1372,7 @@ def replace_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user:
 def delete_legal_metadata(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     doc.legal_metadata = None
     record_audit(db, "document.legal_metadata.delete", user.id, "document", doc.id)
@@ -1397,7 +1398,7 @@ def reprocess_document(document_id: str, user: User = Depends(current_admin), db
             "job_id": active.id,
         })
     doc.status, doc.error_code, doc.error_message = "queued", None, None
-    job = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type="REPROCESS_DOCUMENT")
+    job = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type=JobType.REPROCESS_DOCUMENT)
     db.add(job); record_audit(db, "document.reprocess", user.id, "document", doc.id)
     db.commit()
     return {"status": "queued", "document_id": doc.id, "job_id": job.id}
@@ -1412,7 +1413,7 @@ def soft_delete_document(db: Session, doc: Document) -> ProcessingJob:
     ).update({"status": "cancelled"}, synchronize_session=False)
     # Keep the retrieval index in sync. A failed purge remains retryable as a
     # normal processing job, so a deleted source cannot silently block re-ingest.
-    purge = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type="PURGE_REMOTE_INDEX")
+    purge = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type=JobType.PURGE_REMOTE_INDEX)
     db.add(purge)
     return purge
 
@@ -1421,7 +1422,7 @@ def soft_delete_document(db: Session, doc: Document) -> ProcessingJob:
 def delete_document(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     purge = soft_delete_document(db, doc)
     record_audit(db, "document.delete", user.id, "document", doc.id, {"knowledge_base_id": doc.knowledge_base_id})
@@ -1433,10 +1434,13 @@ def delete_document(document_id: str, user: User = Depends(current_admin), db: S
 def restore_document(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
-    if not doc or not doc.deleted_at:
+    if not doc or doc.is_live:
         raise HTTPException(404, "Deleted document not found")
+    if doc.lifecycle is DocumentLifecycle.PURGED:
+        raise HTTPException(409, {"code": "DOCUMENT_PURGED", "retryable": False,
+                                  "message": "This document was permanently deleted and cannot be restored. Upload the file again."})
     doc.deleted_at, doc.status = None, "queued"
-    job = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type="RESTORE_DOCUMENT")
+    job = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type=JobType.RESTORE_DOCUMENT)
     db.add(job); record_audit(db, "document.restore", user.id, "document", doc.id)
     db.commit()
     return {"status": "queued", "document_id": doc.id, "job_id": job.id}
@@ -1499,8 +1503,7 @@ def delete_entity(entity_id: str, user: User = Depends(current_admin), db: Sessi
     if entity: assert_kb_access(db, user, entity.knowledge_base_id)
     if not entity or entity.deleted_at:
         raise HTTPException(404, "Entity not found")
-    entity.deleted_at = datetime.utcnow()
-    db.query(Relationship).filter((Relationship.source_entity_id == entity.id) | (Relationship.target_entity_id == entity.id), Relationship.deleted_at.is_(None)).update({"deleted_at": datetime.utcnow()}, synchronize_session=False)
+    delete_entity_with_edges(db, entity)
     record_audit(db, "entity.delete", user.id, "entity", entity.id); db.commit()
     return {"status": "deleted", "entity_id": entity.id}
 
@@ -1717,7 +1720,7 @@ def get_legal_map(kb_id: str, view: str = "verified", instrument_id: str | None 
             Document, Document.id == RelationshipSource.document_id
         ).filter(
             RelationshipSource.relationship_id.in_([edge.id for edge in edges]),
-            Document.deleted_at.is_(None),
+            Document.live(),
         ).all()
         for source, document in source_rows:
             edge_sources.setdefault(source.relationship_id, []).append({
@@ -1739,12 +1742,12 @@ def queue_legal_graph_rebuild(kb_id: str, user: User = Depends(current_admin), d
         raise HTTPException(404, "Knowledge base not found")
     assert_kb_access(db, user, kb_id)
     active = db.query(ProcessingJob).filter(
-        ProcessingJob.knowledge_base_id == kb_id, ProcessingJob.job_type == "REBUILD_LEGAL_GRAPH",
+        ProcessingJob.knowledge_base_id == kb_id, ProcessingJob.job_type == JobType.REBUILD_LEGAL_GRAPH,
         ProcessingJob.status.in_(["queued", "running"]),
     ).first()
     if active:
         return {"status": active.status, "job_id": active.id, "knowledge_base_id": kb_id}
-    job = ProcessingJob(knowledge_base_id=kb_id, job_type="REBUILD_LEGAL_GRAPH", current_stage="queued")
+    job = ProcessingJob(knowledge_base_id=kb_id, job_type=JobType.REBUILD_LEGAL_GRAPH, current_stage="queued")
     db.add(job); db.flush()
     record_audit(db, "legal_graph.rebuild.queue", user.id, "knowledge_base", kb_id, {"job_id": job.id})
     db.commit()
@@ -1754,7 +1757,7 @@ def queue_legal_graph_rebuild(kb_id: str, user: User = Depends(current_admin), d
 @app.get("/api/v1/knowledge-bases/{kb_id}/legal-graph/rebuild")
 def legal_graph_rebuild_status(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     assert_kb_access(db, user, kb_id)
-    job = db.query(ProcessingJob).filter_by(knowledge_base_id=kb_id, job_type="REBUILD_LEGAL_GRAPH").order_by(ProcessingJob.created_at.desc()).first()
+    job = db.query(ProcessingJob).filter_by(knowledge_base_id=kb_id, job_type=JobType.REBUILD_LEGAL_GRAPH).order_by(ProcessingJob.created_at.desc()).first()
     if not job:
         return {"status": "not_started", "job_id": None}
     return {"status": job.status, "job_id": job.id, "stage": job.current_stage, "progress_percent": job.progress_percent,
@@ -1910,7 +1913,7 @@ def sync_knowledge_base_graph(kb_id: str, user: User = Depends(current_admin), d
         raise HTTPException(404, "Knowledge base not found")
     assert_kb_access(db, user, kb_id)
     totals = {"entities": 0, "relationships": 0}
-    documents = db.query(Document).filter_by(knowledge_base_id=kb_id, status="completed").filter(Document.deleted_at.is_(None)).all()
+    documents = db.query(Document).filter_by(knowledge_base_id=kb_id, status="completed").filter(Document.live()).all()
     for document in documents:
         result = sync_lightrag_document_graph(db, document)
         totals["entities"] += result["entities"]
@@ -1941,7 +1944,7 @@ def delete_relationship(relationship_id: str, user: User = Depends(current_admin
     if relationship: assert_kb_access(db, user, relationship.knowledge_base_id)
     if not relationship or relationship.deleted_at:
         raise HTTPException(404, "Relationship not found")
-    relationship.deleted_at = datetime.utcnow(); record_audit(db, "relationship.delete", user.id, "relationship", relationship.id); db.commit()
+    retire_relationship(db, relationship); record_audit(db, "relationship.delete", user.id, "relationship", relationship.id); db.commit()
     return {"status": "deleted", "relationship_id": relationship.id}
 
 
@@ -2002,7 +2005,7 @@ def get_entity_inspector(entity_id: str, depth: int = 1, user: User = Depends(cu
         raise HTTPException(404, "Entity not found")
     depth = max(1, min(depth, 3))
     source_rows = db.query(EntitySource, Document).join(Document, Document.id == EntitySource.document_id).filter(
-        EntitySource.entity_id == entity.id, Document.deleted_at.is_(None)
+        EntitySource.entity_id == entity.id, Document.live()
     ).order_by(EntitySource.created_at.desc()).limit(50).all()
     document_ids = {document.id for _, document in source_rows}
     attr_document_id = (entity.attributes or {}).get("document_id")
@@ -2848,7 +2851,7 @@ def ingest_knowledge_base_view(kb: KnowledgeBase) -> dict:
 
 def ingest_document_row(db: Session, token: TokenKey, document_id: str) -> Document:
     doc = db.get(Document, document_id)
-    if not doc or doc.deleted_at or doc.knowledge_base_id != token.allowed_ingest_knowledge_base_id:
+    if not doc or not doc.is_live or doc.knowledge_base_id != token.allowed_ingest_knowledge_base_id:
         raise HTTPException(404, {"code": "DOCUMENT_NOT_FOUND", "message": "Document not found", "retryable": False})
     return doc
 
@@ -3089,7 +3092,7 @@ def ingest_list_documents(kb_id: str, status: str | None = None, limit: int = 50
     ingest_knowledge_base(db, token, kb_id)
     if limit < 1 or limit > 100 or offset < 0:
         raise HTTPException(400, {"code": "DOCUMENT_PAGE_INVALID", "message": "limit must be 1-100 and offset must be non-negative.", "retryable": False})
-    rows = db.query(Document).filter(Document.knowledge_base_id == kb_id, Document.deleted_at.is_(None))
+    rows = db.query(Document).filter(Document.knowledge_base_id == kb_id, Document.live())
     if status:
         rows = rows.filter(Document.status == status)
     total = rows.count()

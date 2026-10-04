@@ -75,7 +75,7 @@ def create_text_document_job(db: Session, knowledge_base_id: str, title: str, te
     checksum = hashlib.sha256(payload).hexdigest()
     from .models import Document as _Document
     duplicate = db.query(_Document).filter_by(knowledge_base_id=knowledge_base_id, checksum_sha256=checksum).filter(
-        _Document.deleted_at.is_(None)
+        _Document.live()
     ).first()
     if duplicate:
         path.unlink(missing_ok=True)

@@ -141,6 +141,7 @@ class DocumentOut(ORMModel):
     legal_metadata: dict[str, Any] | None
     indexed_at: datetime | None
     deleted_at: datetime | None
+    purged_at: datetime | None = None
     # Latest job fields let the Documents UI observe follow-up work such as
     # legal metadata extraction even after the document itself is searchable.
     processing_job_status: str | None = None

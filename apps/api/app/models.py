@@ -1,7 +1,8 @@
 import uuid
+from enum import StrEnum
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import and_, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 from pgvector.sqlalchemy import Vector
@@ -112,6 +113,12 @@ class DocumentMetadataTemplate(Timestamped, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 
+class DocumentLifecycle(StrEnum):
+    LIVE = "live"
+    DELETED = "deleted"  # hidden and restorable: files, chunks and graph evidence are still kept
+    PURGED = "purged"  # content removed for good; only the row remains as a tombstone
+
+
 class Document(Timestamped, Base):
     __tablename__ = "documents"
     __table_args__ = (
@@ -167,6 +174,29 @@ class Document(Timestamped, Base):
     quality_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     external_engine_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    # Set when a deleted document's files, chunks and generated graph were removed for
+    # good (app.document_purge). The row stays as a tombstone for audit and job history.
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def lifecycle(self) -> DocumentLifecycle:
+        if self.purged_at is not None:
+            return DocumentLifecycle.PURGED
+        return DocumentLifecycle.LIVE if self.deleted_at is None else DocumentLifecycle.DELETED
+
+    @property
+    def is_live(self) -> bool:
+        return self.lifecycle is DocumentLifecycle.LIVE
+
+    @classmethod
+    def live(cls):
+        """SQL condition: the document has not been deleted."""
+        return cls.deleted_at.is_(None)
+
+    @classmethod
+    def restorable(cls):
+        """SQL condition: deleted, but its content has not been purged yet."""
+        return and_(cls.deleted_at.isnot(None), cls.purged_at.is_(None))
 
 
 class DocumentMetadataValue(Base):
@@ -275,12 +305,25 @@ class LegalInstrumentRelation(Timestamped, Base):
     review_status: Mapped[str] = mapped_column(String(20), default="suggested", index=True)
 
 
+class JobType(StrEnum):
+    """Every kind of work the worker runs. Values are the strings already stored in ``processing_jobs``."""
+    PROCESS_DOCUMENT = "PROCESS_DOCUMENT"
+    REPROCESS_DOCUMENT = "REPROCESS_DOCUMENT"
+    RESTORE_DOCUMENT = "RESTORE_DOCUMENT"
+    AUTO_RETRY_DOCUMENT = "AUTO_RETRY_DOCUMENT"
+    REINDEX_EMBEDDINGS = "REINDEX_EMBEDDINGS"
+    EXTRACT_LEGAL_METADATA = "EXTRACT_LEGAL_METADATA"
+    EXTRACT_DOCUMENT_METADATA = "EXTRACT_DOCUMENT_METADATA"
+    REBUILD_LEGAL_GRAPH = "REBUILD_LEGAL_GRAPH"
+    PURGE_REMOTE_INDEX = "PURGE_REMOTE_INDEX"
+
+
 class ProcessingJob(Timestamped, Base):
     __tablename__ = "processing_jobs"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
     document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id"), nullable=True, index=True)
     knowledge_base_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_bases.id"), nullable=True)
-    job_type: Mapped[str] = mapped_column(String(50), default="PROCESS_DOCUMENT")
+    job_type: Mapped[str] = mapped_column(String(50), default=JobType.PROCESS_DOCUMENT)
     status: Mapped[str] = mapped_column(String(30), default="queued")
     current_stage: Mapped[str | None] = mapped_column(String(50), nullable=True)
     progress_percent: Mapped[int] = mapped_column(Integer, default=0)

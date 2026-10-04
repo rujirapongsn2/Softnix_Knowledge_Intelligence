@@ -30,9 +30,42 @@ _DUPLICATE_MARKER = "identical content already exists"
 _DUPLICATE_ORIGINAL = re.compile(r"Original doc_id:\s*([A-Za-z0-9_-]+)")
 
 
+# Upstream provider failures that mean "retry later with fewer parallel calls", seen inside
+# LightRAG track errors. Matched case-insensitively because the engine relays provider text verbatim.
+_BUDGET_EXHAUSTED_MARKERS = ("in_flight_budget_exhausted", "in-flight budget", "payment required", "insufficient credits", "402")
+
+# What a person is told for each engine failure; the engine's own wording follows as detail.
+ENGINE_ERROR_MESSAGES = {
+    "RETRIEVAL_ENGINE_DUPLICATE": "Identical content is already indexed in this Knowledge Base.",
+    "RETRIEVAL_ENGINE_REJECTED": "The retrieval engine rejected this document.",
+    "RETRIEVAL_ENGINE_UNAVAILABLE": "The retrieval engine could not be reached.",
+    "RETRIEVAL_ENGINE_BUSY": "The retrieval engine is busy.",
+    "RETRIEVAL_ENGINE_TIMEOUT": "The retrieval engine did not finish in time.",
+}
+
+
+def describe_engine_failure(code: str, detail: str | None, default: str) -> str:
+    base = ENGINE_ERROR_MESSAGES.get(code, default)
+    return f"{base} Detail: {detail}"[:2000] if detail else base
+
+
 def is_duplicate_content_error(error: str | None) -> bool:
     """True when LightRAG rejected an insert because identical content is already indexed."""
     return _DUPLICATE_MARKER in (error or "").casefold() or "[duplicate:content_hash]" in (error or "").casefold()
+
+
+def classify_track_failure(error_detail: str | None) -> str:
+    """Map a failed LightRAG track onto a platform error code.
+
+    Budget exhaustion is transient (the shared provider frees quota over minutes). Identical content
+    that already exists is its own code so it can be resolved or explained. Anything else is REJECTED.
+    """
+    detail = (error_detail or "").casefold()
+    if any(marker in detail for marker in _BUDGET_EXHAUSTED_MARKERS):
+        return "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
+    if is_duplicate_content_error(error_detail):
+        return "RETRIEVAL_ENGINE_DUPLICATE"
+    return "RETRIEVAL_ENGINE_REJECTED"
 
 
 def duplicate_original_id(error: str | None) -> str | None:

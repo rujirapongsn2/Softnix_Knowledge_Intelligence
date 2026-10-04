@@ -31,6 +31,14 @@ export function useDocumentTypeForm() {
       keys.forEach(key => delete remaining[key]);
       if (Object.keys(remaining).length) next.fields[target] = remaining; else delete next.fields[target];
     }
+    // Changing one of two equal keys resolves the "duplicate" message on the other row too.
+    if (keys.includes("key")) {
+      for (const [row, rowErrors] of Object.entries(next.fields)) {
+        if (rowErrors.key !== "duplicate") continue;
+        const {key: _resolved, ...rest} = rowErrors;
+        if (Object.keys(rest).length) next.fields[row] = rest; else delete next.fields[row];
+      }
+    }
     setFieldErrors(next);
     if (!next.name && !Object.keys(next.fields).length) setError("");
   };

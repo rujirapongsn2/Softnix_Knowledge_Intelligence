@@ -32,7 +32,7 @@ _DUPLICATE_ORIGINAL = re.compile(r"Original doc_id:\s*([A-Za-z0-9_-]+)")
 
 # Upstream provider failures that mean "retry later with fewer parallel calls", seen inside
 # LightRAG track errors. Matched case-insensitively because the engine relays provider text verbatim.
-_BUDGET_EXHAUSTED_MARKERS = ("in_flight_budget_exhausted", "in-flight budget", "payment required", "insufficient credits", "402")
+_BUDGET_EXHAUSTED = re.compile(r"in_flight_budget_exhausted|in-flight budget|payment required|insufficient credits|\b402\b", re.IGNORECASE)
 
 # What a person is told for each engine failure; the engine's own wording follows as detail.
 ENGINE_ERROR_MESSAGES = {
@@ -60,8 +60,7 @@ def classify_track_failure(error_detail: str | None) -> str:
     Budget exhaustion is transient (the shared provider frees quota over minutes). Identical content
     that already exists is its own code so it can be resolved or explained. Anything else is REJECTED.
     """
-    detail = (error_detail or "").casefold()
-    if any(marker in detail for marker in _BUDGET_EXHAUSTED_MARKERS):
+    if _BUDGET_EXHAUSTED.search(error_detail or ""):
         return "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
     if is_duplicate_content_error(error_detail):
         return "RETRIEVAL_ENGINE_DUPLICATE"
@@ -265,16 +264,8 @@ class LightRAGRetrievalEngine(RetrievalEngine):
 
     def find_document(self, document_id: str, knowledge_base_id: str) -> dict[str, Any] | None:
         """Find this platform document in LightRAG's source registry."""
-        data = self._request("GET", "/documents")
-        statuses = data.get("statuses", {}) if isinstance(data, dict) else {}
-        for rows in statuses.values():
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                identity = self._decode_source_label(str(row.get("file_path") or ""))
-                if identity and identity[0] == knowledge_base_id and identity[1] == document_id:
-                    return row
-        return None
+        return next((row for row in self.list_remote_documents()
+                     if row["document_id"] == document_id and row["knowledge_base_id"] == knowledge_base_id), None)
 
     def delete_remote_document(self, remote_document_id: str) -> None:
         """Delete one failed LightRAG source and wait until it is gone."""

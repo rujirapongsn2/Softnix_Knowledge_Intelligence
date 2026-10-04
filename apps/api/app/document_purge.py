@@ -84,12 +84,17 @@ def purge_document(db: Session, document: Document, *, engine: LightRAGRetrieval
         graph, chunks = {"entities_retired": 0, "relationships_retired": 0}, 0
     # Files go last: if removing one fails the database is already consistent and a
     # rerun (purged_at set) only retries the files.
-    removed_files = []
+    removed_files, failed_files = [], []
     for path in files:
-        if path.exists():
+        if not path.exists():
+            continue
+        try:
             path.unlink()
             removed_files.append(str(path))
-    return {"document_id": document.id, "title": document.title, "chunks_removed": chunks, "files_removed": removed_files, **graph}
+        except OSError:
+            logger.exception("could not remove a purged document's file", extra={"document_id": document.id, "path": str(path)})
+            failed_files.append(str(path))
+    return {"document_id": document.id, "title": document.title, "chunks_removed": chunks, "files_removed": removed_files, "files_failed": failed_files, **graph}
 
 
 def purgeable_documents(db: Session, *, knowledge_base_id: str | None = None, min_age_days: int = DEFAULT_MIN_AGE_DAYS) -> list[Document]:
@@ -113,7 +118,7 @@ def purge_deleted_documents(db: Session, *, knowledge_base_id: str | None = None
     for doc in candidates:
         try:
             report["purged"].append(purge_document(db, doc, engine=engine))
-        except (PurgeBlocked, RuntimeError, OSError) as exc:
+        except (PurgeBlocked, RuntimeError) as exc:
             db.rollback()
             report["blocked"].append({"document_id": doc.id, "title": doc.title, "reason": str(exc)})
     return report

@@ -373,3 +373,19 @@ def test_engine_health_probe():
     assert make(200, {"status": "starting"}).is_healthy() is False
     assert make(503, {}).is_healthy() is False
     assert LightRAGRetrievalEngine(base_url="").is_healthy() is False
+
+
+def test_a_duplicate_whose_id_contains_402_is_not_mistaken_for_budget_exhaustion():
+    error = "Identical content already exists under another filename. Original doc_id: doc-ab402c0de1f2a3b4c5d6e7f8091a2b3c, Status: DocStatus.PROCESSED"
+    assert classify_track_failure(error) == "RETRIEVAL_ENGINE_DUPLICATE"
+    assert classify_track_failure("Provider returned 402") == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
+
+
+def test_find_document_reports_the_status_of_the_group_the_row_was_listed_under():
+    label = "softnix-kb=kb-1__doc=doc-9__Title"
+    payload = {"statuses": {"failed": [{"id": "dup-1", "file_path": label}], "processed": [{"id": "doc-2", "file_path": "softnix-kb=kb-1__doc=doc-8__Other", "status": "PROCESSED"}]}}
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    engine = LightRAGRetrievalEngine(base_url="http://lightrag", client=httpx.Client(transport=transport))
+    assert engine.find_document("doc-9", "kb-1")["status"] == "failed"
+    assert engine.find_document("doc-8", "kb-1")["status"] == "processed"
+    assert engine.find_document("doc-7", "kb-1") is None

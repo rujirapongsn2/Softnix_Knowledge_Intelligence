@@ -242,3 +242,18 @@ def test_a_document_is_live_deleted_or_purged_and_each_state_selects_the_right_r
 
     assert selected(Document.live()) == ["live"]
     assert selected(Document.restorable()) == ["deleted"]
+
+
+def test_a_file_that_cannot_be_removed_is_reported_without_blocking_the_database_purge(db, monkeypatch):
+    doc = make_doc(db, "gone", deleted_days_ago=40)
+    original_unlink = Path.unlink
+
+    def refuse(self, *args, **kwargs):
+        if self == Path(doc.storage_path).resolve():
+            raise PermissionError("read-only")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    report = purge_deleted_documents(db, min_age_days=0, apply=True)
+    assert report["blocked"] == [] and report["purged"][0]["files_failed"] == [str(Path(doc.storage_path).resolve())]
+    assert db.get(Document, "gone").purged_at is not None

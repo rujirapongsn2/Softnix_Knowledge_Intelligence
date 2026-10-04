@@ -26,14 +26,15 @@ export function useAnchoredMenu() {
     if (!open) return undefined;
     const closeOutside = event => { if (!rootRef.current?.contains(event.target)) close(); };
     const closeOnEscape = event => { if (event.key === "Escape") close(); };
+    const closeOnPageScroll = event => { if (!menuRef.current?.contains(event.target)) close(); };
     document.addEventListener("mousedown", closeOutside);
     document.addEventListener("keydown", closeOnEscape);
-    document.addEventListener("scroll", close, true);
+    document.addEventListener("scroll", closeOnPageScroll, true);
     window.addEventListener("resize", close);
     return () => {
       document.removeEventListener("mousedown", closeOutside);
       document.removeEventListener("keydown", closeOnEscape);
-      document.removeEventListener("scroll", close, true);
+      document.removeEventListener("scroll", closeOnPageScroll, true);
       window.removeEventListener("resize", close);
     };
   }, [open, close]);

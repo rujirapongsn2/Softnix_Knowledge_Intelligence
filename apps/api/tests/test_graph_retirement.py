@@ -104,3 +104,47 @@ def test_deleting_a_relationship_through_the_api_removes_it_from_neo4j():
             events = session.query(GraphProjectionEvent).filter_by(relationship_id=relationship["id"]).order_by(GraphProjectionEvent.created_at).all()
             assert len(events) >= 2  # the create projection, then the removal
             assert session.get(Relationship, relationship["id"]).deleted_at is not None
+
+
+def test_purging_a_document_retires_edges_left_dangling_but_regeneration_keeps_them(db):
+    from app.graph_retirement import drop_document_evidence
+
+    only_a = make_entity(db, "only-a", origin="lightrag", sources=["doc-a"])
+    other = make_entity(db, "other", origin="lightrag", sources=["doc-b"])
+    edge_from_b = make_relationship(db, only_a, other, origin="lightrag", sources=["doc-b"])
+    db.commit()
+    drop_document_evidence(db, "doc-a", origin="lightrag")
+    db.commit()
+    assert db.get(Entity, only_a.id).deleted_at and db.get(Relationship, edge_from_b.id).deleted_at is None  # regeneration
+    db.get(Entity, only_a.id).deleted_at = None
+    db.add(EntitySource(entity_id=only_a.id, document_id="doc-a", excerpt="evidence"))
+    db.commit()
+    drop_document_evidence(db, "doc-a")  # purge
+    db.commit()
+    assert db.get(Entity, only_a.id).deleted_at and db.get(Relationship, edge_from_b.id).deleted_at
+    assert ("relationship", edge_from_b.id) in projected(db)
+
+
+def test_projecting_an_edge_never_recreates_a_retired_endpoint(db, monkeypatch):
+    calls = []
+
+    class Store:
+        enabled = True
+
+        def upsert_entity(self, entity):
+            calls.append(("upsert_entity", entity.id))
+
+        def upsert_relationship(self, relationship, source, target):
+            calls.append(("upsert_relationship", relationship.id))
+
+        def delete_relationship(self, relationship_id):
+            calls.append(("delete_relationship", relationship_id))
+
+    monkeypatch.setattr(services, "Neo4jGraphStore", lambda: Store())
+    left, right = make_entity(db, "left", origin="manual"), make_entity(db, "right", origin="manual")
+    edge = make_relationship(db, left, right, origin="manual")
+    left.deleted_at = __import__("datetime").datetime.utcnow()
+    db.add(GraphProjectionEvent(event_type="relationship", relationship_id=edge.id))
+    db.commit()
+    assert services.process_next_graph_projection(db)
+    assert calls == [("delete_relationship", edge.id)]

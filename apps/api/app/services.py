@@ -2737,12 +2737,14 @@ def process_next_graph_projection(db: Session) -> bool:
             relationship = db.get(Relationship, event.relationship_id)
             if relationship is None or relationship.deleted_at:
                 store.delete_relationship(event.relationship_id)
-            elif relationship:
+            else:
                 source, target = db.get(Entity, relationship.source_entity_id), db.get(Entity, relationship.target_entity_id)
-                if source and target:
+                if source and target and not source.deleted_at and not target.deleted_at:
                     store.upsert_entity(source)
                     store.upsert_entity(target)
                     store.upsert_relationship(relationship, source, target)
+                else:
+                    store.delete_relationship(event.relationship_id)
         event.status, event.completed_at, event.last_error = "completed", datetime.utcnow(), None
     except (httpx.HTTPError, RuntimeError) as exc:
         event.status = "queued"

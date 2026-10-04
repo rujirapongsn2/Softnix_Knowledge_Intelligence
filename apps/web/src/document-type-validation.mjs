@@ -54,3 +54,7 @@ export function summarizeDraftChanges(baseline, draft) {
   const detailsChanged = ["name", "description", "base_document_type"].some(key => (baseline[key] || "") !== (draft[key] || ""));
   return {added, removed, modified, detailsChanged, total: added + removed + modified + (detailsChanged ? 1 : 0)};
 }
+
+// Which error a field edit resolves, so the message disappears as soon as the input is touched.
+const ERROR_RESOLVED_BY = {key: "key", label: "label", options_text: "options", field_type: "options", extraction_description: "extraction", fill_mode: "extraction"};
+export const errorKeysForPatch = patch => Object.keys(patch).map(name => ERROR_RESOLVED_BY[name]).filter(Boolean);

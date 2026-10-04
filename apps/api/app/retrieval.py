@@ -1,6 +1,7 @@
 """Engine-neutral retrieval contracts; LightRAG REST details are isolated here."""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import re
 import time
 from typing import Any
 from urllib.parse import quote
@@ -10,6 +11,34 @@ import httpx
 from .config import get_settings
 from .content_safety import protect_document_text, protect_query_text
 from .request_budget import remaining_timeout
+
+
+class RetrievalEngineError(RuntimeError):
+    """Engine failure whose ``str()`` stays the stable error code.
+
+    Existing callers match on ``str(exc)``; the human-readable cause the engine
+    reported (HTTP status/body, track ``error_msg``) travels in ``detail`` so the
+    worker can store it instead of collapsing everything into one bare code.
+    """
+    def __init__(self, code: str, detail: str | None = None):
+        super().__init__(code)
+        self.code = code
+        self.detail = " ".join(str(detail).split())[:500] if detail else None
+
+
+_DUPLICATE_MARKER = "identical content already exists"
+_DUPLICATE_ORIGINAL = re.compile(r"Original doc_id:\s*([A-Za-z0-9_-]+)")
+
+
+def is_duplicate_content_error(error: str | None) -> bool:
+    """True when LightRAG rejected an insert because identical content is already indexed."""
+    return _DUPLICATE_MARKER in (error or "").casefold() or "[duplicate:content_hash]" in (error or "").casefold()
+
+
+def duplicate_original_id(error: str | None) -> str | None:
+    """Extract the LightRAG id of the record the duplicate collided with."""
+    match = _DUPLICATE_ORIGINAL.search(error or "")
+    return match.group(1) if match else None
 
 
 @dataclass
@@ -108,11 +137,12 @@ class LightRAGRetrievalEngine(RetrievalEngine):
             response.raise_for_status()
             return response.json() if response.content else {}
         except httpx.HTTPStatusError as exc:
+            detail = f"HTTP {exc.response.status_code} on {method} {path}: {exc.response.text[:300]}"
             if exc.response.status_code == 409:
-                raise RuntimeError("RETRIEVAL_ENGINE_BUSY") from exc
-            raise RuntimeError("RETRIEVAL_ENGINE_REJECTED") from exc
+                raise RetrievalEngineError("RETRIEVAL_ENGINE_BUSY", detail) from exc
+            raise RetrievalEngineError("RETRIEVAL_ENGINE_REJECTED", detail) from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError("RETRIEVAL_ENGINE_UNAVAILABLE") from exc
+            raise RetrievalEngineError("RETRIEVAL_ENGINE_UNAVAILABLE", f"{type(exc).__name__} on {method} {path}: {exc}") from exc
         finally:
             if self._client is None:
                 client.close()
@@ -165,6 +195,40 @@ class LightRAGRetrievalEngine(RetrievalEngine):
             self.delete_remote_document(existing["id"])
             data = self._request("POST", "/documents/text", json=payload)
         return data.get("track_id") or data.get("id")
+
+    def is_healthy(self) -> bool:
+        """True when LightRAG answers its health endpoint (used before re-queueing failed documents)."""
+        if not self.enabled:
+            return False
+        try:
+            return str(self._request("GET", "/health").get("status", "")).lower() == "healthy"
+        except RuntimeError:
+            return False
+
+    def list_remote_documents(self) -> list[dict[str, Any]]:
+        """Return every LightRAG source row with the platform identity decoded from its label.
+
+        ``knowledge_base_id``/``document_id`` are ``None`` for rows this platform
+        did not create, so callers never touch foreign records.
+        """
+        data = self._request("GET", "/documents")
+        statuses = data.get("statuses", {}) if isinstance(data, dict) else {}
+        rows: list[dict[str, Any]] = []
+        for status, items in statuses.items():
+            if not isinstance(items, list):
+                continue
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                identity = self._decode_source_label(str(row.get("file_path") or ""))
+                rows.append({**row, "status": str(row.get("status") or status).lower(),
+                             "knowledge_base_id": identity[0] if identity else None,
+                             "document_id": identity[1] if identity else None,
+                             "title": identity[2] if identity else None})
+        return rows
+
+    def get_remote_document(self, remote_document_id: str) -> dict[str, Any] | None:
+        return next((row for row in self.list_remote_documents() if row.get("id") == remote_document_id), None)
 
     def find_document(self, document_id: str, knowledge_base_id: str) -> dict[str, Any] | None:
         """Find this platform document in LightRAG's source registry."""

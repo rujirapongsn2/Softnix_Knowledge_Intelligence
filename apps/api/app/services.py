@@ -34,7 +34,8 @@ from .data_quality import build_document_quality_reports
 from .openrouter import OpenRouterClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
-from .retrieval import LightRAGRetrievalEngine, RetrievalEvidence
+from .remote_index import resolve_remote_duplicate
+from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, RetrievalEvidence, is_duplicate_content_error
 
 SUPPORTED_EXTENSIONS = {".pdf", ".doc", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".html", ".htm", ".csv", ".json"}
 REFERENCE_FILE_EXTENSIONS = {".pdf", ".doc", ".docx", ".xlsx", ".xls", ".txt"}
@@ -70,6 +71,14 @@ TRANSIENT_PROCESSING_ERRORS = {
     "RETRIEVAL_ENGINE_TIMEOUT", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "OPENROUTER_UNAVAILABLE", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_TIMEOUT", "OCR_CHAIN_FAILED",
 }
 MAX_PROCESSING_ATTEMPTS = 3
+# A remote-index purge that fails leaves a "ghost" that blocks re-uploads of the
+# same content, so it keeps retrying through an engine restart (backoff caps at 60s).
+MAX_PURGE_ATTEMPTS = 8
+# While the retrieval engine is unreachable (restart, crash, deploy) retrying within
+# seconds is pointless: back off from 30s up to 5 minutes, ~27 minutes in total, and
+# leave the rest to the recovery sweep in remote_index.py.
+MAX_ENGINE_UNAVAILABLE_ATTEMPTS = 8
+ENGINE_UNAVAILABLE_MAX_DELAY_SECONDS = 300
 # Budget exhaustion outlives the normal retry window (the shared provider
 # account frees in-flight quota on the scale of minutes), so those tracks
 # earn extra attempts instead of failing the document permanently (F1).
@@ -89,6 +98,10 @@ logger = logging.getLogger(__name__)
 
 def processing_retry_delay(attempt_count: int) -> int:
     return min(60, 2 ** max(1, attempt_count))
+
+
+def engine_unavailable_retry_delay(attempt_count: int) -> int:
+    return min(ENGINE_UNAVAILABLE_MAX_DELAY_SECONDS, 30 * 2 ** max(0, attempt_count - 1))
 
 
 def canonical_entity_name(value: str) -> str:
@@ -2545,13 +2558,32 @@ def classify_track_failure(error_detail: str | None) -> str:
 
     ``RETRIEVAL_ENGINE_BUDGET_EXHAUSTED`` is transient: the shared provider
     account frees in-flight quota on the scale of minutes, so the worker's
-    retry backoff can recover it without operator action (F1).  Everything
-    else keeps the existing terminal ``RETRIEVAL_ENGINE_REJECTED``.
+    retry backoff can recover it without operator action (F1).  "Identical
+    content already exists" is reported as ``RETRIEVAL_ENGINE_DUPLICATE`` so it
+    can be resolved (or explained) instead of looking like an engine fault.
+    Everything else keeps the existing ``RETRIEVAL_ENGINE_REJECTED``.
     """
     detail = (error_detail or "").casefold()
     if any(marker in detail for marker in _BUDGET_EXHAUSTED_MARKERS):
         return "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
+    if is_duplicate_content_error(error_detail):
+        return "RETRIEVAL_ENGINE_DUPLICATE"
     return "RETRIEVAL_ENGINE_REJECTED"
+
+
+# Operator-facing explanations; the engine's own wording is appended as detail.
+ENGINE_ERROR_MESSAGES = {
+    "RETRIEVAL_ENGINE_DUPLICATE": "Identical content is already indexed in this Knowledge Base.",
+    "RETRIEVAL_ENGINE_REJECTED": "The retrieval engine rejected this document.",
+    "RETRIEVAL_ENGINE_UNAVAILABLE": "The retrieval engine could not be reached.",
+    "RETRIEVAL_ENGINE_BUSY": "The retrieval engine is busy.",
+    "RETRIEVAL_ENGINE_TIMEOUT": "The retrieval engine did not finish in time.",
+}
+
+
+def engine_failure_message(code: str, detail: str | None, default: str) -> str:
+    base = ENGINE_ERROR_MESSAGES.get(code, default)
+    return f"{base} Detail: {detail}"[:2000] if detail else base
 
 
 # Follow-up stages run after a document is already searchable and are cheap;
@@ -2596,8 +2628,10 @@ def process_next_job(db: Session) -> bool:
             code = str(exc) if str(exc).startswith("RETRIEVAL_ENGINE_") else "REMOTE_INDEX_PURGE_FAILED"
             # Transient engine states (BUSY/TIMEOUT) retry like document
             # processing — a busy remote must not strand a ghost (review info).
-            if code in {"RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT"} and job.attempt_count < MAX_PROCESSING_ATTEMPTS:
-                job.status, job.error_code, job.error_message = "queued", code, "Remote engine busy; purge retry scheduled."
+            # An unreachable engine (restart, network blip) is just as temporary: giving up
+            # here left ghost records that later rejected every re-upload of the same content.
+            if code in {"RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "RETRIEVAL_ENGINE_UNAVAILABLE"} and job.attempt_count < MAX_PURGE_ATTEMPTS:
+                job.status, job.error_code, job.error_message = "queued", code, "Remote engine busy or unavailable; purge retry scheduled."
                 job.next_attempt_at = datetime.utcnow() + timedelta(seconds=processing_retry_delay(job.attempt_count))
             else:
                 job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "REMOTE_INDEX_PURGE_FAILED", str(exc)[:2000]
@@ -2704,12 +2738,24 @@ def process_next_job(db: Session) -> bool:
                 track_id = doc.external_engine_id
                 if track_id:
                     deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
+                    duplicate_resolved = False
                     while time.monotonic() < deadline:
                         track = engine.track_status(track_id)
                         if track["status"] == "processed":
                             break
                         if track["status"] == "failed":
-                            raise RuntimeError(classify_track_failure(track.get("error")))
+                            failure = classify_track_failure(track.get("error"))
+                            if failure == "RETRIEVAL_ENGINE_DUPLICATE" and not duplicate_resolved:
+                                # A stale record of a deleted document blocks this content: remove it
+                                # and ingest once more. A live twin raises a clear DUPLICATE error.
+                                duplicate_resolved = True
+                                if resolve_remote_duplicate(db, engine, doc, track.get("error")) == "already_indexed":
+                                    break
+                                doc.external_engine_id = track_id = engine.ingest(doc.id, doc.knowledge_base_id, text, doc.title or doc.original_filename)
+                                if not track_id:
+                                    break  # nothing to poll, same as a first ingest without a track
+                                continue
+                            raise RetrievalEngineError(failure, track.get("error"))
                         job.progress_percent = 85
                         db.commit()
                         time.sleep(2)
@@ -2736,17 +2782,24 @@ def process_next_job(db: Session) -> bool:
         # (doc-level clear above covers F2's user-visible case).
         job.error_code, job.error_message = None, None
     except Exception as exc:
-        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
+        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
         logger.exception("document processing failed", extra={"document_id": doc.id, "job_id": job.id, "error_code": code})
         message = "The document could not be processed."
         if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED":
             message = "Upstream indexing budget temporarily exhausted; retry scheduled."
+        if code.startswith("RETRIEVAL_ENGINE_"):
+            # Keep the engine's own explanation (HTTP status, track error, which document
+            # the content collides with) so the document view can say why, not just the code.
+            message = engine_failure_message(code, getattr(exc, "detail", None), message)
         job.error_code, job.error_message = code, message
-        attempt_ceiling = MAX_BUDGET_PROCESSING_ATTEMPTS if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED" else MAX_PROCESSING_ATTEMPTS
+        attempt_ceiling = {"RETRIEVAL_ENGINE_BUDGET_EXHAUSTED": MAX_BUDGET_PROCESSING_ATTEMPTS,
+                           "RETRIEVAL_ENGINE_UNAVAILABLE": MAX_ENGINE_UNAVAILABLE_ATTEMPTS}.get(code, MAX_PROCESSING_ATTEMPTS)
         if code in TRANSIENT_PROCESSING_ERRORS and job.attempt_count < attempt_ceiling:
             delay = processing_retry_delay(job.attempt_count)
             if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED":
                 delay = max(delay, BUDGET_RETRY_DELAY_FLOOR_SECONDS)
+            elif code == "RETRIEVAL_ENGINE_UNAVAILABLE":
+                delay = engine_unavailable_retry_delay(job.attempt_count)
             job.status, job.current_stage = "queued", "retry_wait"
             job.next_attempt_at = datetime.utcnow() + timedelta(seconds=delay)
             doc.status, doc.error_code, doc.error_message = "queued", code, "Temporary dependency failure; retry scheduled."

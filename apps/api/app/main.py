@@ -1094,7 +1094,7 @@ def document_text(document_id: str, user: User = Depends(current_admin), db: Ses
     return {"document_id": doc.id, "status": doc.status, "document_type": doc.document_type, "metadata_template_id": doc.metadata_template_id,
             "metadata_template_name": doc.metadata_template_name, "metadata_template_version": doc.metadata_template_version,
             "metadata_template_fields": doc.metadata_template_fields or [],
-            "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text, "error_code": doc.error_code, "legal_metadata": doc.legal_metadata,
+            "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text, "error_code": doc.error_code, "error_message": doc.error_message, "legal_metadata": doc.legal_metadata,
             "quality": build_document_quality_report(db, doc),
             "reference_file": reference_file_view(doc), "reference_pdf": reference_pdf_view(doc)}
 

@@ -52,16 +52,19 @@ export const Button = forwardRef(function Button({label, children, variant = "se
   return <KumoButton ref={ref} variant={kumoVariant} loading={isLoading} disabled={isDisabled || isLoading} className={join("snx-button", `snx-button-${size}`, className)} {...props}>{children || label}</KumoButton>;
 });
 
+// Kumo prints an English "(optional)" after the label whenever `required` is
+// explicitly false, which clashes with our own localized optional marker and
+// mislabels fields that are mandatory. Only pass `required` when it is true.
 export function TextInput({label, value, onChange, description, isLabelHidden = false, isDisabled = false, isRequired = false, isOptional = false, optionalLabel, hasAutoFocus = false, className, ...props}) {
   const accessibleLabel = isOptional ? <>{label}{optionalLabel && <> <em>{optionalLabel}</em></>}</> : label;
-  return <div className={join("snx-field", className)}>
-    <KumoInput label={accessibleLabel} description={description} aria-label={props["aria-label"] || (isLabelHidden ? label : undefined)} value={value ?? ""} onChange={event => onChange?.(event.target.value)} disabled={isDisabled} required={isRequired} autoFocus={hasAutoFocus} {...props}/>
+  return <div className={join("snx-field", props.error && "snx-field-invalid", className)}>
+    <KumoInput label={accessibleLabel} description={description} aria-label={props["aria-label"] || (isLabelHidden ? label : undefined)} value={value ?? ""} onChange={event => onChange?.(event.target.value)} disabled={isDisabled} required={isRequired || undefined} variant={props.error ? "error" : undefined} autoFocus={hasAutoFocus} {...props}/>
   </div>;
 }
 
 export function TextArea({label, value, onChange, description, isLabelHidden = false, isDisabled = false, isRequired = false, className, ...props}) {
-  return <div className={join("snx-field", className)}>
-    <KumoInputArea label={label} description={description} aria-label={props["aria-label"] || (isLabelHidden ? label : undefined)} value={value ?? ""} onChange={event => onChange?.(event.target.value)} disabled={isDisabled} required={isRequired} {...props}/>
+  return <div className={join("snx-field", props.error && "snx-field-invalid", className)}>
+    <KumoInputArea label={label} description={description} aria-label={props["aria-label"] || (isLabelHidden ? label : undefined)} value={value ?? ""} onChange={event => onChange?.(event.target.value)} disabled={isDisabled} required={isRequired || undefined} variant={props.error ? "error" : undefined} {...props}/>
   </div>;
 }
 

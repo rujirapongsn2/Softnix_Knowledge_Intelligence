@@ -1,5 +1,6 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
+import {parseOptions, summarizeDraftChanges, validateDocumentTypeDraft, withRowId} from "./document-type-validation.mjs";
 import {Theme, AppShell, Badge, Button, Card, CheckboxInput, CommandPalette, EmptyState, FileInput, ProgressBar, SideNav, SideNavHeading, SideNavItem, SideNavSection, Selector, TextArea, TextInput, Toast, TopNav, TopNavHeading, useDialogFocus} from "./ui.jsx";
 import {AppWindow, BookOpen, Buildings, ChartLineUp, CirclesThree, Cloud, Compass, Database, FileText, Gavel, GitBranch, HardDrives, ImageSquare, Key, Lightbulb, MagnifyingGlass, Rows, Scales, ShieldCheck, SquaresFour, Trash, UploadSimple, User, Users, UsersThree} from "@phosphor-icons/react";
 import {Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow, ReactFlowProvider, useEdgesState, useNodesState, useReactFlow} from "@xyflow/react";
@@ -1489,32 +1490,64 @@ function MetadataFields({fields = [], values = {}, onChange, isDisabled = false}
   })}</div>;
 }
 
-function DocumentTypeEditor({draft, setDraft, editing, error, setError, onSubmit, onCancel, profileDefaults}) {
+const DOCUMENT_ERROR_CODES = ["RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_UNAVAILABLE"];
+
+const FIELD_ERROR_FOR_PATCH = {key: "key", label: "label", options_text: "options", field_type: "options", extraction_description: "extraction", fill_mode: "extraction"};
+
+function DocumentTypeEditor({draft, setDraft, editing, error, setError, fieldErrors, clearFieldError, changes, onSubmit, onCancel, profileDefaults}) {
   const {t} = useLanguage();
-  const addField = () => setDraft(current => ({...current, fields: [...current.fields, {key: "", label: "", field_type: "text", required: false, fill_mode: "extract", extraction_description: "", review_policy: "evidence", batch_default_allowed: false, help_text: "", options: [], searchable: true, filterable: false, graph_entity_type: "", graph_relationship: ""}]}));
-  const copyProfileDefaults = () => setDraft(current => ({...current, fields: (profileDefaults[current.base_document_type] || []).map(field => ({...field}))}));
-  const updateField = (index, patch) => setDraft(current => ({...current, fields: current.fields.map((field, currentIndex) => currentIndex === index ? {...field, ...patch} : field)}));
-  const removeField = index => setDraft(current => ({...current, fields: current.fields.filter((_, currentIndex) => currentIndex !== index)}));
-  return <form className="template-form" onSubmit={onSubmit}>
+  const [lastRemoved, setLastRemoved] = useState(null);
+  const [focusRowId, setFocusRowId] = useState(null);
+  // After "Add field", bring the new row into view and put the cursor in its key input.
+  useEffect(() => {
+    if (!focusRowId) return;
+    const input = document.querySelector(`.template-form [data-row-id="${focusRowId}"] input`);
+    if (!input) return;
+    input.scrollIntoView({block: "center", behavior: "smooth"});
+    input.focus({preventScroll: true});
+    setFocusRowId(null);
+  }, [focusRowId, draft.fields]);
+  const fieldMessage = (scope, code) => code ? t(`documentType.fieldError.${scope}.${code}`) : undefined;
+  const addField = () => { clearFieldError(); const row = withRowId({key: "", label: "", field_type: "text", required: false, fill_mode: "extract", extraction_description: "", review_policy: "evidence", batch_default_allowed: false, help_text: "", options: [], searchable: true, filterable: false, graph_entity_type: "", graph_relationship: ""}); setDraft(current => ({...current, fields: [...current.fields, row]})); setFocusRowId(row._uid); };
+  const copyProfileDefaults = () => { clearFieldError(); setDraft(current => ({...current, fields: (profileDefaults[current.base_document_type] || []).map(field => withRowId({...field, _uid: undefined}))})); };
+  const updateField = (index, patch) => { clearFieldError(index, Object.keys(patch).map(name => FIELD_ERROR_FOR_PATCH[name]).filter(Boolean)); setDraft(current => ({...current, fields: current.fields.map((field, currentIndex) => currentIndex === index ? {...field, ...patch} : field)})); };
+  const removeField = index => {
+    clearFieldError();
+    setLastRemoved({field: draft.fields[index], index});
+    setDraft(current => ({...current, fields: current.fields.filter((_, currentIndex) => currentIndex !== index)}));
+  };
+  const undoRemove = () => {
+    if (!lastRemoved) return;
+    clearFieldError();
+    setDraft(current => { const fields = [...current.fields]; fields.splice(Math.min(lastRemoved.index, fields.length), 0, lastRemoved.field); return {...current, fields}; });
+    setLastRemoved(null);
+  };
+  const removedName = lastRemoved ? (lastRemoved.field.label || lastRemoved.field.key || t("documentType.removed.unnamed")) : "";
+  const changeParts = [changes.added && t("documentType.unsaved.added", {count: changes.added}), changes.removed && t("documentType.unsaved.removed", {count: changes.removed}), changes.modified && t("documentType.unsaved.modified", {count: changes.modified}), changes.detailsChanged && t("documentType.unsaved.details")].filter(Boolean);
+  return <form className="template-form" onSubmit={onSubmit} noValidate>
     <div className="drawer-form-heading"><div><p className="eyebrow">{editing ? t("documentType.editor.editEyebrow") : t("documentType.editor.newEyebrow")}</p><h3>{editing ? t("documentType.editor.editTitle") : t("documentType.editor.createTitle")}</h3></div><span className="section-copy">{t("documentType.editor.description")}</span></div>
-    <TextInput label={t("documentType.editor.typeName")} value={draft.name} onChange={name => setDraft(current => ({...current, name}))} placeholder={t("documentType.editor.typeNamePlaceholder")} isRequired/>
+    <TextInput label={t("documentType.editor.typeName")} value={draft.name} onChange={name => { clearFieldError("name"); setDraft(current => ({...current, name})); }} placeholder={t("documentType.editor.typeNamePlaceholder")} error={fieldMessage("name", fieldErrors.name)} isRequired/>
     <TextInput label={t("documentType.editor.shortDescription")} value={draft.description} onChange={description => setDraft(current => ({...current, description}))} placeholder={t("documentType.editor.shortDescriptionPlaceholder")} isOptional optionalLabel={t("common.optional")}/>
     <Selector label={t("documentType.editor.processingProfile")} value={draft.base_document_type} onChange={base_document_type => setDraft(current => ({...current, base_document_type, fields: current.fields.length ? current.fields : (profileDefaults[base_document_type] || []).map(field => ({...field}))}))} options={DOCUMENT_TYPE_OPTIONS.map(option => ({value: option.value, label: t(option.labelKey)}))}/>
-    <div className="template-field-builder"><div><b>{t("documentType.editor.metadataFields")}</b><span className="template-field-actions"><Button label={t("documentType.editor.useProfileDefaults")} type="button" size="sm" variant="ghost" onClick={copyProfileDefaults} isDisabled={!profileDefaults[draft.base_document_type]?.length}/><Button label={t("documentType.editor.addField")} type="button" size="sm" variant="ghost" onClick={addField}/></span></div>{draft.fields.map((field, index) => <div className="template-field-row" key={`metadata-field-${index}`}>
-      <div className="template-field-control"><TextInput label={t("documentType.editor.fieldKey")} value={field.key} onChange={key => updateField(index, {key})} placeholder="issuer" isRequired/></div>
-      <div className="template-field-control"><TextInput label={t("documentType.editor.label")} value={field.label} onChange={label => updateField(index, {label})} placeholder={t("documentType.editor.labelPlaceholder")} isRequired/></div>
+    <div className="template-field-builder"><div><b>{t("documentType.editor.metadataFields")} <span className="template-field-count">({t(draft.fields.length === 1 ? "documentType.drawer.fieldCountOne" : "documentType.drawer.fieldCountOther", {count: draft.fields.length})})</span></b><span className="template-field-actions"><Button label={t("documentType.editor.useProfileDefaults")} type="button" size="sm" variant="ghost" onClick={copyProfileDefaults} isDisabled={!profileDefaults[draft.base_document_type]?.length}/><Button label={t("documentType.editor.addField")} type="button" size="sm" variant="ghost" onClick={addField}/></span></div>{draft.fields.map((field, index) => { const fe = fieldErrors.fields[index] || {}; return <div className="template-field-row" key={field._uid || `metadata-field-${index}`} data-row-id={field._uid}>
+      <div className="template-field-control"><TextInput label={t("documentType.editor.fieldKey")} value={field.key} onChange={key => updateField(index, {key})} placeholder="issuer" error={fieldMessage("key", fe.key)} isRequired/></div>
+      <div className="template-field-control"><TextInput label={t("documentType.editor.label")} value={field.label} onChange={label => updateField(index, {label})} placeholder={t("documentType.editor.labelPlaceholder")} error={fieldMessage("label", fe.label)} isRequired/></div>
       <div className="template-field-control"><Selector label={t("documentType.editor.fieldType")} value={field.field_type} onChange={field_type => updateField(index, {field_type})} description={field.field_type === "multi_select" ? t("documentType.editor.fieldType.multiSelectHelp") : undefined} options={["text", "textarea", "date", "number", "select", "multi_select", "boolean"].map(value => ({value, label: value === "multi_select" ? t("documentType.editor.fieldType.multiSelect") : value}))}/></div>
       <div className="template-field-control"><Selector label={t("autoMetadata.fillMode")} value={field.fill_mode || "manual"} onChange={fill_mode => updateField(index, {fill_mode})} options={[{value: "extract", label: t("autoMetadata.extractMode")}, {value: "manual", label: t("autoMetadata.manualMode")}]}/></div>
-      {field.fill_mode === "extract" && <div className="template-field-control template-field-extraction"><TextArea label={t("autoMetadata.extractionInstruction")} value={field.extraction_description || ""} onChange={extraction_description => updateField(index, {extraction_description})} placeholder={t("autoMetadata.extractionInstructionPlaceholder")} description={t("autoMetadata.extractionInstructionDescription")} isRequired/><DesignSystemCheckbox label={t("autoMetadata.alwaysReview")} checked={field.review_policy === "always"} onChange={checked => updateField(index, {review_policy: checked ? "always" : "evidence"})}/></div>}
+      {field.fill_mode === "extract" && <div className="template-field-control template-field-extraction"><TextArea label={t("autoMetadata.extractionInstruction")} value={field.extraction_description || ""} onChange={extraction_description => updateField(index, {extraction_description})} placeholder={t("autoMetadata.extractionInstructionPlaceholder")} description={t("autoMetadata.extractionInstructionDescription")} error={fieldMessage("extraction", fe.extraction)} isRequired/><DesignSystemCheckbox label={t("autoMetadata.alwaysReview")} checked={field.review_policy === "always"} onChange={checked => updateField(index, {review_policy: checked ? "always" : "evidence"})}/></div>}
       {field.fill_mode !== "extract" && <DesignSystemCheckbox label={t("autoMetadata.batchAllowed")} checked={Boolean(field.batch_default_allowed)} onChange={batch_default_allowed => updateField(index, {batch_default_allowed})}/>}
       <div className="template-field-control template-field-required"><DesignSystemCheckbox label={t(field.fill_mode === "extract" ? "autoMetadata.requiredReview" : "documentType.editor.required")} checked={field.required} onChange={required => updateField(index, {required})}/></div>
       <div className="template-field-control template-field-help"><TextInput label={t("documentType.editor.helpText")} value={field.help_text || ""} onChange={help_text => updateField(index, {help_text})} placeholder={t("documentType.editor.helpTextPlaceholder")} isOptional optionalLabel={t("common.optional")}/></div>
-      {["select", "multi_select"].includes(field.field_type) && <div className="template-field-control template-field-options"><TextInput label={t("documentType.editor.options")} value={field.options_text ?? (field.options || []).join(", ")} onChange={options_text => updateField(index, {options_text})} placeholder={t("documentType.editor.optionsPlaceholder")}/></div>}
+      {["select", "multi_select"].includes(field.field_type) && <div className="template-field-control template-field-options"><TextInput label={t("documentType.editor.options")} value={field.options_text ?? (field.options || []).join(", ")} onChange={options_text => updateField(index, {options_text})} placeholder={t("documentType.editor.optionsPlaceholder")} description={t("documentType.editor.optionsHelp")} error={fieldMessage("options", fe.options)} isRequired/></div>}
       <details className="template-field-advanced"><summary>{t("documentType.editor.capabilitiesSummary")}</summary><div className="template-field-capabilities"><DesignSystemCheckbox label={t("documentType.editor.searchCapability")} checked={field.searchable !== false} onChange={searchable => updateField(index, {searchable})}/><DesignSystemCheckbox label={t("documentType.editor.filterCapability")} checked={Boolean(field.filterable)} onChange={filterable => updateField(index, {filterable})}/><DesignSystemCheckbox label={t("documentType.editor.graphCapability")} checked={Boolean(field.graph_relationship)} onChange={enabled => updateField(index, enabled ? {graph_entity_type: field.graph_entity_type || "Entity", graph_relationship: field.graph_relationship || "RELATED_TO"} : {graph_entity_type: "", graph_relationship: ""})}/></div>{field.graph_relationship && <div className="template-field-control template-field-graph"><TextInput label={t("documentType.editor.graphEntityType")} value={field.graph_entity_type || ""} onChange={graph_entity_type => updateField(index, {graph_entity_type})} placeholder={t("documentType.editor.graphEntityTypePlaceholder")}/><TextInput label={t("documentType.editor.relationship")} value={field.graph_relationship || ""} onChange={graph_relationship => updateField(index, {graph_relationship: graph_relationship.toUpperCase().replace(/[^A-Z0-9_]/g, "")})} placeholder="ISSUED_BY"/></div>}</details>
       <div className="template-field-action"><Button label={t("documentType.editor.remove")} type="button" size="sm" variant="destructive" onClick={() => removeField(index)}/></div>
-    </div>)}</div>
-    {error && <p className="inline-error" role="alert">{error}</p>}
-    <div className="preview-actions"><Button label={editing ? t("documentType.editor.save") : t("documentType.editor.createTitle")} type="submit" variant="primary"/><Button label={t("common.cancel")} type="button" variant="ghost" onClick={onCancel}/></div>
+    </div>; })}</div>
+    <div className="template-form-footer">
+      {error && <p className="inline-error" role="alert">{error}</p>}
+      {lastRemoved && <div className="template-field-notice" role="status"><span>{t("documentType.removed.notice", {name: removedName})}</span><Button label={t("documentType.removed.undo")} type="button" size="sm" variant="secondary" onClick={undoRemove}/></div>}
+      {changes.total > 0 && <p className="template-unsaved" role="status"><b>{t("documentType.unsaved.title")}</b> {changeParts.join(" · ")} — {t("documentType.unsaved.hint")}</p>}
+      <div className="preview-actions"><Button label={editing ? t("documentType.editor.save") : t("documentType.editor.createTitle")} type="submit" variant="primary"/><Button label={t("common.cancel")} type="button" variant="ghost" onClick={onCancel}/></div>
+    </div>
   </form>;
 }
 
@@ -1527,6 +1560,10 @@ function DocumentTypeDrawer({open, templates, onClose, onCreate, onUpdate, onDea
   const [editing, setEditing] = useState(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
+  const noFieldErrors = () => ({name: null, fields: {}});
+  const [fieldErrors, setFieldErrors] = useState(noFieldErrors);
+  const [baseline, setBaseline] = useState(emptyDraft);
+  const requestCloseRef = useRef(onClose);
   const [renamingTemplate, setRenamingTemplate] = useState(null);
   const headingRef = useRef(null);
   const drawerRef = useRef(null);
@@ -1535,7 +1572,7 @@ function DocumentTypeDrawer({open, templates, onClose, onCreate, onUpdate, onDea
     headingRef.current?.focus();
     const handleKeyDown = event => {
       if (event.key === "Escape") {
-        onClose();
+        requestCloseRef.current();
         return;
       }
       if (event.key !== "Tab") return;
@@ -1556,7 +1593,7 @@ function DocumentTypeDrawer({open, templates, onClose, onCreate, onUpdate, onDea
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => { document.removeEventListener("keydown", handleKeyDown); document.body.style.overflow = previousOverflow; };
-  }, [open, onClose]);
+  }, [open]);
   if (!open) return null;
   const normalizedSearch = search.trim().toLocaleLowerCase();
   const filtered = templates.filter(template => {
@@ -1567,19 +1604,42 @@ function DocumentTypeDrawer({open, templates, onClose, onCreate, onUpdate, onDea
   const systemTemplates = filtered.filter(template => template.is_system);
   const customTemplates = filtered.filter(template => !template.is_system);
   const profileDefaults = Object.fromEntries(templates.filter(template => template.is_system).map(template => [template.base_document_type, template.fields || []]));
-  const resetEditor = () => { setEditing(null); setCreating(false); setDraft(emptyDraft()); setError(""); };
-  const startCreate = () => { setEditing(null); setCreating(true); setDraft(emptyDraft()); setError(""); };
-  const startEdit = template => { setEditing(template); setCreating(false); setDraft({name: template.name, description: template.description || "", base_document_type: template.base_document_type, fields: template.fields || []}); setError(""); };
+  const changes = (creating || editing) ? summarizeDraftChanges(baseline, draft) : {added: 0, removed: 0, modified: 0, detailsChanged: false, total: 0};
+  const confirmDiscard = () => changes.total === 0 || window.confirm(t("documentType.unsaved.confirmDiscard"));
+  const requestClose = () => { if (confirmDiscard()) onClose(); };
+  requestCloseRef.current = requestClose;
+  const resetEditor = () => { setEditing(null); setCreating(false); setDraft(emptyDraft()); setBaseline(emptyDraft()); setError(""); setFieldErrors(noFieldErrors()); };
+  const cancelEditing = () => { if (confirmDiscard()) resetEditor(); };
+  const startCreate = () => { if (!confirmDiscard()) return; setEditing(null); setCreating(true); setDraft(emptyDraft()); setBaseline(emptyDraft()); setError(""); setFieldErrors(noFieldErrors()); };
+  const startEdit = template => { if (!confirmDiscard()) return; const loaded = {name: template.name, description: template.description || "", base_document_type: template.base_document_type, fields: (template.fields || []).map(field => withRowId({...field, _uid: undefined}))}; setEditing(template); setCreating(false); setDraft(loaded); setBaseline(loaded); setError(""); setFieldErrors(noFieldErrors()); };
+  // Drop the error for the input being edited (or all of them when the field list changes).
+  const clearFieldError = (target, props) => {
+    const next = {name: fieldErrors.name, fields: {...fieldErrors.fields}};
+    if (target === undefined) { next.name = null; next.fields = {}; }
+    else if (target === "name") next.name = null;
+    else if (next.fields[target]) {
+      const remaining = {...next.fields[target]};
+      (props || []).forEach(prop => delete remaining[prop]);
+      if (Object.keys(remaining).length) next.fields[target] = remaining; else delete next.fields[target];
+    }
+    setFieldErrors(next);
+    if (!next.name && !Object.keys(next.fields).length) setError("");
+  };
   const submit = async event => {
     event.preventDefault();
-    if (!draft.name.trim()) { setError(t("documentType.drawer.error.nameRequired")); return; }
-    if (draft.fields.some(field => !/^[a-z][a-z0-9_]*$/.test(field.key) || !field.label.trim())) { setError(t("documentType.drawer.error.fieldInvalid")); return; }
-    if (new Set(draft.fields.map(field => field.key)).size !== draft.fields.length) { setError(t("documentType.drawer.error.duplicateKey")); return; }
-    const fields = draft.fields.map(({options_text, ...field}) => ({
-      ...field,
-      options: options_text === undefined ? field.options || [] : options_text.split(",").map(item => item.trim()).filter(Boolean),
-    }));
-    if (fields.some(field => ["select", "multi_select"].includes(field.field_type) && !field.options.length)) { setError(t("documentType.drawer.error.optionsRequired")); return; }
+    const {errors, count} = validateDocumentTypeDraft(draft);
+    if (count) {
+      setFieldErrors(errors);
+      setError(t("documentType.fieldError.summary", {count}));
+      window.requestAnimationFrame(() => {
+        const invalid = document.querySelector(".template-form .snx-field-invalid input, .template-form .snx-field-invalid textarea");
+        invalid?.scrollIntoView({block: "center", behavior: "smooth"});
+        invalid?.focus({preventScroll: true});
+      });
+      return;
+    }
+    setFieldErrors(noFieldErrors());
+    const fields = draft.fields.map(({options_text, _uid, ...field}) => ({...field, options: parseOptions({...field, options_text})}));
     try { if (editing) await onUpdate(editing.id, {...draft, fields}); else await onCreate({...draft, fields}); resetEditor(); }
     catch (requestError) { setError(requestError.message || t("documentType.drawer.error.saveFailed")); }
   };
@@ -1600,11 +1660,11 @@ function DocumentTypeDrawer({open, templates, onClose, onCreate, onUpdate, onDea
       <Button label={t("common.delete")} size="sm" variant="destructive" onClick={() => confirmPurge(template)}/>
     </div>}
   </article>;
-  return <div className="document-type-drawer-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><aside ref={drawerRef} className="document-type-drawer" role="dialog" aria-modal="true" aria-labelledby="document-type-drawer-title" onMouseDown={event => event.stopPropagation()}>
-    <header className="document-type-drawer-header"><div><p className="eyebrow">{t("documentType.drawer.eyebrow")}</p><h2 id="document-type-drawer-title" tabIndex={-1} ref={headingRef}>{t("documentType.drawer.title")}</h2><p>{t("documentType.drawer.countInKb", {count: templates.length})}</p></div><button type="button" className="drawer-close" onClick={onClose} aria-label={t("documentType.drawer.close")}>×</button></header>
+  return <div className="document-type-drawer-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) requestClose(); }}><aside ref={drawerRef} className="document-type-drawer" role="dialog" aria-modal="true" aria-labelledby="document-type-drawer-title" onMouseDown={event => event.stopPropagation()}>
+    <header className="document-type-drawer-header"><div><p className="eyebrow">{t("documentType.drawer.eyebrow")}</p><h2 id="document-type-drawer-title" tabIndex={-1} ref={headingRef}>{t("documentType.drawer.title")}</h2><p>{t("documentType.drawer.countInKb", {count: templates.length})}</p></div><button type="button" className="drawer-close" onClick={requestClose} aria-label={t("documentType.drawer.close")}>×</button></header>
     <div className="document-type-controls"><TextInput label={t("documentType.drawer.findType")} value={search} onChange={setSearch} placeholder={t("documentType.drawer.findTypePlaceholder")}/><Selector label={t("common.status")} value={statusFilter} onChange={setStatusFilter} options={[{value: "all", label: t("common.allStatuses")}, {value: "active", label: t("common.active")}, {value: "inactive", label: t("common.inactive")}]}/></div>
-    <div className="document-type-drawer-actions"><Button label={creating || editing ? t("documentType.drawer.cancelEditing") : t("documentType.drawer.createType")} size="sm" variant="primary" onClick={() => (creating || editing) ? resetEditor() : startCreate()}/></div>
-    {(creating || editing) && <DocumentTypeEditor draft={draft} setDraft={setDraft} editing={editing} error={error} setError={setError} onSubmit={submit} onCancel={resetEditor} profileDefaults={profileDefaults}/>}
+    <div className="document-type-drawer-actions"><Button label={creating || editing ? t("documentType.drawer.cancelEditing") : t("documentType.drawer.createType")} size="sm" variant="primary" onClick={() => (creating || editing) ? cancelEditing() : startCreate()}/></div>
+    {(creating || editing) && <DocumentTypeEditor draft={draft} setDraft={setDraft} editing={editing} error={error} setError={setError} fieldErrors={fieldErrors} clearFieldError={clearFieldError} changes={changes} onSubmit={submit} onCancel={cancelEditing} profileDefaults={profileDefaults}/>}
     <section className="document-type-section"><div className="document-type-section-heading"><h3>{t("documentType.drawer.builtInTypes")}</h3><span>{systemTemplates.length}</span></div>{systemTemplates.length ? systemTemplates.map(renderRow) : <p className="document-type-empty">{t("documentType.drawer.noBuiltInMatch")}</p>}</section>
     <section className="document-type-section"><div className="document-type-section-heading"><h3>{t("documentType.drawer.customTypes")}</h3><span>{customTemplates.length}</span></div>{customTemplates.length ? customTemplates.map(renderRow) : <p className="document-type-empty">{t("documentType.drawer.noCustomTypes")}</p>}</section>
     {renamingTemplate && <RenameTemplateDialog template={renamingTemplate} onClose={() => setRenamingTemplate(null)} onSave={async (name, description) => { const updated = await onRename(renamingTemplate, name, description); if (updated) setRenamingTemplate(null); }} onPurge={confirmPurge}/>}
@@ -2992,7 +3052,7 @@ function DocumentPreview({onRefreshMetadata, preview, jobs, isPollingJobs, polli
   return <div className="document-preview-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <div ref={modalRef} className="document-preview-modal" role="dialog" aria-modal="true" aria-labelledby="document-preview-title" onMouseDown={event => event.stopPropagation()}>
       <div className="preview-heading"><div><p className="eyebrow">{t("documentPreview.eyebrow")}</p><h2 id="document-preview-title" tabIndex={-1} ref={headingRef}>{preview.title}</h2></div><div className="preview-actions"><StatusBadge status={preview.status}/>{onDownloadOriginal && <Button label={t("documents.action.downloadOriginal")} size="sm" variant="ghost" onClick={() => onDownloadOriginal({id: preview.document_id, original_filename: preview.original_filename, title: preview.title})}/>}{referenceFile?.available && <Button label={t("documentPreview.referenceFile")} title={referenceFile.filename} size="sm" variant="secondary" onClick={() => window.open(`${referenceFile.download_url}&disposition=${referenceFile.mime_type === "application/pdf" ? "inline" : "attachment"}`, "_blank", "noopener,noreferrer")}/>} {isExtracting && <span className="live-status" role="status" aria-live="polite">{t("documentPreview.extractingMetadata")}</span>}{preview.status === "completed" && ["legal", "regulation", "contract"].includes(preview.document_type) && <Button label={isExtracting ? t("documentPreview.extractingMetadata") : t("documentPreview.extractLegalMetadata")} size="sm" variant="secondary" isLoading={isExtracting} isDisabled={isExtracting} onClick={() => onExtractLegal({id: preview.document_id, title: preview.title})}/>}<button type="button" className="drawer-close" onClick={onClose} aria-label={t("documentPreview.closeAriaLabel")}>×</button></div></div>
-      {preview.error_code && <p className="inline-error">{preview.error_code}</p>}
+      {preview.error_code && <div className="inline-error" role="alert">{DOCUMENT_ERROR_CODES.includes(preview.error_code) ? <><b>{t(`documentError.${preview.error_code}.title`)}</b><p>{t(`documentError.${preview.error_code}.hint`)}</p></> : <b>{preview.error_code}</b>}{preview.error_message && <p className="document-error-detail">{preview.error_message}</p>}<small className="document-error-code">{preview.error_code}</small></div>}
       <nav className="document-preview-tabs" role="tablist" aria-label={t("documentPreview.sectionsAriaLabel")}>{tabs.map(([value, label]) => <button type="button" role="tab" aria-selected={tab === value} className={tab === value ? "selected" : ""} key={value} onClick={() => setTab(value)}>{label}</button>)}</nav>
       <div className={`document-preview-tab-panel${tab === "content" ? " is-file-preview" : ""}`}>
         {tab === "content" && <FilePreviewPanel preview={preview} legalInstrument={legalInstrument} onDownloadOriginal={onDownloadOriginal}/>}

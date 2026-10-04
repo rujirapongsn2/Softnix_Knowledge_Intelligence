@@ -307,6 +307,7 @@ export const translations = {
     "documentType.drawer.usageCountOther": "{count} documents",
     "documentType.drawer.error.nameRequired": "Enter a document type name.",
     "documentType.drawer.error.fieldInvalid": "Each field needs a lowercase key and a label.",
+    "documentType.drawer.error.optionsRequired": "Select and multi-select fields need at least one option (comma-separated).",
     "documentType.drawer.error.duplicateKey": "Field keys must be unique.",
     "documentType.drawer.error.saveFailed": "Unable to save this document type.",
 
@@ -1397,6 +1398,7 @@ export const translations = {
     "documentType.drawer.usageCountOther": "{count} เอกสาร",
     "documentType.drawer.error.nameRequired": "กรุณากรอกชื่อประเภทเอกสาร",
     "documentType.drawer.error.fieldInvalid": "ทุกฟิลด์ต้องมีคีย์เป็นตัวพิมพ์เล็กและมีป้ายชื่อ",
+    "documentType.drawer.error.optionsRequired": "ฟิลด์แบบตัวเลือกเดียวและหลายตัวเลือกต้องมีอย่างน้อย 1 ตัวเลือก (คั่นด้วยเครื่องหมายจุลภาค)",
     "documentType.drawer.error.duplicateKey": "คีย์ฟิลด์ต้องไม่ซ้ำกัน",
     "documentType.drawer.error.saveFailed": "ไม่สามารถบันทึกประเภทเอกสารนี้ได้",
 

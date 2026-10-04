@@ -4,10 +4,9 @@ import json
 from datetime import datetime, timedelta
 
 from .document_templates import metadata_search_text, validate_metadata_values
-from .models import Document, ProcessingJob
+from .models import Document, JobType, ProcessingJob
 from .openrouter import OpenRouterClient
 
-JOB_TYPE = "EXTRACT_DOCUMENT_METADATA"
 EXTRACTOR_VERSION = "1"
 WINDOW = 12000
 MAX_WINDOWS = 4
@@ -49,13 +48,13 @@ def queue_metadata_extraction(db, document):
     if not extraction_fields(document):
         return False
     active = db.query(ProcessingJob.id).filter(
-        ProcessingJob.document_id == document.id, ProcessingJob.job_type == JOB_TYPE,
+        ProcessingJob.document_id == document.id, ProcessingJob.job_type == JobType.EXTRACT_DOCUMENT_METADATA,
         ProcessingJob.status.in_(["queued", "running"]),
     ).first()
     if active:
         return False
     document.metadata_status = "queued"
-    db.add(ProcessingJob(document_id=document.id, knowledge_base_id=document.knowledge_base_id, job_type=JOB_TYPE))
+    db.add(ProcessingJob(document_id=document.id, knowledge_base_id=document.knowledge_base_id, job_type=JobType.EXTRACT_DOCUMENT_METADATA))
     db.flush()
     return True
 
@@ -134,7 +133,7 @@ def process_metadata_job(db, job):
         return
     db.refresh(job)
     document = db.query(Document).filter_by(id=job.document_id).with_for_update().one()
-    if document.deleted_at:
+    if not document.is_live:
         job.status = "cancelled"
         db.commit()
         return
@@ -151,7 +150,7 @@ def process_metadata_job(db, job):
             raise RuntimeError("METADATA_TEXT_NOT_READY")
         observations = extract_candidates(fields, text, OpenRouterClient()) if fields else {}
         document = db.query(Document).filter_by(id=job.document_id).populate_existing().with_for_update().one()
-        if document.deleted_at:
+        if not document.is_live:
             job.status = "cancelled"
             db.commit()
             return
@@ -179,7 +178,7 @@ def process_metadata_job(db, job):
     except Exception as exc:
         db.rollback()
         document = db.query(Document).filter_by(id=job.document_id).populate_existing().with_for_update().one()
-        if document.deleted_at:
+        if not document.is_live:
             job.status = "cancelled"
         else:
             retry = str(exc) == "OPENROUTER_UNAVAILABLE" and job.attempt_count < 3

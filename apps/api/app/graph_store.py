@@ -76,6 +76,12 @@ class Neo4jGraphStore:
              "is_legal": getattr(entity, "is_legal", False)},
         )
 
+    def delete_entity(self, entity_id: str) -> None:
+        self._execute("MATCH (node:KnowledgeEntity {id: $id}) DETACH DELETE node", {"id": entity_id})
+
+    def delete_relationship(self, relationship_id: str) -> None:
+        self._execute("MATCH ()-[edge:KNOWLEDGE_RELATIONSHIP {id: $id}]->() DELETE edge", {"id": relationship_id})
+
     def check(self) -> bool:
         if not self.enabled:
             return False

@@ -199,9 +199,7 @@
 }
 .document-overflow-trigger:focus-visible { outline: 3px solid #2786C235; }
 .document-overflow-menu {
-  position: absolute;
-  right: 0;
-  top: calc(100% + .25rem);
+  position: fixed;
   z-index: 20;
   min-width: 11rem;
   display: grid;

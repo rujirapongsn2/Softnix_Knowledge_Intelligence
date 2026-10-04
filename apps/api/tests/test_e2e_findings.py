@@ -23,7 +23,8 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 
 import app.services as services  # noqa: E402
-from app.retrieval import LightRAGRetrievalEngine  # noqa: E402
+from app.retrieval import LightRAGRetrievalEngine, classify_track_failure  # noqa: E402
+from app.retry_policy import DEFAULT_RETRY, PROCESSING_RETRY_POLICIES  # noqa: E402
 
 ADMIN = {"username": "admin", "password": "correct-horse-battery-staple"}
 
@@ -94,16 +95,16 @@ def test_track_status_returns_error_detail():
 
 
 def test_classify_track_failure_maps_budget_markers():
-    assert services.classify_track_failure("402 in_flight_budget_exhausted") == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
-    assert services.classify_track_failure("Provider returned 402") == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
-    assert services.classify_track_failure("some parse error") == "RETRIEVAL_ENGINE_REJECTED"
-    assert services.classify_track_failure(None) == "RETRIEVAL_ENGINE_REJECTED"
+    assert classify_track_failure("402 in_flight_budget_exhausted") == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
+    assert classify_track_failure("Provider returned 402") == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
+    assert classify_track_failure("some parse error") == "RETRIEVAL_ENGINE_REJECTED"
+    assert classify_track_failure(None) == "RETRIEVAL_ENGINE_REJECTED"
 
 
 def test_budget_error_is_transient_with_longer_backoff():
-    assert "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED" in services.TRANSIENT_PROCESSING_ERRORS
-    assert services.MAX_BUDGET_PROCESSING_ATTEMPTS > services.MAX_PROCESSING_ATTEMPTS
-    assert services.BUDGET_RETRY_DELAY_FLOOR_SECONDS >= services.processing_retry_delay(services.MAX_PROCESSING_ATTEMPTS)
+    policy = PROCESSING_RETRY_POLICIES["RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"]
+    assert policy.max_attempts > DEFAULT_RETRY.max_attempts
+    assert policy.delay(1) >= DEFAULT_RETRY.delay(DEFAULT_RETRY.max_attempts)
 
 
 def test_indexing_semaphore_limits_concurrency():

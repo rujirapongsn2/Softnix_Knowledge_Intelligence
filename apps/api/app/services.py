@@ -28,13 +28,16 @@ from .legal_resolver import resolve_legal_context
 from .legal_corpus import parse_legal_corpus_metadata
 from .document_templates import metadata_search_text, normalize_field_definitions
 from .metadata_search import apply_typed_predicates, decorate_sources, metadata_coverage, predicate_coverage
-from .metadata_extraction import JOB_TYPE as METADATA_JOB_TYPE, process_metadata_job, queue_metadata_extraction
-from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
+from .metadata_extraction import process_metadata_job, queue_metadata_extraction
+from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, JobType, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .data_quality import build_document_quality_reports
 from .openrouter import OpenRouterClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
-from .retrieval import LightRAGRetrievalEngine, RetrievalEvidence
+from .graph_retirement import drop_document_evidence
+from .remote_index import HealOutcome, purge_remote_record, resolve_remote_duplicate
+from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, RetrievalEvidence, classify_track_failure, describe_engine_failure
+from .retry_policy import PROCESSING_RETRY_POLICIES, PURGE_RETRYABLE_CODES, PURGE_RETRY, schedule_retry
 
 SUPPORTED_EXTENSIONS = {".pdf", ".doc", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".html", ".htm", ".csv", ".json"}
 REFERENCE_FILE_EXTENSIONS = {".pdf", ".doc", ".docx", ".xlsx", ".xls", ".txt"}
@@ -65,30 +68,13 @@ DEFAULT_RETRIEVAL_CONFIG = {
     "planner_llm_fallback": True, "default_top_k": 12, "maximum_top_k": 30,
     "maximum_graph_depth": 3, "citation_required": True,
 }
-TRANSIENT_PROCESSING_ERRORS = {
-    "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY",
-    "RETRIEVAL_ENGINE_TIMEOUT", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "OPENROUTER_UNAVAILABLE", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_TIMEOUT", "OCR_CHAIN_FAILED",
-}
-MAX_PROCESSING_ATTEMPTS = 3
-# Budget exhaustion outlives the normal retry window (the shared provider
-# account frees in-flight quota on the scale of minutes), so those tracks
-# earn extra attempts instead of failing the document permanently (F1).
-MAX_BUDGET_PROCESSING_ATTEMPTS = 6
 # Cap on how many documents one worker may push into the remote indexing
 # pipeline at the same time.  LightRAG fans every insert out into upstream LLM
 # calls; 13 parallel ingests exhausted the shared OpenRouter in-flight budget
 # (402) and failed the whole batch (F1).
 INDEXING_CONCURRENCY_LIMIT = 2
-# A budget-exhausted track is retried on the same exponential schedule as the
-# other transient errors, but with a longer floor: the account's in-flight
-# quota frees up on the scale of minutes, not seconds.
-BUDGET_RETRY_DELAY_FLOOR_SECONDS = 60
 _indexing_semaphore = BoundedSemaphore(INDEXING_CONCURRENCY_LIMIT)
 logger = logging.getLogger(__name__)
-
-
-def processing_retry_delay(attempt_count: int) -> int:
-    return min(60, 2 ** max(1, attempt_count))
 
 
 def canonical_entity_name(value: str) -> str:
@@ -151,26 +137,7 @@ def create_relationship(db: Session, knowledge_base_id: str, payload) -> Relatio
 
 def _remove_metadata_graph_projection(db: Session, document: Document) -> None:
     """Remove only graph facts generated from the document's metadata fields."""
-    relationship_ids = [row[0] for row in db.query(Relationship.id).join(RelationshipSource).filter(
-        RelationshipSource.document_id == document.id, Relationship.origin == "metadata"
-    ).all()]
-    for relationship_id in relationship_ids:
-        db.query(RelationshipSource).filter_by(relationship_id=relationship_id, document_id=document.id).delete(synchronize_session=False)
-        relationship = db.get(Relationship, relationship_id)
-        if relationship:
-            relationship.source_count = db.query(func.count(RelationshipSource.id)).filter_by(relationship_id=relationship_id).scalar() or 0
-            if relationship.source_count == 0:
-                relationship.deleted_at = datetime.utcnow()
-    entity_ids = [row[0] for row in db.query(Entity.id).join(EntitySource).filter(
-        EntitySource.document_id == document.id, Entity.origin == "metadata"
-    ).all()]
-    for entity_id in entity_ids:
-        db.query(EntitySource).filter_by(entity_id=entity_id, document_id=document.id).delete(synchronize_session=False)
-        entity = db.get(Entity, entity_id)
-        if entity:
-            entity.source_count = db.query(func.count(EntitySource.id)).filter_by(entity_id=entity_id).scalar() or 0
-            if entity.source_count == 0:
-                entity.deleted_at = datetime.utcnow()
+    drop_document_evidence(db, document.id, origin="metadata")
     db.flush()
 
 
@@ -457,26 +424,7 @@ def _legal_fingerprint(value: str) -> str:
 
 def _remove_document_legal_projection(db: Session, document: Document) -> None:
     """Remove only generated evidence from one document; never touch manual rows."""
-    relationship_ids = [row[0] for row in db.query(Relationship.id).join(RelationshipSource).filter(
-        RelationshipSource.document_id == document.id, Relationship.origin == "legal_schema"
-    ).all()]
-    for relationship_id in relationship_ids:
-        db.query(RelationshipSource).filter_by(relationship_id=relationship_id, document_id=document.id).delete(synchronize_session=False)
-        relationship = db.get(Relationship, relationship_id)
-        if relationship:
-            relationship.source_count = db.query(func.count(RelationshipSource.id)).filter_by(relationship_id=relationship_id).scalar() or 0
-            if relationship.source_count == 0:
-                relationship.deleted_at = datetime.utcnow()
-    entity_ids = [row[0] for row in db.query(Entity.id).join(EntitySource).filter(
-        EntitySource.document_id == document.id, Entity.origin == "legal_schema"
-    ).all()]
-    for entity_id in entity_ids:
-        db.query(EntitySource).filter_by(entity_id=entity_id, document_id=document.id).delete(synchronize_session=False)
-        entity = db.get(Entity, entity_id)
-        if entity:
-            entity.source_count = db.query(func.count(EntitySource.id)).filter_by(entity_id=entity_id).scalar() or 0
-            if entity.source_count == 0:
-                entity.deleted_at = datetime.utcnow()
+    drop_document_evidence(db, document.id, origin="legal_schema")
     db.flush()
 
 
@@ -779,7 +727,7 @@ def _target_instrument(db: Session, document: Document, reference: dict) -> Docu
     number = _legal_value(reference, "target_number", "official_number", "instrument_number")
     candidates = db.query(Document).filter(
         Document.knowledge_base_id == document.knowledge_base_id, Document.id != document.id,
-        Document.document_type.in_(LEGAL_DOCUMENT_TYPES), Document.status == "completed", Document.deleted_at.is_(None),
+        Document.document_type.in_(LEGAL_DOCUMENT_TYPES), Document.status == "completed", Document.live(),
     ).all()
     matches = []
     source_meta = legal_metadata_v2(document).get("instrument") or {}
@@ -811,7 +759,7 @@ def build_legal_cross_document_suggestions(db: Session, knowledge_base_id: str, 
     count = 0
     documents = db.query(Document).filter(
         Document.knowledge_base_id == knowledge_base_id, Document.document_type.in_(LEGAL_DOCUMENT_TYPES),
-        Document.status == "completed", Document.deleted_at.is_(None),
+        Document.status == "completed", Document.live(),
     ).all()
     for document in documents:
         source = legal_instrument_entity(db, document)
@@ -854,7 +802,7 @@ def build_legal_cross_document_suggestions(db: Session, knowledge_base_id: str, 
 def rebuild_legal_graph(db: Session, knowledge_base_id: str) -> dict[str, int]:
     documents = db.query(Document).filter(
         Document.knowledge_base_id == knowledge_base_id, Document.document_type.in_(LEGAL_DOCUMENT_TYPES),
-        Document.status == "completed", Document.deleted_at.is_(None),
+        Document.status == "completed", Document.live(),
     ).all()
     totals = {"documents": len(documents), "entities": 0, "relationships": 0, "suggestions": 0}
     _clear_legal_suggestions(db, knowledge_base_id)
@@ -898,7 +846,7 @@ def relationship_sources(db: Session, relationships: list[Relationship], plan: R
     if not ids:
         return []
     rows = db.query(RelationshipSource, Document).join(Document, Document.id == RelationshipSource.document_id).filter(
-        RelationshipSource.relationship_id.in_(ids), Document.status == "completed", Document.deleted_at.is_(None)
+        RelationshipSource.relationship_id.in_(ids), Document.status == "completed", Document.live()
     )
     if plan and plan.published_from:
         rows = rows.filter(Document.published_at >= plan.published_from)
@@ -924,7 +872,7 @@ def _filter_relationships_by_plan(db: Session, relationships: list[Relationship]
         Document, Document.id == RelationshipSource.document_id,
     ).filter(
         RelationshipSource.relationship_id.in_([relationship.id for relationship in relationships]),
-        Document.status == "completed", Document.deleted_at.is_(None),
+        Document.status == "completed", Document.live(),
     )
     query = _apply_published_filter(query, plan)
     query = _apply_metadata_filter(query, plan)
@@ -1281,7 +1229,7 @@ def enrich_sources_with_file_links(db: Session, sources: list[dict], *, base_url
         documents = {
             document.id: document
             for document in db.query(Document).filter(
-                Document.id.in_(doc_ids), Document.deleted_at.is_(None),
+                Document.id.in_(doc_ids), Document.live(),
             ).all()
         }
     quality_by_document = build_document_quality_reports(
@@ -1395,7 +1343,7 @@ def _persist_query_result(db: Session, result: dict, token_id: str | None = None
 def build_legal_metadata_result(db: Session, query: str, kb_ids: list[str], token_id: str | None = None) -> dict:
     """Resolve publisher/version metadata directly from the legal registry."""
     rows = db.query(Document, LegalInstrument).join(LegalInstrument, LegalInstrument.document_id == Document.id).filter(
-        Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None), Document.status == "completed"
+        Document.knowledge_base_id.in_(kb_ids), Document.live(), Document.status == "completed"
     )
     requested = _requested_amendment_number(query)
     if requested:
@@ -1442,7 +1390,7 @@ def build_legal_effective_rule_result(db: Session, query: str, kb_ids: list[str]
     """
     requested = _requested_amendment_number(query)
     rows = db.query(Document, LegalInstrument).join(LegalInstrument, LegalInstrument.document_id == Document.id).filter(
-        Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None), Document.status == "completed",
+        Document.knowledge_base_id.in_(kb_ids), Document.live(), Document.status == "completed",
         LegalInstrument.version_role == "amendment", LegalInstrument.official_number == requested,
     ).order_by(LegalInstrument.version_date.desc()).all()
     sources: list[dict] = []
@@ -1491,7 +1439,7 @@ def _verified_amendment_relations(db: Session, kb_ids: list[str], family_id: str
         LegalInstrumentRelation.knowledge_base_id.in_(kb_ids),
         LegalInstrumentRelation.review_status == "verified",
         LegalInstrumentRelation.relation == "AMENDS",
-        Document.deleted_at.is_(None), Document.status == "completed",
+        Document.live(), Document.status == "completed",
     )
     if family_id:
         target_instrument = aliased(LegalInstrument)
@@ -1581,7 +1529,7 @@ def _persist_legal_clause_result(db: Session, *, query: str, kb_ids: list[str], 
 
 def _sole_latest_legal_instrument(db: Session, kb_ids: list[str]) -> tuple[Document, LegalInstrument] | None:
     rows = db.query(Document, LegalInstrument).join(LegalInstrument, LegalInstrument.document_id == Document.id).filter(
-        Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None), Document.status == "completed",
+        Document.knowledge_base_id.in_(kb_ids), Document.live(), Document.status == "completed",
         LegalInstrument.version_role == "latest_consolidated",
     ).all()
     return rows[0] if len(rows) == 1 else None
@@ -1788,11 +1736,11 @@ def build_legal_provenance_result(db: Session, query: str, kb_ids: list[str], to
         LegalInstrumentRelation.knowledge_base_id.in_(kb_ids),
         LegalInstrumentRelation.review_status == "verified",
         LegalInstrumentRelation.relation.in_(("AMENDS", "REPEALS", "SUPERSEDES")),
-        Document.deleted_at.is_(None), Document.status == "completed",
+        Document.live(), Document.status == "completed",
     ).order_by(LegalInstrument.version_date.desc(), Document.created_at.desc()).all()
     target_ids = {row[0].target_instrument_id for row in relation_rows if row[0].target_instrument_id}
     target_rows = db.query(LegalInstrument, Document).join(Document, Document.id == LegalInstrument.document_id).filter(
-        LegalInstrument.id.in_(target_ids), Document.deleted_at.is_(None), Document.status == "completed",
+        LegalInstrument.id.in_(target_ids), Document.live(), Document.status == "completed",
     ).all() if target_ids else []
     targets = {instrument.id: (instrument, document) for instrument, document in target_rows}
     sources, statements = [], []
@@ -1930,7 +1878,7 @@ def has_court_decision_evidence(db: Session, kb_ids: list[str]) -> bool:
         return False
     marker = "%คำพิพากษา%"
     row = db.query(Document.id).filter(
-        Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None), Document.status == "completed",
+        Document.knowledge_base_id.in_(kb_ids), Document.live(), Document.status == "completed",
         or_(
             Document.document_type.ilike("%judgment%"),
             Document.metadata_template_name.ilike(marker),
@@ -1977,7 +1925,7 @@ def summarize_document_inventory(db: Session, kb_ids: list[str], *, scope: str =
     current_statuses = {"in_force", "amended", "unknown"}
     base_query = db.query(Document, LegalInstrument).outerjoin(
         LegalInstrument, LegalInstrument.document_id == Document.id
-    ).filter(Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None))
+    ).filter(Document.knowledge_base_id.in_(kb_ids), Document.live())
     if scope == "current":
         base_query = base_query.filter(or_(Document.document_type.notin_(LEGAL_DOCUMENT_TYPES), LegalInstrument.status.in_(current_statuses)))
 
@@ -2126,7 +2074,7 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
     if reference_pdf is not None and reference_file is not None:
         raise ValueError("REFERENCE_FILE_CONFLICT")
     path, stored, size, checksum, mime = store_upload(upload, knowledge_base_id)
-    duplicate = db.query(Document).filter_by(knowledge_base_id=knowledge_base_id, checksum_sha256=checksum).filter(Document.deleted_at.is_(None)).first()
+    duplicate = db.query(Document).filter_by(knowledge_base_id=knowledge_base_id, checksum_sha256=checksum).filter(Document.live()).first()
     if duplicate:
         Path(path).unlink(missing_ok=True)
         raise ValueError("FILE_DUPLICATE")
@@ -2516,7 +2464,7 @@ def embed_document_chunks(db: Session, document_id: str) -> None:
 
 
 def queue_embedding_reindex(db: Session, knowledge_base_id: str, force: bool = False) -> int:
-    documents = db.query(Document).filter_by(knowledge_base_id=knowledge_base_id, status="completed").filter(Document.deleted_at.is_(None)).all()
+    documents = db.query(Document).filter_by(knowledge_base_id=knowledge_base_id, status="completed").filter(Document.live()).all()
     queued = 0
     for document in documents:
         # SQLite represents a JSON null as a non-SQL-NULL value in tests, so
@@ -2524,40 +2472,128 @@ def queue_embedding_reindex(db: Session, knowledge_base_id: str, force: bool = F
         has_embedding = any(chunk.embedding for chunk in db.query(DocumentChunk).filter_by(document_id=document.id))
         active = db.query(ProcessingJob.id).filter(
             ProcessingJob.document_id == document.id,
-            ProcessingJob.job_type == "REINDEX_EMBEDDINGS",
+            ProcessingJob.job_type == JobType.REINDEX_EMBEDDINGS,
             ProcessingJob.status.in_(["queued", "running"]),
         ).first()
         if (force or not has_embedding) and not active:
-            db.add(ProcessingJob(document_id=document.id, knowledge_base_id=knowledge_base_id, job_type="REINDEX_EMBEDDINGS"))
+            db.add(ProcessingJob(document_id=document.id, knowledge_base_id=knowledge_base_id, job_type=JobType.REINDEX_EMBEDDINGS))
             queued += 1
     db.commit()
     return queued
 
 
-# Upstream provider failures that mean "retry later with fewer parallel
-# calls", observed inside LightRAG track error messages.  Matched
-# case-insensitively because the remote relays provider text verbatim.
-_BUDGET_EXHAUSTED_MARKERS = ("in_flight_budget_exhausted", "in-flight budget", "payment required", "insufficient credits", "402")
-
-
-def classify_track_failure(error_detail: str | None) -> str:
-    """Map a failed LightRAG track onto a platform error code.
-
-    ``RETRIEVAL_ENGINE_BUDGET_EXHAUSTED`` is transient: the shared provider
-    account frees in-flight quota on the scale of minutes, so the worker's
-    retry backoff can recover it without operator action (F1).  Everything
-    else keeps the existing terminal ``RETRIEVAL_ENGINE_REJECTED``.
-    """
-    detail = (error_detail or "").casefold()
-    if any(marker in detail for marker in _BUDGET_EXHAUSTED_MARKERS):
-        return "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
-    return "RETRIEVAL_ENGINE_REJECTED"
-
-
 # Follow-up stages run after a document is already searchable and are cheap;
 # running them before new full pipelines keeps a legal document's registry
 # extraction from queueing minutes behind freshly uploaded bulk work (F4).
-_FOLLOW_UP_JOB_TYPES = ("EXTRACT_LEGAL_METADATA", "REINDEX_EMBEDDINGS", METADATA_JOB_TYPE)
+_FOLLOW_UP_JOB_TYPES = (JobType.EXTRACT_LEGAL_METADATA, JobType.REINDEX_EMBEDDINGS, JobType.EXTRACT_DOCUMENT_METADATA)
+
+
+def _run_purge_job(db: Session, job: ProcessingJob) -> None:
+    """Cascade a platform soft-delete into the remote retrieval index so ghost sources stop occupying LightRAG's content-hash namespace."""
+    job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "purging_remote_index", 10, job.attempt_count + 1
+    db.commit()
+    try:
+        doc = db.get(Document, job.document_id)
+        if not doc:
+            raise RuntimeError("DOCUMENT_NOT_FOUND")
+        engine = LightRAGRetrievalEngine()
+        if engine.enabled:
+            purge_remote_record(engine, doc)
+        job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
+    except Exception as exc:
+        logger.exception("remote index purge failed", extra={"job_id": job.id, "document_id": job.document_id})
+        code = str(exc) if str(exc).startswith("RETRIEVAL_ENGINE_") else "REMOTE_INDEX_PURGE_FAILED"
+        if schedule_retry(job, PURGE_RETRY if code in PURGE_RETRYABLE_CODES else None):
+            job.status, job.error_code, job.error_message = "queued", code, "Remote engine busy or unavailable; purge retry scheduled."
+        else:
+            job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "REMOTE_INDEX_PURGE_FAILED", str(exc)[:2000]
+    db.commit()
+
+
+def _run_legal_graph_rebuild_job(db: Session, job: ProcessingJob) -> None:
+    """Rebuild a Knowledge Base's legal graph from its documents."""
+    job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "rebuilding_legal_graph", 10, job.attempt_count + 1
+    db.commit()
+    try:
+        if not job.knowledge_base_id:
+            raise RuntimeError("KNOWLEDGE_BASE_NOT_FOUND")
+        rebuild_legal_graph(db, job.knowledge_base_id)
+        job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
+    except Exception as exc:
+        logger.exception("legal graph rebuild failed", extra={"job_id": job.id, "knowledge_base_id": job.knowledge_base_id})
+        job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "LEGAL_GRAPH_REBUILD_FAILED", str(exc)[:2000]
+    db.commit()
+
+
+def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text: str) -> None:
+    """Follow-up job: derive the legal registry entry of an already searchable document."""
+    job.current_stage, job.progress_percent = "legal_extraction", 60
+    db.commit()
+    deterministic = parse_legal_corpus_metadata(text, doc.title or doc.original_filename)
+    # Official corpora with a structured header already carry the
+    # version identity and explicit change clauses needed by the legal
+    # registry.  Avoid an unnecessary model call for those documents;
+    # unknown/unstructured legal documents still retain the existing
+    # LLM extraction path as a general fallback.
+    extracted = {}
+    if deterministic.get("instrument", {}).get("version_role") == "unknown":
+        try:
+            extracted = OpenRouterClient().extract_legal_metadata(doc.title or doc.original_filename, text)
+        except Exception:
+            # Header/change clauses are sufficient to preserve a traceable
+            # legal instrument even when the optional LLM is unavailable.
+            extracted = {}
+    if isinstance(extracted, dict):
+        extracted["schema_version"] = 2
+        extracted["instrument"] = {**(extracted.get("instrument") or {}), **deterministic["instrument"]}
+        extracted["change_events"] = deterministic.get("change_events", []) or extracted.get("change_events", [])
+        extracted["amendments"] = deterministic.get("amendments", []) or extracted.get("amendments", [])
+        extracted["provenance"] = {**(extracted.get("provenance") or {}), **deterministic.get("provenance", {})}
+        doc.legal_metadata = extracted
+    else:
+        doc.legal_metadata = deterministic
+    sync_legal_document_graph(db, doc)
+    upsert_legal_instrument(db, doc)
+    link_provisions_to_chunks(db, doc)
+    resolve_instrument_statuses(db, doc.knowledge_base_id)
+    job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
+    db.commit()
+
+
+def index_in_engine(db: Session, engine: LightRAGRetrievalEngine, doc: Document, text: str, job: ProcessingJob) -> None:
+    """Send the document to the retrieval engine and wait until it has indexed it.
+
+    A rejection because identical content already exists is healed once: when a stale record of a
+    deleted document is the cause it is removed and the document is ingested again.
+    """
+    title = doc.title or doc.original_filename
+    # Bounded parallelism into the remote pipeline (F1): without this cap a bulk upload fans out
+    # into enough concurrent upstream LLM calls to exhaust the shared provider budget.
+    with _indexing_semaphore:
+        track_id = doc.external_engine_id = engine.ingest(doc.id, doc.knowledge_base_id, text, title)
+        deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
+        healed = False
+        while track_id:
+            if time.monotonic() >= deadline:
+                raise RetrievalEngineError("RETRIEVAL_ENGINE_TIMEOUT")
+            track = engine.track_status(track_id)
+            if track["status"] == "processed":
+                return
+            if track["status"] == "failed":
+                failure = classify_track_failure(track.get("error"))
+                if failure != "RETRIEVAL_ENGINE_DUPLICATE" or healed:
+                    raise RetrievalEngineError(failure, track.get("error"))
+                healed = True
+                if resolve_remote_duplicate(db, engine, doc, track.get("error")) is HealOutcome.ALREADY_INDEXED:
+                    return
+                track_id = doc.external_engine_id = engine.ingest(doc.id, doc.knowledge_base_id, text, title)
+                continue
+            job.progress_percent = 85
+            db.commit()
+            time.sleep(2)
+
+
+_STANDALONE_JOBS = {JobType.PURGE_REMOTE_INDEX: _run_purge_job, JobType.REBUILD_LEGAL_GRAPH: _run_legal_graph_rebuild_job}
 
 
 def process_next_job(db: Session) -> bool:
@@ -2569,63 +2605,27 @@ def process_next_job(db: Session) -> bool:
         ProcessingJob.job_type.in_(_FOLLOW_UP_JOB_TYPES),
     ).order_by(ProcessingJob.created_at).first() or db.query(ProcessingJob).filter(
         ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow(),
-        ProcessingJob.job_type != "PURGE_REMOTE_INDEX",
+        ProcessingJob.job_type != JobType.PURGE_REMOTE_INDEX,
     ).order_by(ProcessingJob.created_at).first() or db.query(ProcessingJob).filter(
         ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow()
     ).order_by(ProcessingJob.created_at).first()
     if not job:
         return False
-    if job.job_type == "PURGE_REMOTE_INDEX":
-        # 4b: cascade a platform soft-delete into the remote retrieval index
-        # so ghost sources stop occupying LightRAG's content-hash namespace.
-        # Runs BEFORE the generic cancelled-because-deleted branch below.
-        job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "purging_remote_index", 10, job.attempt_count + 1
-        db.commit()
-        try:
-            doc = db.get(Document, job.document_id)
-            if not doc:
-                raise RuntimeError("DOCUMENT_NOT_FOUND")
-            engine = LightRAGRetrievalEngine()
-            if engine.enabled:
-                remote = engine.find_document(doc.id, doc.knowledge_base_id)
-                if remote:
-                    engine.delete_remote_document(remote["id"])
-            job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
-        except Exception as exc:
-            logger.exception("remote index purge failed", extra={"job_id": job.id, "document_id": job.document_id})
-            code = str(exc) if str(exc).startswith("RETRIEVAL_ENGINE_") else "REMOTE_INDEX_PURGE_FAILED"
-            # Transient engine states (BUSY/TIMEOUT) retry like document
-            # processing — a busy remote must not strand a ghost (review info).
-            if code in {"RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT"} and job.attempt_count < MAX_PROCESSING_ATTEMPTS:
-                job.status, job.error_code, job.error_message = "queued", code, "Remote engine busy; purge retry scheduled."
-                job.next_attempt_at = datetime.utcnow() + timedelta(seconds=processing_retry_delay(job.attempt_count))
-            else:
-                job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "REMOTE_INDEX_PURGE_FAILED", str(exc)[:2000]
-        db.commit()
-        return True
-    if job.job_type == "REBUILD_LEGAL_GRAPH":
-        job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "rebuilding_legal_graph", 10, job.attempt_count + 1
-        db.commit()
-        try:
-            if not job.knowledge_base_id:
-                raise RuntimeError("KNOWLEDGE_BASE_NOT_FOUND")
-            rebuild_legal_graph(db, job.knowledge_base_id)
-            job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
-        except Exception as exc:
-            logger.exception("legal graph rebuild failed", extra={"job_id": job.id, "knowledge_base_id": job.knowledge_base_id})
-            job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "LEGAL_GRAPH_REBUILD_FAILED", str(exc)[:2000]
-        db.commit()
+    # Standalone jobs run before the deleted-document check: a purge exists because its document was deleted.
+    runner = _STANDALONE_JOBS.get(job.job_type)
+    if runner:
+        runner(db, job)
         return True
     doc = db.get(Document, job.document_id)
-    if not doc or doc.deleted_at:
+    if not doc or not doc.is_live:
         job.status, job.current_stage, job.error_code = "cancelled", "cancelled", "DOCUMENT_DELETED"
         db.commit()
         return True
-    if job.job_type == METADATA_JOB_TYPE:
+    if job.job_type == JobType.EXTRACT_DOCUMENT_METADATA:
         process_metadata_job(db, job)
         return True
-    reindex_only = job.job_type == "REINDEX_EMBEDDINGS"
-    legal_only = job.job_type == "EXTRACT_LEGAL_METADATA"
+    reindex_only = job.job_type == JobType.REINDEX_EMBEDDINGS
+    legal_only = job.job_type == JobType.EXTRACT_LEGAL_METADATA
     job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "extracting", 10, job.attempt_count + 1
     # Legal metadata runs as a follow-up job.  It must never move an already
     # searchable document back to "extracting" or re-read the source file.
@@ -2643,37 +2643,7 @@ def process_next_job(db: Session) -> bool:
         if not reindex_only:
             doc.extracted_text = text
         if legal_only:
-            job.current_stage, job.progress_percent = "legal_extraction", 60
-            db.commit()
-            deterministic = parse_legal_corpus_metadata(text, doc.title or doc.original_filename)
-            # Official corpora with a structured header already carry the
-            # version identity and explicit change clauses needed by the legal
-            # registry.  Avoid an unnecessary model call for those documents;
-            # unknown/unstructured legal documents still retain the existing
-            # LLM extraction path as a general fallback.
-            extracted = {}
-            if deterministic.get("instrument", {}).get("version_role") == "unknown":
-                try:
-                    extracted = OpenRouterClient().extract_legal_metadata(doc.title or doc.original_filename, text)
-                except Exception:
-                    # Header/change clauses are sufficient to preserve a traceable
-                    # legal instrument even when the optional LLM is unavailable.
-                    extracted = {}
-            if isinstance(extracted, dict):
-                extracted["schema_version"] = 2
-                extracted["instrument"] = {**(extracted.get("instrument") or {}), **deterministic["instrument"]}
-                extracted["change_events"] = deterministic.get("change_events", []) or extracted.get("change_events", [])
-                extracted["amendments"] = deterministic.get("amendments", []) or extracted.get("amendments", [])
-                extracted["provenance"] = {**(extracted.get("provenance") or {}), **deterministic.get("provenance", {})}
-                doc.legal_metadata = extracted
-            else:
-                doc.legal_metadata = deterministic
-            sync_legal_document_graph(db, doc)
-            upsert_legal_instrument(db, doc)
-            link_provisions_to_chunks(db, doc)
-            resolve_instrument_statuses(db, doc.knowledge_base_id)
-            job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
-            db.commit()
+            _extract_legal_metadata(db, job, doc, text)
             return True
         job.current_stage, job.progress_percent = "chunking", 45
         existing_chunks = db.query(DocumentChunk.id, DocumentChunk.section_kind).filter_by(document_id=doc.id).all() if reindex_only else []
@@ -2696,25 +2666,7 @@ def process_next_job(db: Session) -> bool:
         if engine.enabled and not reindex_only:
             job.current_stage, job.progress_percent = "indexing", 70
             db.commit()
-            # Bounded parallelism into the remote pipeline (F1): without this
-            # cap a bulk upload fans out into enough concurrent upstream LLM
-            # calls to exhaust the shared provider budget.
-            with _indexing_semaphore:
-                doc.external_engine_id = engine.ingest(doc.id, doc.knowledge_base_id, text, doc.title or doc.original_filename)
-                track_id = doc.external_engine_id
-                if track_id:
-                    deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
-                    while time.monotonic() < deadline:
-                        track = engine.track_status(track_id)
-                        if track["status"] == "processed":
-                            break
-                        if track["status"] == "failed":
-                            raise RuntimeError(classify_track_failure(track.get("error")))
-                        job.progress_percent = 85
-                        db.commit()
-                        time.sleep(2)
-                    else:
-                        raise RuntimeError("RETRIEVAL_ENGINE_TIMEOUT")
+            index_in_engine(db, engine, doc, text, job)
             sync_lightrag_document_graph(db, doc)
         if not reindex_only and not legal_only:
             doc.status = "completed"; doc.indexed_at = datetime.utcnow()
@@ -2727,7 +2679,7 @@ def process_next_job(db: Session) -> bool:
                 db.add(ProcessingJob(
                     document_id=doc.id,
                     knowledge_base_id=doc.knowledge_base_id,
-                    job_type="EXTRACT_LEGAL_METADATA",
+                    job_type=JobType.EXTRACT_LEGAL_METADATA,
                     current_stage="queued",
                 ))
         job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
@@ -2736,19 +2688,18 @@ def process_next_job(db: Session) -> bool:
         # (doc-level clear above covers F2's user-visible case).
         job.error_code, job.error_message = None, None
     except Exception as exc:
-        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
+        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
         logger.exception("document processing failed", extra={"document_id": doc.id, "job_id": job.id, "error_code": code})
         message = "The document could not be processed."
         if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED":
             message = "Upstream indexing budget temporarily exhausted; retry scheduled."
+        if code.startswith("RETRIEVAL_ENGINE_"):
+            # Keep the engine's own explanation (HTTP status, track error, which document
+            # the content collides with) so the document view can say why, not just the code.
+            message = describe_engine_failure(code, exc.detail if isinstance(exc, RetrievalEngineError) else None, message)
         job.error_code, job.error_message = code, message
-        attempt_ceiling = MAX_BUDGET_PROCESSING_ATTEMPTS if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED" else MAX_PROCESSING_ATTEMPTS
-        if code in TRANSIENT_PROCESSING_ERRORS and job.attempt_count < attempt_ceiling:
-            delay = processing_retry_delay(job.attempt_count)
-            if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED":
-                delay = max(delay, BUDGET_RETRY_DELAY_FLOOR_SECONDS)
+        if schedule_retry(job, PROCESSING_RETRY_POLICIES.get(code)):
             job.status, job.current_stage = "queued", "retry_wait"
-            job.next_attempt_at = datetime.utcnow() + timedelta(seconds=delay)
             doc.status, doc.error_code, doc.error_message = "queued", code, "Temporary dependency failure; retry scheduled."
         else:
             if legal_only:
@@ -2775,18 +2726,25 @@ def process_next_graph_projection(db: Session) -> bool:
     event.status, event.attempt_count = "running", event.attempt_count + 1
     db.commit()
     try:
+        # A deleted row is projected as a removal so Neo4j never keeps facts PostgreSQL dropped.
         if event.event_type == "entity" and event.entity_id:
             entity = db.get(Entity, event.entity_id)
-            if entity:
+            if entity is None or entity.deleted_at:
+                store.delete_entity(event.entity_id)
+            else:
                 store.upsert_entity(entity)
         elif event.event_type == "relationship" and event.relationship_id:
             relationship = db.get(Relationship, event.relationship_id)
-            if relationship:
+            if relationship is None or relationship.deleted_at:
+                store.delete_relationship(event.relationship_id)
+            else:
                 source, target = db.get(Entity, relationship.source_entity_id), db.get(Entity, relationship.target_entity_id)
-                if source and target:
+                if source and target and not source.deleted_at and not target.deleted_at:
                     store.upsert_entity(source)
                     store.upsert_entity(target)
                     store.upsert_relationship(relationship, source, target)
+                else:
+                    store.delete_relationship(event.relationship_id)
         event.status, event.completed_at, event.last_error = "completed", datetime.utcnow(), None
     except (httpx.HTTPError, RuntimeError) as exc:
         event.status = "queued"
@@ -2873,7 +2831,7 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
                                 started_at=time.monotonic(), result_count=len(metadata_document_ids),
                                 detail=f"exact filter keys: {', '.join(sorted(plan.metadata_filters))}")
     if plan.metadata_predicates:
-        rows = db.query(Document.id).filter(Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None))
+        rows = db.query(Document.id).filter(Document.knowledge_base_id.in_(kb_ids), Document.live())
         rows = _apply_metadata_filter(rows, plan)
         ids = [r[0] for r in apply_typed_predicates(rows, plan.metadata_predicates).all()]
         plan = plan.model_copy(update={"metadata_document_ids": ids})
@@ -3084,7 +3042,7 @@ def _query_lightrag(db: Session, engine: LightRAGRetrievalEngine, query: str, kb
         if plan and _relationship_filter_active(plan):
             source_ids = {source.get("document_id") for source in value.sources if source.get("document_id")}
             allowed = db.query(Document.id).filter(
-                Document.id.in_(source_ids), Document.status == "completed", Document.deleted_at.is_(None),
+                Document.id.in_(source_ids), Document.status == "completed", Document.live(),
             ) if source_ids else db.query(Document.id).filter(False)
             allowed = _apply_published_filter(allowed, plan)
             allowed = _apply_metadata_filter(allowed, plan)
@@ -3118,7 +3076,7 @@ def _metadata_filter_document_ids(db: Session, knowledge_base_ids: list[str], fi
         return []
     rows = db.query(Document.id).join(
         DocumentMetadataValue, DocumentMetadataValue.document_id == Document.id,
-    ).filter(Document.deleted_at.is_(None))
+    ).filter(Document.live())
     if knowledge_base_ids:
         rows = rows.filter(Document.knowledge_base_id.in_(knowledge_base_ids))
     rows = rows.filter(or_(*[
@@ -3250,7 +3208,7 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
     distance = DocumentChunk.embedding.cosine_distance(query_vector)
     rows = db.query(DocumentChunk, Document, distance.label("distance")).join(
         Document, Document.id == DocumentChunk.document_id
-    ).filter(Document.status == "completed", Document.deleted_at.is_(None), DocumentChunk.embedding.is_not(None))
+    ).filter(Document.status == "completed", Document.live(), DocumentChunk.embedding.is_not(None))
     if kb_ids:
         rows = rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
     rows = _apply_published_filter(rows, plan)
@@ -3272,7 +3230,7 @@ def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int
     started_at = time.monotonic()
     words = [word for word in re.findall(r"[\w-]+", query.lower()) if len(word) > 1]
     base_rows = db.query(DocumentChunk, Document).join(Document, Document.id == DocumentChunk.document_id).filter(
-        Document.status == "completed", Document.deleted_at.is_(None)
+        Document.status == "completed", Document.live()
     )
     if kb_ids:
         base_rows = base_rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
@@ -3316,7 +3274,7 @@ def query_exact_documents(db: Session, plan: RetrievalPlan, kb_ids: list[str], l
                                 started_at=started_at, detail="no document identifier supplied")
         return RetrievalEvidence([], [], [], [])
     rows = db.query(DocumentChunk, Document).join(Document, Document.id == DocumentChunk.document_id).filter(
-        Document.status == "completed", Document.deleted_at.is_(None)
+        Document.status == "completed", Document.live()
     )
     if kb_ids:
         rows = rows.filter(DocumentChunk.knowledge_base_id.in_(kb_ids))
@@ -3358,7 +3316,7 @@ def _global_graph_evidence(db: Session, kb_ids: list[str], limit: int, plan: Ret
         relationship_query = relationship_query.join(
             RelationshipSource, RelationshipSource.relationship_id == Relationship.id,
         ).join(Document, Document.id == RelationshipSource.document_id).filter(
-            Document.status == "completed", Document.deleted_at.is_(None),
+            Document.status == "completed", Document.live(),
         )
         relationship_query = _apply_published_filter(relationship_query, plan)
         relationship_query = _apply_metadata_filter(relationship_query, plan).distinct()

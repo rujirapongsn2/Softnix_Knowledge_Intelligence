@@ -52,16 +52,19 @@ export const Button = forwardRef(function Button({label, children, variant = "se
   return <KumoButton ref={ref} variant={kumoVariant} loading={isLoading} disabled={isDisabled || isLoading} className={join("snx-button", `snx-button-${size}`, className)} {...props}>{children || label}</KumoButton>;
 });
 
-export function TextInput({label, value, onChange, description, isLabelHidden = false, isDisabled = false, isRequired = false, isOptional = false, optionalLabel, hasAutoFocus = false, className, ...props}) {
+// Kumo prints an English "(optional)" after the label whenever `required` is
+// explicitly false, which clashes with our own localized optional marker and
+// mislabels fields that are mandatory. Only pass `required` when it is true.
+export function TextInput({label, value, onChange, description, error, isLabelHidden = false, isDisabled = false, isRequired = false, isOptional = false, optionalLabel, hasAutoFocus = false, className, ...props}) {
   const accessibleLabel = isOptional ? <>{label}{optionalLabel && <> <em>{optionalLabel}</em></>}</> : label;
-  return <div className={join("snx-field", className)}>
-    <KumoInput label={accessibleLabel} description={description} aria-label={props["aria-label"] || (isLabelHidden ? label : undefined)} value={value ?? ""} onChange={event => onChange?.(event.target.value)} disabled={isDisabled} required={isRequired} autoFocus={hasAutoFocus} {...props}/>
+  return <div className={join("snx-field", error && "snx-field-invalid", className)}>
+    <KumoInput {...props} label={accessibleLabel} description={description} error={error} aria-label={props["aria-label"] || (isLabelHidden ? label : undefined)} value={value ?? ""} onChange={event => onChange?.(event.target.value)} disabled={isDisabled} required={isRequired || undefined} variant={error ? "error" : props.variant} autoFocus={hasAutoFocus}/>
   </div>;
 }
 
-export function TextArea({label, value, onChange, description, isLabelHidden = false, isDisabled = false, isRequired = false, className, ...props}) {
-  return <div className={join("snx-field", className)}>
-    <KumoInputArea label={label} description={description} aria-label={props["aria-label"] || (isLabelHidden ? label : undefined)} value={value ?? ""} onChange={event => onChange?.(event.target.value)} disabled={isDisabled} required={isRequired} {...props}/>
+export function TextArea({label, value, onChange, description, error, isLabelHidden = false, isDisabled = false, isRequired = false, className, ...props}) {
+  return <div className={join("snx-field", error && "snx-field-invalid", className)}>
+    <KumoInputArea {...props} label={label} description={description} error={error} aria-label={props["aria-label"] || (isLabelHidden ? label : undefined)} value={value ?? ""} onChange={event => onChange?.(event.target.value)} disabled={isDisabled} required={isRequired || undefined} variant={error ? "error" : props.variant}/>
   </div>;
 }
 
@@ -80,6 +83,10 @@ export function CheckboxInput({label, value, checked, onChange, isDisabled = fal
   const resolvedValue = checked ?? value ?? false;
   return <label className={join("snx-checkbox", className)}><input type="checkbox" checked={resolvedValue} onChange={event => onChange?.(event.target.checked)} disabled={isDisabled}/><span>{label}</span></label>;
 }
+
+export const DesignSystemCheckbox = ({label, checked, onChange, isDisabled = false, className}) => (
+  <CheckboxInput label={label} value={checked} onChange={onChange} isDisabled={isDisabled} className={className} size="sm"/>
+);
 
 export function Badge({label, variant = "neutral", className}) {
   return <span className={join("snx-badge", `snx-badge-${variant}`, className)}>{label}</span>;

@@ -73,7 +73,7 @@ def apply_typed_predicates(rows, predicates):
 
 def describe_schema(db, kb_ids, offset=0, limit=200):
     """Bound snapshot traversal; report coverage for this page, never imply completeness."""
-    base = db.query(Document).filter(Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None))
+    base = db.query(Document).filter(Document.knowledge_base_id.in_(kb_ids), Document.live())
     total = base.count()
     documents = base.options(load_only(Document.id, Document.knowledge_base_id, Document.metadata_template_id,
                                        Document.metadata_template_version, Document.metadata_template_name,
@@ -105,7 +105,7 @@ def decorate_sources(db, sources, kb_ids, requested_keys=()):
     ids = {s.get("document_id") for s in sources if s.get("document_id")}
     documents = {d.id: d for d in db.query(Document).options(load_only(Document.id, Document.metadata_template_fields,
                  Document.document_metadata, Document.metadata_observations, Document.metadata_status,
-                 Document.metadata_revision)).filter(Document.id.in_(ids), Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None))}
+                 Document.metadata_revision)).filter(Document.id.in_(ids), Document.knowledge_base_id.in_(kb_ids), Document.live())}
     for source in sources:
         doc = documents.get(source.get("document_id"))
         if not doc:
@@ -130,7 +130,7 @@ def decorate_sources(db, sources, kb_ids, requested_keys=()):
 
 def metadata_coverage(db, kb_ids):
     rows = db.query(Document.metadata_status, func.count(Document.id)).filter(
-        Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None)).group_by(Document.metadata_status).all()
+        Document.knowledge_base_id.in_(kb_ids), Document.live()).group_by(Document.metadata_status).all()
     return {"scope": "all_non_deleted_documents_in_authorized_kbs", "by_status": dict(rows)}
 
 
@@ -138,7 +138,7 @@ def predicate_coverage(db, kb_ids, predicates):
     result = []
     for raw in predicates:
         predicate = raw if isinstance(raw, MetadataPredicate) else MetadataPredicate.model_validate(raw)
-        rows = db.query(Document.id).filter(Document.knowledge_base_id.in_(kb_ids), Document.deleted_at.is_(None), template_clause(predicate.template_id))
+        rows = db.query(Document.id).filter(Document.knowledge_base_id.in_(kb_ids), Document.live(), template_clause(predicate.template_id))
         known = db.query(DocumentMetadataValue.id).filter(
             DocumentMetadataValue.document_id == Document.id,
             DocumentMetadataValue.field_key == predicate.field_key,

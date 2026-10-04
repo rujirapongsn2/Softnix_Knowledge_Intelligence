@@ -1,6 +1,8 @@
+import io
 import os
 import tempfile
 import uuid
+import zipfile
 from pathlib import Path
 import pytest
 
@@ -146,12 +148,25 @@ def test_reference_pdf_can_attach_after_text_ingest_without_creating_pdf_job():
         assert db.query(ProcessingJob).filter_by(document_id=doc_id).count() == 1
 
 
+def _office_zip(member: str) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as package:
+        package.writestr("[Content_Types].xml", "<Types/>")
+        package.writestr(member, "<root/>")
+    return output.getvalue()
+
+
 @pytest.mark.parametrize("extension,mime,body", [
     ("pdf", "application/pdf", b"%PDF-1.4\nevidence"),
-    ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", b"PK\x03\x04docx"),
-    ("doc", "application/msword", b"\xd0\xcf\x11\xe0doc"),
-    ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", b"PK\x03\x04xlsx"),
-    ("xls", "application/vnd.ms-excel", b"\xd0\xcf\x11\xe0xls"),
+    ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", _office_zip("word/document.xml")),
+    ("doc", "application/msword", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1doc"),
+    ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", _office_zip("xl/workbook.xml")),
+    ("xls", "application/vnd.ms-excel", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1xls"),
+    ("xls", "application/vnd.ms-excel", b"<html><table><tr><td>Evidence</td></tr></table></html>"),
+    ("xls", "application/vnd.ms-excel", b"\xef\xbb\xbf<html><table><tr><td>Evidence</td></tr></table></html>"),
+    ("xls", "application/vnd.ms-excel", b'<?xml version="1.0"?><Workbook/>'),
+    ("doc", "application/msword", b"{\\rtf1\\ansi Evidence}"),
+    ("doc", "application/msword", b"<html><body>Evidence</body></html>"),
     ("txt", "text/plain", b"Original evidence text"),
 ])
 def test_reference_file_types_share_markdown_document_without_processing(extension, mime, body):
@@ -199,7 +214,7 @@ def test_reference_file_can_attach_after_json_text_ingest():
     assert uploaded.status_code == 202
     doc_id = uploaded.json()["document_id"]
     attached = test_client.post(f"/api/v1/ingest/documents/{doc_id}/reference-file",
-                                headers=_headers(secret), files={"file": ("policy.doc", b"\xd0\xcf\x11\xe0doc", "application/msword")})
+                                headers=_headers(secret), files={"file": ("policy.doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1doc", "application/msword")})
     assert attached.status_code == 200, attached.text
     assert attached.json()["reference_file"]["mime_type"] == "application/msword"
     assert attached.json()["reference_pdf"] is None
@@ -207,6 +222,41 @@ def test_reference_file_can_attach_after_json_text_ingest():
                             headers=_headers(secret), files={"file": ("again.txt", b"again", "text/plain")}).status_code == 409
     with SessionLocal() as db:
         assert db.query(ProcessingJob).filter_by(document_id=doc_id).count() == 1
+
+
+@pytest.mark.parametrize("filename,body,mime", [
+    ("empty.txt", b"", "text/plain"),
+    ("invalid.docx", b"PK\x03\x04not-a-package", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ("wrong-package.xlsx", _office_zip("word/document.xml"), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ("invalid.doc", b"not-a-word-file", "application/msword"),
+    ("invalid.xls", b"not-an-excel-file", "application/vnd.ms-excel"),
+])
+def test_invalid_reference_file_does_not_create_document(filename, body, mime):
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"invalid-ref-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    response = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents",
+                                headers=_headers(secret), files={
+                                    "file": ("source.md", b"# Indexed Markdown", "text/markdown"),
+                                    "reference_file": (filename, body, mime),
+                                })
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "REFERENCE_FILE_INVALID"
+    with SessionLocal() as db:
+        assert db.query(Document).filter_by(knowledge_base_id=kb_id).count() == 0
+
+
+def test_reference_text_accepts_content_type_with_charset():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"charset-ref-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    response = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents",
+                                headers=_headers(secret), files={
+                                    "file": ("source.md", b"# Indexed Markdown", "text/markdown; charset=utf-8"),
+                                    "reference_file": ("evidence.txt", b"Evidence", "text/plain; charset=utf-8"),
+                                })
+    assert response.status_code == 202, response.text
+    assert response.json()["reference_file"]["mime_type"] == "text/plain"
 
 
 def test_saved_answer_and_references_refresh_when_pdf_is_attached_later():
@@ -603,3 +653,8 @@ def test_ingest_observability_records_attribution_without_the_secret():
     ingest_transaction = next(row for row in transactions if row["path"].startswith("/api/v1/ingest"))
     assert ingest_transaction["authentication"] == "ingest_token"
     assert secret not in str(transactions)
+
+
+def test_reference_file_validation_treats_unreadable_file_as_invalid(tmp_path):
+    from app.services import _valid_reference_file
+    assert _valid_reference_file(tmp_path / "missing.pdf", ".pdf", 10) is False

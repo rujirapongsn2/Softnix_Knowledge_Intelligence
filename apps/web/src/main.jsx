@@ -86,7 +86,9 @@ const api = async (path, init = {}, mayRefresh = true) => {
   }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const message = data.error?.message || (typeof data.detail === "string" ? data.detail : data.detail?.message) || "Request failed";
+    // FastAPI validation failures (422) send `detail` as a list of {msg} items.
+    const validationMessage = Array.isArray(data.detail) ? data.detail.map(item => String(item?.msg || "").replace(/^Value error, /, "")).filter(Boolean).join("; ") : "";
+    const message = data.error?.message || (typeof data.detail === "string" ? data.detail : data.detail?.message) || validationMessage || "Request failed";
     throw new Error(message);
   }
   return data;
@@ -1577,6 +1579,7 @@ function DocumentTypeDrawer({open, templates, onClose, onCreate, onUpdate, onDea
       ...field,
       options: options_text === undefined ? field.options || [] : options_text.split(",").map(item => item.trim()).filter(Boolean),
     }));
+    if (fields.some(field => ["select", "multi_select"].includes(field.field_type) && !field.options.length)) { setError(t("documentType.drawer.error.optionsRequired")); return; }
     try { if (editing) await onUpdate(editing.id, {...draft, fields}); else await onCreate({...draft, fields}); resetEditor(); }
     catch (requestError) { setError(requestError.message || t("documentType.drawer.error.saveFailed")); }
   };

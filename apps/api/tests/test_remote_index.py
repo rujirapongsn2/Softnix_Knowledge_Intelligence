@@ -7,6 +7,7 @@ from sqlalchemy.pool import StaticPool
 from datetime import datetime
 
 from app import services
+from app.main import soft_delete_document
 from app.models import Base, Document, JobType, KnowledgeBase, ProcessingJob
 from app.remote_index import find_orphan_remote_documents, purge_orphan_remote_documents, resolve_remote_duplicate
 from app.retrieval import LightRAGRetrievalEngine, RetrievalEngineError, classify_track_failure, duplicate_original_id, is_duplicate_content_error
@@ -389,3 +390,59 @@ def test_find_document_reports_the_status_of_the_group_the_row_was_listed_under(
     assert engine.find_document("doc-9", "kb-1")["status"] == "failed"
     assert engine.find_document("doc-8", "kb-1")["status"] == "processed"
     assert engine.find_document("doc-7", "kb-1") is None
+
+
+class StatusRecordingEngine(FakeEngine):
+    def __init__(self, db, doc_id):
+        super().__init__()
+        self.db, self.doc_id, self.seen = db, doc_id, []
+
+    def ingest(self, document_id, knowledge_base_id, text, title):
+        self.seen.append(self.db.get(Document, self.doc_id).status)
+        return super().ingest(document_id, knowledge_base_id, text, title)
+
+
+def test_a_document_is_indexing_while_the_engine_works_and_moves_on_afterwards(db, monkeypatch):
+    make_doc(db, "new-doc", status="queued")
+    engine = StatusRecordingEngine(db, "new-doc")
+    engine.tracks = [{"status": "processed", "error": None}]
+    doc, _ = run_job(db, monkeypatch, engine)
+    assert engine.seen == ["indexing"] and doc.status == "completed"
+
+
+def test_a_document_leaves_indexing_when_the_engine_fails_or_asks_for_a_retry(db, monkeypatch):
+    make_doc(db, "new-doc", status="queued")
+    engine = StatusRecordingEngine(db, "new-doc")
+    engine.tracks = [{"status": "failed", "error": "Regex error while tokenizing"}] * 3
+    doc, job = run_job(db, monkeypatch, engine)
+    assert engine.seen[0] == "indexing" and (doc.status, job.status) == ("queued", "queued")
+    make_doc(db, "dup-doc", status="queued")
+    make_doc(db, "live-doc")
+    engine = StatusRecordingEngine(db, "dup-doc")
+    engine.rows = [row("doc-ghost", "live-doc")]
+    engine.tracks = [{"status": "failed", "error": DUPLICATE_ERROR}]
+    doc, _ = run_job(db, monkeypatch, engine, doc_id="dup-doc")
+    assert engine.seen == ["indexing"] and doc.status == "failed"
+
+
+class DeletingEngine(FakeEngine):
+    def __init__(self, db, doc_id):
+        super().__init__()
+        self.db, self.doc_id = db, doc_id
+
+    def ingest(self, document_id, knowledge_base_id, text, title):
+        soft_delete_document(self.db, self.db.get(Document, self.doc_id))
+        self.db.commit()
+        return super().ingest(document_id, knowledge_base_id, text, title)
+
+
+@pytest.mark.parametrize("track", [{"status": "processed", "error": None}, {"status": "failed", "error": DUPLICATE_ERROR}])
+def test_a_document_deleted_while_it_is_processed_stays_deleted(db, monkeypatch, track):
+    make_doc(db, "new-doc", status="queued")
+    make_doc(db, "live-doc")
+    engine = DeletingEngine(db, "new-doc")
+    engine.rows = [row("doc-ghost", "live-doc")]
+    engine.tracks = [track]
+    doc, job = run_job(db, monkeypatch, engine)
+    assert (doc.status, doc.deleted_at is not None, job.status, job.error_code) == ("deleted", True, "cancelled", "DOCUMENT_DELETED")
+    assert db.query(ProcessingJob).filter_by(document_id="new-doc", job_type=JobType.EXTRACT_DOCUMENT_METADATA).count() == 0

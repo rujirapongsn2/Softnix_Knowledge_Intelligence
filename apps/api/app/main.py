@@ -212,7 +212,7 @@ def system_dashboard(user: User = Depends(require_manager), db: Session = Depend
     }
     # "Total documents" means live documents — soft-deleted rows are tracked
     # separately in documents_by_status but must not inflate the headline.
-    total_docs = sum(v for k, v in doc_status_counts.items() if k != "deleted")
+    total_docs = doc_q.filter(Document.live()).count()
 
     job_q = db.query(ProcessingJob).filter(ProcessingJob.knowledge_base_id.in_(visible_kb_ids))
     job_status_counts = {
@@ -975,13 +975,14 @@ def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, o
     if limit < 1 or limit > 100 or offset < 0:
         raise HTTPException(400, {"code": "DOCUMENT_PAGE_INVALID", "message": "limit must be 1-100 and offset must be non-negative.", "retryable": False})
     rows = db.query(Document).filter(Document.knowledge_base_id == kb_id)
-    if not include_deleted:
+    # A status filter decides the lifecycle itself; include_deleted only widens the unfiltered list.
+    if status:
+        rows = rows.filter(Document.with_status(status))
+    elif not include_deleted:
         rows = rows.filter(Document.live())
     if search and search.strip():
         term = f"%{search.strip()}%"
         rows = rows.filter(or_(Document.title.ilike(term), Document.original_filename.ilike(term)))
-    if status:
-        rows = rows.filter(Document.status == status)
     if document_type:
         rows = rows.filter(Document.document_type == document_type)
     if template_id:

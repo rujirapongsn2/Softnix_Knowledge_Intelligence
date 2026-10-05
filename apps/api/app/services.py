@@ -2665,9 +2665,12 @@ def process_next_job(db: Session) -> bool:
         engine = LightRAGRetrievalEngine()
         if engine.enabled and not reindex_only:
             job.current_stage, job.progress_percent = "indexing", 70
+            doc.status = "indexing"
             db.commit()
             index_in_engine(db, engine, doc, text, job)
             sync_lightrag_document_graph(db, doc)
+        if _abandon_if_deleted(db, job, doc):
+            return True
         if not reindex_only and not legal_only:
             doc.status = "completed"; doc.indexed_at = datetime.utcnow()
             # A retry that finally succeeded must not keep the failure it
@@ -2690,6 +2693,8 @@ def process_next_job(db: Session) -> bool:
     except Exception as exc:
         code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
         logger.exception("document processing failed", extra={"document_id": doc.id, "job_id": job.id, "error_code": code})
+        if _abandon_if_deleted(db, job, doc):
+            return True
         message = "The document could not be processed."
         if code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED":
             message = "Upstream indexing budget temporarily exhausted; retry scheduled."
@@ -2709,6 +2714,17 @@ def process_next_job(db: Session) -> bool:
             else:
                 doc.status, doc.error_code, doc.error_message = "failed", code, message
             job.status = "failed"
+    db.commit()
+    return True
+
+
+def _abandon_if_deleted(db: Session, job: ProcessingJob, doc: Document) -> bool:
+    """A document deleted while its job ran keeps its deleted state: the job is cancelled and nothing more is written to it."""
+    db.commit()
+    db.refresh(doc)
+    if doc.is_live:
+        return False
+    job.status, job.current_stage, job.error_code = "cancelled", "cancelled", "DOCUMENT_DELETED"
     db.commit()
     return True
 

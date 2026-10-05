@@ -198,6 +198,12 @@ class Document(Timestamped, Base):
         """SQL condition: deleted, but its content has not been purged yet."""
         return and_(cls.deleted_at.isnot(None), cls.purged_at.is_(None))
 
+    @classmethod
+    def with_status(cls, status: str):
+        """SQL condition for a status filter. "deleted" is a lifecycle, not a processing status, so it selects restorable
+        documents; any other status selects live documents in that status."""
+        return cls.restorable() if status == "deleted" else and_(cls.status == status, cls.live())
+
 
 class DocumentMetadataValue(Base):
     """Indexed, filterable metadata projection for query-time exact filters."""

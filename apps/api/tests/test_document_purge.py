@@ -257,3 +257,30 @@ def test_a_file_that_cannot_be_removed_is_reported_without_blocking_the_database
     report = purge_deleted_documents(db, min_age_days=0, apply=True)
     assert report["blocked"] == [] and report["purged"][0]["files_failed"] == [str(Path(doc.storage_path).resolve())]
     assert db.get(Document, "gone").purged_at is not None
+
+
+def test_the_documents_page_status_filter_separates_deleted_from_live_documents():
+    from fastapi.testclient import TestClient
+
+    from app.db import SessionLocal
+    from app.main import app
+
+    with TestClient(app) as client:
+        assert client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-horse-battery-staple"}).status_code == 200
+        kb = client.post("/api/v1/knowledge-bases", json={"name": "Status filter", "code": f"status-filter-{uuid.uuid4().hex[:8]}"}).json()
+        with SessionLocal() as session:
+            for name, status, deleted in (("live", "completed", False), ("gone", "deleted", True), ("purged", "deleted", True)):
+                session.add(Document(knowledge_base_id=kb["id"], original_filename=f"{name}.md", stored_filename=f"{name}.md", storage_path="/tmp/none.md",
+                                     mime_type="text/markdown", file_size=1, checksum_sha256=uuid.uuid4().hex * 2, title=name, status=status,
+                                     deleted_at=datetime.utcnow() if deleted else None,
+                                     purged_at=datetime.utcnow() if name == "purged" else None))
+            session.commit()
+
+        def titles(query):
+            return [item["title"] for item in client.get(f"/api/v1/knowledge-bases/{kb['id']}/documents/page{query}").json()["items"]]
+
+        assert titles("?status=deleted") == ["gone"]
+        assert titles("?status=deleted&include_deleted=true") == ["gone"]
+        assert titles("?status=completed&include_deleted=true") == ["live"]
+        assert titles("") == ["live"]
+        assert sorted(titles("?include_deleted=true")) == ["gone", "live", "purged"]

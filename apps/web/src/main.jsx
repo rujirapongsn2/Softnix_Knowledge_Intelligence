@@ -23,6 +23,8 @@ import "./cloudflare-overrides.css";
 import "./knowledge-base-cards.css";
 import {connectionHandles} from "./graph-geometry.mjs";
 import {buildFilePreviewSections, isFilePreviewEmptyValue, mapFilePreviewClassLabel, pickDocumentMetadataValue, pickFilePreviewValue} from "./file-preview.mjs";
+import {Hint} from "./hint.jsx";
+import {errorGuide, kbStatusTip, metadataReviewTip, statusFilterTip, statusTip} from "./hints.mjs";
 import {LanguageProvider, useLanguage} from "./language.jsx";
 import {MetadataReviewPanel} from "./metadata-review.jsx";
 import {legalLabels} from "./translations.js";
@@ -1260,15 +1262,15 @@ const statusHelp = (t, status) => STATUS_HELP_KEYS.includes(status) ? t(`status.
 const KB_STATUS_KEYS = ["active", "draft", "disabled"];
 const KB_STATUS_VARIANTS = {active: "success", draft: "warning", disabled: "neutral"};
 const KB_STATUS_DOTS = {active: "●", draft: "●", disabled: "○"};
-const StatusBadge = ({status}) => {
+const StatusBadge = ({status, document}) => {
   const {t} = useLanguage();
   const label = STATUS_KEYS.includes(status) ? t(`status.${status}.label`) : status.replace(/_/g, " ");
-  return <Badge label={label} variant={status === "completed" ? "success" : status === "failed" || status === "ocr_required" ? "error" : status === "queued" || status === "extracting" || status === "indexing" ? "warning" : "neutral"}/>;
+  return <Hint focusable tip={document ? statusTip(t, document) : null}><Badge label={label} variant={status === "completed" ? "success" : status === "failed" || status === "ocr_required" ? "error" : status === "queued" || status === "extracting" || status === "indexing" ? "warning" : "neutral"}/></Hint>;
 };
 const KbStatusBadge = ({status}) => {
   const {t} = useLanguage();
   const label = KB_STATUS_KEYS.includes(status) ? t(`kb.status.${status}`) : status.replace(/_/g, " ");
-  return <Badge label={KB_STATUS_DOTS[status] ? `${KB_STATUS_DOTS[status]} ${label}` : label} variant={KB_STATUS_VARIANTS[status] || "neutral"}/>;
+  return <Hint focusable tip={kbStatusTip(t, status)}><Badge label={KB_STATUS_DOTS[status] ? `${KB_STATUS_DOTS[status]} ${label}` : label} variant={KB_STATUS_VARIANTS[status] || "neutral"}/></Hint>;
 };
 const Metric = ({value, label, detail}) => <Card padding={3}><p className="metric-value">{value}</p><p className="metric-label">{label}</p>{detail && <p className="metric-detail">{detail}</p>}</Card>;
 
@@ -1482,12 +1484,6 @@ function MetadataFields({fields = [], values = {}, onChange, isDisabled = false}
   })}</div>;
 }
 
-const DOCUMENT_ERROR_MESSAGES = {
-  RETRIEVAL_ENGINE_DUPLICATE: {title: "documentError.RETRIEVAL_ENGINE_DUPLICATE.title", hint: "documentError.RETRIEVAL_ENGINE_DUPLICATE.hint"},
-  RETRIEVAL_ENGINE_REJECTED: {title: "documentError.RETRIEVAL_ENGINE_REJECTED.title", hint: "documentError.RETRIEVAL_ENGINE_REJECTED.hint"},
-  RETRIEVAL_ENGINE_UNAVAILABLE: {title: "documentError.RETRIEVAL_ENGINE_UNAVAILABLE.title", hint: "documentError.RETRIEVAL_ENGINE_UNAVAILABLE.hint"},
-};
-
 function DocumentRowOverflowMenu({document: doc, processing, onReprocess, onDelete, t}) {
   const menu = useAnchoredMenu();
   return <div className="document-overflow" ref={menu.rootRef}>
@@ -1609,8 +1605,8 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
     {(libraryTab === "files" || !(legalInstruments?.length > 0)) && <section className="content-section"><div className="section-title"><div><h2>{showDeletedDocuments ? t("documents.library.allTitle") : t("documents.library.title")}</h2><p>{documentTotal ? t(documentTotal === 1 ? "documents.library.showingCountOne" : "documents.library.showingCountOther", {start: pageStart, end: pageEnd, total: documentTotal}) : t("documents.library.empty")}</p></div>{documents.some(document => ["queued", "extracting", "indexing"].includes(document.status) || ["queued", "running"].includes(document.processing_job_status)) && <span className="live-status" role="status">{t("documents.library.updatingLive")}</span>}</div>
       <div className="document-filter-bar">
         <TextInput label={t("documents.filter.findLabel")} value={documentSearch} onChange={value => { setDocumentOffset(0); setDocumentSearch(value); }} placeholder={t("documents.filter.findPlaceholder")}/>
-        <Selector label={t("common.status")} value={documentStatusFilter} onChange={value => { setDocumentOffset(0); setDocumentStatusFilter(value); }} options={[{value: "all", label: t("common.allStatuses")}, {value: "metadata_review", label: t("autoMetadata.needs_review")}, ...STATUS_KEYS.filter(key => key !== "disabled").map(key => ({value: key, label: t(`status.${key}.label`)})), {value: "deleted", label: t("documents.filter.status.deleted")}]}/>
-        <Selector label={t("documents.upload.documentType")} value={documentTypeFilter} onChange={value => { setDocumentOffset(0); setDocumentTypeFilter(value); }} options={[{value: "all", label: t("common.allTypes")}, ...DOCUMENT_TYPE_OPTIONS.map(option => ({value: option.value, label: t(option.labelKey)})), ...documentTemplates.filter(template => !template.is_system).map(template => ({value: template.id, label: template.name}))]}/>
+        <Selector label={t("common.status")} tip={statusFilterTip(t, documentStatusFilter)} value={documentStatusFilter} onChange={value => { setDocumentOffset(0); setDocumentStatusFilter(value); }} options={[{value: "all", label: t("common.allStatuses")}, {value: "metadata_review", label: t("autoMetadata.needs_review")}, ...STATUS_KEYS.filter(key => key !== "disabled").map(key => ({value: key, label: t(`status.${key}.label`)})), {value: "deleted", label: t("documents.filter.status.deleted")}]}/>
+        <Selector label={t("documents.upload.documentType")} tip={documentTypeFilter === "all" ? {meaning: t("hint.filter.allTypes")} : null} value={documentTypeFilter} onChange={value => { setDocumentOffset(0); setDocumentTypeFilter(value); }} options={[{value: "all", label: t("common.allTypes")}, ...DOCUMENT_TYPE_OPTIONS.map(option => ({value: option.value, label: t(option.labelKey)})), ...documentTemplates.filter(template => !template.is_system).map(template => ({value: template.id, label: template.name}))]}/>
       </div>
     {documentsLoading && !documents.length ? <p className="section-copy" role="status">{t("documents.loading")}</p> : documents.length ? <div className="document-table">{documents.map(document => {
       const activeStatus = processingStatus(document);
@@ -1625,8 +1621,8 @@ function Documents({selectedKb, documents, documentTotal, documentOffset, setDoc
           {failed && <p className="document-status-help document-status-warning">{statusHelp(t, document.status) || t("status.failed.help")}{document.error_code ? ` (${document.error_code})` : ""}</p>}
         </div>
         <div className="document-status-badges">
-          <StatusBadge status={document.status}/>
-          {document.metadata_status === "needs_review" && <span className="metadata-review-badge" title={t("autoMetadata.needs_review")}>{t("documents.badge.needsReview")}</span>}
+          <StatusBadge status={document.status} document={document}/>
+          {document.metadata_status === "needs_review" && <Hint focusable tip={metadataReviewTip(t, document)}><span className="metadata-review-badge">{t("documents.badge.needsReview")}</span></Hint>}
         </div>
         <div className="document-actions"><DocumentRowActions document={document} processing={processing} t={t} onRestore={restoreDocument} onDownload={downloadOriginalDocument} onPreview={previewOriginalDocument} onReprocess={reprocessDocument} onDelete={deleteDocument}/></div>
       </article>;
@@ -2818,7 +2814,7 @@ function DocumentPreview({onRefreshMetadata, preview, jobs, isPollingJobs, polli
   return <div className="document-preview-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <div ref={modalRef} className="document-preview-modal" role="dialog" aria-modal="true" aria-labelledby="document-preview-title" onMouseDown={event => event.stopPropagation()}>
       <div className="preview-heading"><div><p className="eyebrow">{t("documentPreview.eyebrow")}</p><h2 id="document-preview-title" tabIndex={-1} ref={headingRef}>{preview.title}</h2></div><div className="preview-actions"><StatusBadge status={preview.status}/>{onDownloadOriginal && <Button label={t("documents.action.downloadOriginal")} size="sm" variant="ghost" onClick={() => onDownloadOriginal({id: preview.document_id, original_filename: preview.original_filename, title: preview.title})}/>}{referenceFile?.available && <Button label={t("documentPreview.referenceFile")} title={referenceFile.filename} size="sm" variant="secondary" onClick={() => window.open(`${referenceFile.download_url}&disposition=${referenceFile.mime_type === "application/pdf" ? "inline" : "attachment"}`, "_blank", "noopener,noreferrer")}/>} {isExtracting && <span className="live-status" role="status" aria-live="polite">{t("documentPreview.extractingMetadata")}</span>}{preview.status === "completed" && ["legal", "regulation", "contract"].includes(preview.document_type) && <Button label={isExtracting ? t("documentPreview.extractingMetadata") : t("documentPreview.extractLegalMetadata")} size="sm" variant="secondary" isLoading={isExtracting} isDisabled={isExtracting} onClick={() => onExtractLegal({id: preview.document_id, title: preview.title})}/>}<button type="button" className="drawer-close" onClick={onClose} aria-label={t("documentPreview.closeAriaLabel")}>×</button></div></div>
-      {preview.error_code && <div className="inline-error" role="alert">{DOCUMENT_ERROR_MESSAGES[preview.error_code] ? <><b>{t(DOCUMENT_ERROR_MESSAGES[preview.error_code].title)}</b><p>{t(DOCUMENT_ERROR_MESSAGES[preview.error_code].hint)}</p></> : <b>{preview.error_code}</b>}{preview.error_message && <p className="document-error-detail">{preview.error_message}</p>}<small className="document-error-code">{preview.error_code}</small></div>}
+      {preview.error_code && <div className="inline-error" role="alert"><><b>{errorGuide(t, preview.error_code).title}</b><p>{errorGuide(t, preview.error_code).action}</p></>{preview.error_message && <p className="document-error-detail">{preview.error_message}</p>}<small className="document-error-code">{preview.error_code}</small></div>}
       <nav className="document-preview-tabs" role="tablist" aria-label={t("documentPreview.sectionsAriaLabel")}>{tabs.map(([value, label]) => <button type="button" role="tab" aria-selected={tab === value} className={tab === value ? "selected" : ""} key={value} onClick={() => setTab(value)}>{label}</button>)}</nav>
       <div className={`document-preview-tab-panel${tab === "content" ? " is-file-preview" : ""}`}>
         {tab === "content" && <FilePreviewPanel preview={preview} legalInstrument={legalInstrument} onDownloadOriginal={onDownloadOriginal}/>}

@@ -25,16 +25,19 @@ def extraction_fields(document):
                      and observations.get(f["key"], {}).get("content_version") != digest))]
 
 
+def pending_review_keys(fields, values, observations):
+    """Keys of AI-extracted fields that still wait for a person: empty, or filled by extraction without auto-acceptance."""
+    return [f["key"] for f in fields or []
+            if f.get("fill_mode") == "extract"
+            and not observations.get(f["key"], {}).get("locked")
+            and observations.get(f["key"], {}).get("status") != "not_found_confirmed"
+            and (f["key"] not in values
+                 or (observations.get(f["key"], {}).get("origin") == "document_extraction"
+                     and observations.get(f["key"], {}).get("status") != "auto_accepted"))]
+
+
 def update_status(document):
-    observations = document.metadata_observations or {}
-    values = document.document_metadata or {}
-    pending = [f for f in document.metadata_template_fields or []
-               if f.get("fill_mode") == "extract"
-               and not observations.get(f["key"], {}).get("locked")
-               and observations.get(f["key"], {}).get("status") != "not_found_confirmed"
-               and (f["key"] not in values
-                    or (observations.get(f["key"], {}).get("origin") == "document_extraction"
-                        and observations.get(f["key"], {}).get("status") != "auto_accepted"))]
+    pending = pending_review_keys(document.metadata_template_fields, document.document_metadata or {}, document.metadata_observations or {})
     document.metadata_status = "needs_review" if pending else "complete"
 
 

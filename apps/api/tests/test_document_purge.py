@@ -284,3 +284,20 @@ def test_the_documents_page_status_filter_separates_deleted_from_live_documents(
         assert titles("?status=completed&include_deleted=true") == ["live"]
         assert titles("") == ["live"]
         assert sorted(titles("?include_deleted=true")) == ["gone", "live", "purged"]
+
+
+def test_a_document_needing_review_lists_the_fields_waiting_for_a_person():
+    from app.metadata_extraction import pending_review_keys
+    from app.schemas import DocumentOut
+
+    fields = [{"key": "party", "fill_mode": "extract"}, {"key": "date", "fill_mode": "extract"}, {"key": "note", "fill_mode": "manual"},
+              {"key": "owner", "fill_mode": "extract"}, {"key": "none", "fill_mode": "extract"}]
+    values = {"date": "2020-01-01", "owner": "A"}
+    observations = {"date": {"origin": "document_extraction", "status": "suggested"}, "owner": {"origin": "document_extraction", "status": "auto_accepted"},
+                    "none": {"status": "not_found_confirmed"}}
+    assert pending_review_keys(fields, values, observations) == ["party", "date"]
+    base = dict(id="d", knowledge_base_id="k", original_filename="a", title=None, document_type="general", mime_type="text/plain", file_size=1,
+                status="completed", error_code=None, error_message=None, legal_metadata=None, indexed_at=None, deleted_at=None, published_at=None,
+                metadata_template_fields=fields, document_metadata=values, metadata_observations=observations)
+    assert DocumentOut(**base, metadata_status="needs_review").metadata_pending_fields == ["party", "date"]
+    assert DocumentOut(**base, metadata_status="complete").metadata_pending_fields == []

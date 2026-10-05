@@ -1,4 +1,5 @@
 import React, {forwardRef, useEffect, useState} from "react";
+import {Hint} from "./hint.jsx";
 import {Button as KumoButton, Input as KumoInput, InputArea as KumoInputArea} from "@cloudflare/kumo";
 
 const join = (...items) => items.filter(Boolean).join(" ");
@@ -68,13 +69,13 @@ export function TextArea({label, value, onChange, description, error, isLabelHid
   </div>;
 }
 
-export function Selector({label, value, onChange, options = [], description, isLabelHidden = false, isDisabled = false, className}) {
+export function Selector({label, value, onChange, options = [], description, isLabelHidden = false, isDisabled = false, className, tip}) {
   const id = React.useId();
   return <label className={join("snx-field", className)} htmlFor={id}>
     {!isLabelHidden && <span className="snx-field-label">{label}</span>}
-    <select id={id} className="snx-select" value={value} onChange={event => onChange?.(event.target.value)} disabled={isDisabled}>
+    <Hint tip={tip}><select id={id} className="snx-select" value={value} onChange={event => onChange?.(event.target.value)} disabled={isDisabled}>
       {options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-    </select>
+    </select></Hint>
     {description && <small className="snx-field-description">{description}</small>}
   </label>;
 }

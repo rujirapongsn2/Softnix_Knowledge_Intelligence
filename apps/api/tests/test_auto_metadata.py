@@ -339,3 +339,63 @@ def test_typed_projection_migration_preserves_existing_rows():
         assert connection.execute(text("SELECT metadata_status, metadata_revision FROM documents")).one() == ("not_started", 0)
         migration.downgrade()
         assert connection.execute(text("SELECT value_text FROM document_metadata_values")).scalar() == "2026-09-08"
+
+
+def scripted_client(*answers):
+    calls = []
+
+    def extract(fields, text):
+        calls.append([f["key"] for f in fields])
+        return answers[min(len(calls), len(answers)) - 1]
+    return SimpleNamespace(extract_document_metadata=extract), calls
+
+
+GOOD = [{"value": "to keep the register accurate", "evidence_quote": "to keep the register accurate"}]
+TEXT = "Purpose: to keep the register accurate. Issuer: Land Department."
+
+
+@pytest.mark.parametrize("bad", ["a bare string", [{"value": "no quote here"}], [{"value": "x", "evidence_quote": "not in the document"}]])
+def test_an_unusable_answer_is_asked_again_for_that_field_only(bad):
+    fields = [field("purpose", field_type="textarea"), field("issuer")]
+    issuer = [{"value": "Land Department", "evidence_quote": "Land Department"}]
+    client, calls = scripted_client({"purpose": bad, "issuer": issuer}, {"purpose": GOOD})
+    observations = extract_candidates(fields, TEXT, client)
+    assert calls == [["purpose", "issuer"], ["purpose"]]
+    assert observations["purpose"]["status"] == "auto_accepted" and observations["purpose"]["candidates"][0]["value"] == GOOD[0]["value"]
+    assert observations["issuer"]["status"] == "auto_accepted"
+
+
+def test_an_answer_that_stays_unusable_is_reported_after_one_retry():
+    client, calls = scripted_client({"purpose": "still a bare string"})
+    observations = extract_candidates([field("purpose", field_type="textarea")], TEXT, client)
+    assert len(calls) == 2 and observations["purpose"]["status"] == "invalid_evidence" and observations["purpose"]["candidates"] == []
+
+
+def test_a_usable_answer_is_not_asked_twice():
+    client, calls = scripted_client({"purpose": GOOD})
+    extract_candidates([field("purpose", field_type="textarea")], TEXT, client)
+    assert len(calls) == 1
+
+
+DOCUMENT = "Section 7 There shall be a central committee.\nIts chair is the permanent secretary.  Issuer: Land Department."
+
+
+@pytest.mark.parametrize("quote", [
+    '"Section 7 There shall be a central committee."',
+    "“Section 7 There shall be a central committee.”",
+    "Section 7 There shall be a   central committee.",
+    "Section 7 There shall be a central committee.\nIts chair is the permanent secretary. Issuer: Land Department.",
+])
+def test_a_quote_differing_only_in_wrapping_marks_or_spacing_is_accepted_as_the_documents_own_text(quote):
+    answer = {"purpose": [{"value": "Section 7", "evidence_quote": quote}]}
+    observation = extract_candidates([field("purpose", field_type="textarea")], DOCUMENT, extractor(answer))["purpose"]
+    assert observation["status"] == "auto_accepted"
+    stored = observation["candidates"][0]["evidence"]
+    assert DOCUMENT[stored["char_start"]:stored["char_end"]] == stored["quote"]
+
+
+@pytest.mark.parametrize("quote", ["Section 7 There shall be a different committee.", '"A committee that is not in the document"', '""', "   "])
+def test_a_quote_whose_words_are_not_in_the_document_is_still_rejected(quote):
+    answer = {"purpose": [{"value": "Section 7", "evidence_quote": quote}]}
+    observation = extract_candidates([field("purpose", field_type="textarea")], DOCUMENT, extractor(answer))["purpose"]
+    assert observation["status"] == "invalid_evidence" and observation["candidates"] == []

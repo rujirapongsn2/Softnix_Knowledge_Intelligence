@@ -181,7 +181,7 @@ class DocumentMetadataUpdate(BaseModel):
 class MetadataFieldDefinition(BaseModel):
     key: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
     label: str = Field(min_length=1, max_length=160)
-    field_type: Literal["text", "textarea", "date", "number", "select", "multi_select", "boolean"] = "text"
+    field_type: Literal["text", "textarea", "text_list", "date", "number", "select", "multi_select", "boolean"] = "text"
     required: bool = False
     fill_mode: Literal["manual", "extract"] = "manual"
     extraction_description: str | None = Field(default=None, max_length=1000)

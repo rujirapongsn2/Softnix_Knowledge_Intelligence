@@ -24,7 +24,8 @@ import "./knowledge-base-cards.css";
 import {connectionHandles} from "./graph-geometry.mjs";
 import {buildFilePreviewSections, isFilePreviewEmptyValue, mapFilePreviewClassLabel, pickDocumentMetadataValue, pickFilePreviewValue} from "./file-preview.mjs";
 import {Hint} from "./hint.jsx";
-import {errorGuide, kbStatusTip, metadataReviewTip, statusFilterTip, statusTip} from "./hints.mjs";
+import {ListTextArea} from "./list-text-area.jsx";
+import {jobTip, kbStatusTip, legalStatusTip, metadataReviewTip, reviewStatusTip, roleTip, serviceTip, statusFilterTip, statusTip, userStatusTip, errorGuide} from "./hints.mjs";
 import {LanguageProvider, useLanguage} from "./language.jsx";
 import {MetadataReviewPanel} from "./metadata-review.jsx";
 import {legalLabels} from "./translations.js";
@@ -878,7 +879,7 @@ function SystemStatusView() {
                   <span>{isReady ? t("systemStatus.serviceReady") : t("systemStatus.serviceUnavailable")}</span>
                 </div>
               </div>
-              <Badge label={isReady ? t("systemStatus.up") : t("systemStatus.down")} variant={isReady ? "success" : "error"}/>
+              <Hint focusable tip={serviceTip(t, isReady)}><Badge label={isReady ? t("systemStatus.up") : t("systemStatus.down")} variant={isReady ? "success" : "error"}/></Hint>
             </div>
           );
         })}
@@ -1012,7 +1013,7 @@ function SystemStatusView() {
                     <td><b>{job.job_type}</b></td>
                     <td>{job.current_stage || "queued"}</td>
                     <td>{job.progress_percent}%</td>
-                    <td><StatusBadge status={job.status}/></td>
+                    <td><StatusBadge status={job.status} job={job}/></td>
                   </tr>
                 ))}
               </tbody>
@@ -1051,7 +1052,7 @@ function SystemStatusView() {
                     <td><code>{job.id.slice(0, 8)}…</code></td>
                     <td>{metrics.knowledge_bases?.[job.knowledge_base_id] || job.knowledge_base_id || "—"}</td>
                     <td><b>{job.job_type}</b></td>
-                    <td><StatusBadge status={job.status}/></td>
+                    <td><StatusBadge status={job.status} job={job}/></td>
                     <td>{job.error_code ? <code>{job.error_code}</code> : "—"}</td>
                     <td><small>{job.created_at ? new Date(job.created_at).toLocaleString() : "—"}</small></td>
                   </tr>
@@ -1262,10 +1263,10 @@ const statusHelp = (t, status) => STATUS_HELP_KEYS.includes(status) ? t(`status.
 const KB_STATUS_KEYS = ["active", "draft", "disabled"];
 const KB_STATUS_VARIANTS = {active: "success", draft: "warning", disabled: "neutral"};
 const KB_STATUS_DOTS = {active: "●", draft: "●", disabled: "○"};
-const StatusBadge = ({status, document}) => {
+const StatusBadge = ({status, document, job}) => {
   const {t} = useLanguage();
   const label = STATUS_KEYS.includes(status) ? t(`status.${status}.label`) : status.replace(/_/g, " ");
-  return <Hint focusable tip={document ? statusTip(t, document) : null}><Badge label={label} variant={status === "completed" ? "success" : status === "failed" || status === "ocr_required" ? "error" : status === "queued" || status === "extracting" || status === "indexing" ? "warning" : "neutral"}/></Hint>;
+  return <Hint focusable tip={document ? statusTip(t, document) : job ? jobTip(t, job) : null}><Badge label={label} variant={status === "completed" ? "success" : status === "failed" || status === "ocr_required" ? "error" : status === "queued" || status === "extracting" || status === "indexing" ? "warning" : "neutral"}/></Hint>;
 };
 const KbStatusBadge = ({status}) => {
   const {t} = useLanguage();
@@ -1476,6 +1477,7 @@ function MetadataFields({fields = [], values = {}, onChange, isDisabled = false}
     const value = values[field.key] ?? (field.field_type === "boolean" ? false : "");
     const label = field.required ? t("metadataFields.requiredLabel", {label: field.label}) : field.label;
     if (field.field_type === "textarea") return <TextArea key={field.key} label={label} value={value} onChange={next => setValue(field.key, next)} rows={3} description={field.help_text} isDisabled={isDisabled}/>;
+    if (field.field_type === "text_list") return <ListTextArea key={field.key} label={label} value={values[field.key]} onChange={next => setValue(field.key, next)} description={field.help_text || t("metadata.textList.hint")} isDisabled={isDisabled}/>;
     if (field.field_type === "boolean") return <Selector key={field.key} label={label} value={values[field.key] === undefined ? "" : String(values[field.key])} onChange={next => setValue(field.key, next === "" ? undefined : next === "true")} options={[{value: "", label: t("common.selectPlaceholder")}, {value: "true", label: t("autoMetadata.yes")}, {value: "false", label: t("autoMetadata.no")}]} isDisabled={isDisabled}/>;
     if (field.field_type === "select") return <Selector key={field.key} label={label} value={value} onChange={next => setValue(field.key, next)} options={[{value: "", label: t("common.selectPlaceholder")}, ...(field.options || []).map(option => ({value: option, label: option}))]} isDisabled={isDisabled} description={field.help_text}/>;
     if (field.field_type === "multi_select") return <fieldset className="metadata-multi-select" key={field.key} disabled={isDisabled}><legend>{label}</legend><div>{(field.options || []).map(option => <label key={option}><input type="checkbox" checked={(Array.isArray(values[field.key]) ? values[field.key] : []).includes(option)} onChange={event => { const selected = new Set(Array.isArray(values[field.key]) ? values[field.key] : []); event.target.checked ? selected.add(option) : selected.delete(option); setValue(field.key, [...selected]); }}/><span>{option}</span></label>)}</div>{field.help_text && <small>{field.help_text}</small>}</fieldset>;
@@ -1727,7 +1729,7 @@ function KnowledgeNode({data, selected}) {
     <div className="graph-node-circle" title={isLegal ? legalEntityLabel(labels, data.entityType) : entityTypeLabel(t, data.entityType)}><Icon size={28} weight="duotone" aria-hidden="true"/></div>
     <strong className="graph-node-label" title={data.label}>{data.label}</strong>
     <span className="graph-node-type" title={isLegal ? legalEntityLabel(labels, data.entityType) : entityTypeLabel(t, data.entityType)}>{isLegal ? legalEntityLabel(labels, data.entityType) : entityTypeLabel(t, data.entityType)}{data.documentId ? ` · ${String(data.documentId).slice(0, 8)}` : ""}</span>
-    {isLegal && <span className={`graph-node-review ${reviewStatus}`}><i aria-hidden="true"/>{reviewStatusLabel(labels, reviewStatus)}</span>}
+    {isLegal && <Hint tip={reviewStatusTip(t, reviewStatus)}><span className={`graph-node-review ${reviewStatus}`}><i aria-hidden="true"/>{reviewStatusLabel(labels, reviewStatus)}</span></Hint>}
   </div>;
 }
 
@@ -1763,7 +1765,7 @@ function LegalMapPanel({map, loading, onSelectInstrument, onOpenDocument, onOpen
   const renderCard = instrument => {
     const provenance = [instrument.authority_level != null ? t("legal.authorityLevel", {level: instrument.authority_level}) : null, instrument.status_reason, instrument.source_reference].filter(Boolean).join(" · ");
     return <div key={instrument.id} role="button" tabIndex={0} className={`legal-instrument-card ${instrument.id === currentInstrument?.id ? "is-current" : ""}`} onClick={() => onSelectInstrument(instrument.id)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelectInstrument(instrument.id); } }}>
-      <div className="legal-instrument-card-top"><span className="legal-class-chip">{legalClassLabel(labels, instrument)}</span><span className={`legal-status ${instrument.status || "unknown"}`}><i aria-hidden="true"/>{legalStatusLabel(labels, instrument.status)}</span><Badge label={reviewStatusLabel(labels, instrument.review_status)} variant={reviewBadgeVariant(instrument.review_status)}/></div>
+      <div className="legal-instrument-card-top"><span className="legal-class-chip">{legalClassLabel(labels, instrument)}</span><Hint focusable tip={legalStatusTip(t, instrument.status)}><span className={`legal-status ${instrument.status || "unknown"}`}><i aria-hidden="true"/>{legalStatusLabel(labels, instrument.status)}</span></Hint><Hint focusable tip={reviewStatusTip(t, instrument.review_status)}><Badge label={reviewStatusLabel(labels, instrument.review_status)} variant={reviewBadgeVariant(instrument.review_status)}/></Hint></div>
       <h3>{instrument.title}</h3>
       <p className="legal-instrument-filename">{instrument.filename || instrument.document_id}</p>
       {provenance && <p className="legal-instrument-authority">{provenance}{instrument.source_uri && " · "}{instrument.source_uri && <a className="legal-instrument-source-link" href={instrument.source_uri} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()}>{t("legal.map.card.sourceLink")}</a>}</p>}
@@ -1859,7 +1861,7 @@ function LegalInspector({entity, data, loading, tab, setTab, onImpact, onFocus})
   const tabs = [["overview", t("legal.inspector.tab.overview")], ["evidence", t("legal.inspector.tab.evidence")], ["relations", t("legal.inspector.tab.relations")], ["versions", t("legal.inspector.tab.versions")]];
   return <div className="legal-inspector">
     <p className="eyebrow">{t("legal.inspector.eyebrow")}</p><h2>{legal.name}</h2>
-    <div className="inspector-badges"><Badge label={legalEntityLabel(labels, legal.entity_type)} variant="info"/><Badge label={reviewStatusLabel(labels, legal.review_status)} variant={statusVariant}/>{legal.origin && <Badge label={relationshipOriginLabel(labels, legal.origin)} variant="neutral"/>}</div>
+    <div className="inspector-badges"><Badge label={legalEntityLabel(labels, legal.entity_type)} variant="info"/><Hint focusable tip={reviewStatusTip(t, legal.review_status)}><Badge label={reviewStatusLabel(labels, legal.review_status)} variant={statusVariant}/></Hint>{legal.origin && <Badge label={relationshipOriginLabel(labels, legal.origin)} variant="neutral"/>}</div>
     <div className="inspector-trust-note"><b>{legal.review_status === "suggested" ? t("legal.inspector.trust.unverifiedTitle") : t("legal.inspector.trust.verifiedTitle")}</b><span>{legal.review_status === "suggested" ? t("legal.inspector.trust.unverifiedBody") : t("legal.inspector.trust.verifiedBody")}</span></div>
     <div className="inspector-tabs" role="tablist">{tabs.map(([value,label]) => <button key={value} type="button" className={tab === value ? "active" : ""} onClick={() => setTab(value)}>{label}</button>)}</div>
     {loading && <p className="section-copy" role="status">{t("legal.inspector.loading")}</p>}
@@ -2575,9 +2577,9 @@ const Graph = ({data}) => {
 };
 const LEGAL_STATUS_VARIANTS = {in_force: "success", amended: "warning", not_yet_effective: "neutral", unknown: "neutral", superseded: "error", repealed: "error"};
 const LegalStatusBadge = ({status}) => {
-  const {language} = useLanguage();
+  const {t, language} = useLanguage();
   const labels = legalLabels[language];
-  return status ? <Badge label={legalStatusLabel(labels, status)} variant={LEGAL_STATUS_VARIANTS[status] || "neutral"}/> : null;
+  return status ? <Hint focusable tip={legalStatusTip(t, status)}><Badge label={legalStatusLabel(labels, status)} variant={LEGAL_STATUS_VARIANTS[status] || "neutral"}/></Hint> : null;
 };
 
 const QueryResult = ({data, submitFeedback, onOpenSource}) => {
@@ -2879,9 +2881,9 @@ function UsersView({users, groups, loadUsers, loadGroups, notify, showError}) {
     <tbody>{users.map(user => <tr key={user.id}>
       <td><b>{user.username}</b></td>
       <td>{user.display_name || "—"}</td>
-      <td><Badge label={t(`users.role.${user.role}`)} variant={user.role === "admin" ? "danger" : user.role === "manager" ? "warning" : "info"}/></td>
+      <td><Hint focusable tip={roleTip(t, user.role)}><Badge label={t(`users.role.${user.role}`)} variant={user.role === "admin" ? "danger" : user.role === "manager" ? "warning" : "info"}/></Hint></td>
       <td>{groups.find(group => group.id === user.group_id)?.name || "—"}</td>
-      <td><Badge label={user.is_active ? t("users.status.active") : t("users.status.inactive")} variant={user.is_active ? "success" : "neutral"}/></td>
+      <td><Hint focusable tip={userStatusTip(t, user.is_active)}><Badge label={user.is_active ? t("users.status.active") : t("users.status.inactive")} variant={user.is_active ? "success" : "neutral"}/></Hint></td>
       <td className="row-actions">
         <Button label={t("users.edit")} size="sm" variant="secondary" onClick={() => openEdit(user)}/>
         <Button label={t("users.resetPassword")} size="sm" variant="ghost" onClick={() => setResetTarget(user)}/>

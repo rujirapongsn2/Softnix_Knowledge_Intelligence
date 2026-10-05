@@ -4,13 +4,15 @@ import json
 import re
 from datetime import datetime, timedelta
 
-from .document_templates import metadata_search_text, validate_metadata_values
+from .document_templates import TEXT_LIST_MAX_ITEMS, metadata_search_text, validate_metadata_values
 from .models import Document, JobType, ProcessingJob
 from .openrouter import OpenRouterClient
 
 EXTRACTOR_VERSION = "1"
 WINDOW = 12000
-MAX_WINDOWS = 4
+WINDOW_OVERLAP = 1000
+# 240,000 characters. A longer document is read up to here and its fields are marked partial.
+MAX_WINDOWS = 20
 
 
 def extraction_fields(document):
@@ -92,7 +94,10 @@ def _read_answer(field, answer, window):
             invalid = True
             continue
         try:
-            value = validate_metadata_values([{**field, "required": False}], {field["key"]: candidate.get("value")})[field["key"]]
+            # A list field's answer is one item per object; the item is validated as a one-item list.
+            is_list = field.get("field_type") == "text_list"
+            value = validate_metadata_values([{**field, "required": False}], {field["key"]: [candidate.get("value")] if is_list else candidate.get("value")})[field["key"]]
+            value = value[0] if is_list else value
             # JSON rejects NaN/Infinity even though Python floats accept them.
             json.dumps(value, allow_nan=False)
         except (ValueError, KeyError, TypeError):
@@ -117,21 +122,38 @@ def _read_window(fields, window, client):
     return answers
 
 
+def _evidence(window, start, quote):
+    offset = start + window.index(quote)
+    return {"quote": quote, "char_start": offset, "char_end": offset + len(quote)}
+
+
+def _auto_acceptable(field, candidate):
+    """Only values that are literally their own quote pass without a person. Dates, numbers, booleans and graph facts need review."""
+    if field.get("review_policy", "evidence") != "evidence" or field.get("graph_relationship"):
+        return False
+    kind, value = field.get("field_type", "text"), candidate["value"]
+    if kind in {"text", "textarea", "select"}:
+        return isinstance(value, str) and value in candidate["evidence"]["quote"]
+    if kind == "text_list":
+        return all(item in evidence["quote"] for item, evidence in zip(value, candidate["item_evidence"]))
+    return False
+
+
 def extract_candidates(fields, text, client):
     """Bound provider work and verify source quotes against the exact input version."""
     collected = {f["key"]: [] for f in fields}
     invalid = set()
     truncated = len(text) > WINDOW * MAX_WINDOWS
     for start in range(0, min(len(text), WINDOW * MAX_WINDOWS), WINDOW):
-        window = text[start:start + WINDOW]
+        # The overlap keeps a sentence that crosses a window boundary whole in one of the two windows.
+        window = text[start:start + WINDOW + WINDOW_OVERLAP]
         for key, (entries, bad) in _read_window(fields, window, client).items():
             if bad:
                 invalid.add(key)
             for value, quote in entries:
-                offset = start + window.index(quote)
-                entry = {"value": value, "evidence": {"quote": quote, "char_start": offset, "char_end": offset + len(quote)}}
+                entry = {"value": value, "evidence": _evidence(window, start, quote)}
                 if not any(c["value"] == value for c in collected[key]):
-                    if len(collected[key]) < 20:
+                    if len(collected[key]) < (TEXT_LIST_MAX_ITEMS if next(f for f in fields if f["key"] == key).get("field_type") == "text_list" else 20):
                         collected[key].append(entry)
                     else:
                         invalid.add(key)
@@ -140,22 +162,18 @@ def extract_candidates(fields, text, client):
     for field in fields:
         key = field["key"]
         candidates = collected[key]
+        if field.get("field_type") == "text_list" and candidates:
+            # The items found are one value; each keeps the quote that backs it.
+            candidates = [{"value": [c["value"] for c in candidates], "evidence": candidates[0]["evidence"], "item_evidence": [c["evidence"] for c in candidates]}]
         status = "suggested" if candidates else "not_found"
         if len(candidates) > 1:
             status = "conflict"
         elif key in invalid:
-            status = "invalid_evidence"
+            status = "suggested" if candidates and field.get("field_type") == "text_list" else "invalid_evidence"
         elif truncated:
             status = "partial"
-        elif len(candidates) == 1:
-            value, evidence = candidates[0]["value"], candidates[0]["evidence"]
-            # Only literal text/enum values can pass the initial automatic policy.
-            # Dates, numbers, booleans and graph facts require human verification.
-            if (field.get("review_policy", "evidence") == "evidence"
-                    and field.get("field_type", "text") in {"text", "textarea", "select"}
-                    and not field.get("graph_relationship")
-                    and isinstance(value, str) and value in evidence["quote"]):
-                status = "auto_accepted"
+        elif len(candidates) == 1 and _auto_acceptable(field, candidates[0]):
+            status = "auto_accepted"
         observations[key] = {"status": status, "origin": "document_extraction", "candidates": candidates,
                              "content_version": digest, "extractor_version": EXTRACTOR_VERSION,
                              "coverage": "partial" if truncated else "full", "locked": False}

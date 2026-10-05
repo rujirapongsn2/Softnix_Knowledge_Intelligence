@@ -1,6 +1,7 @@
 """Evidence-backed custom metadata. Candidates never masquerade as manual facts."""
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta
 
 from .document_templates import metadata_search_text, validate_metadata_values
@@ -62,6 +63,60 @@ def queue_metadata_extraction(db, document):
     return True
 
 
+_WRAPPING_MARKS = "\"'\u201c\u201d\u2018\u2019\u00ab\u00bb"
+
+
+def _locate_quote(quote, window):
+    """The exact text in the window that a model's quote points at, or None. Models often wrap a copied quote in quotation
+    marks or change its line breaks and spacing, so those differences are ignored. The text returned is always the document's own."""
+    if quote in window:
+        return quote
+    cleaned = quote.strip().strip(_WRAPPING_MARKS).strip()
+    if not cleaned:
+        return None
+    if cleaned in window:
+        return cleaned
+    match = re.search(r"\s+".join(re.escape(part) for part in cleaned.split()), window)
+    return match.group(0) if match else None
+
+
+def _read_answer(field, answer, window):
+    """Valid candidates (value plus verbatim quote) from one field's answer, and whether any of it was unusable."""
+    if not isinstance(answer, list) or len(answer) > 20:
+        return [], True
+    entries, invalid = [], False
+    for candidate in answer:
+        quote = candidate.get("evidence_quote") if isinstance(candidate, dict) else None
+        quote = _locate_quote(quote, window) if isinstance(quote, str) and len(quote) <= 4000 else None
+        if not quote:
+            invalid = True
+            continue
+        try:
+            value = validate_metadata_values([{**field, "required": False}], {field["key"]: candidate.get("value")})[field["key"]]
+            # JSON rejects NaN/Infinity even though Python floats accept them.
+            json.dumps(value, allow_nan=False)
+        except (ValueError, KeyError, TypeError):
+            invalid = True
+            continue
+        entries.append((value, quote))
+    return entries, invalid
+
+
+def _read_window(fields, window, client):
+    """Answers for one window. A field whose answer was unusable is asked once more on its own, because models
+    sometimes drop the quote or the list shape the first time. The retry replaces the first answer unless it is worse."""
+    result = client.extract_document_metadata(fields, window)
+    answers = {f["key"]: _read_answer(f, result.get(f["key"], []), window) for f in fields}
+    retry = [f for f in fields if answers[f["key"]][1]]
+    if retry:
+        again = client.extract_document_metadata(retry, window)
+        for field in retry:
+            second = _read_answer(field, again.get(field["key"], []), window)
+            if not second[1] or len(second[0]) >= len(answers[field["key"]][0]):
+                answers[field["key"]] = second
+    return answers
+
+
 def extract_candidates(fields, text, client):
     """Bound provider work and verify source quotes against the exact input version."""
     collected = {f["key"]: [] for f in fields}
@@ -69,29 +124,10 @@ def extract_candidates(fields, text, client):
     truncated = len(text) > WINDOW * MAX_WINDOWS
     for start in range(0, min(len(text), WINDOW * MAX_WINDOWS), WINDOW):
         window = text[start:start + WINDOW]
-        result = client.extract_document_metadata(fields, window)
-        for field in fields:
-            key = field["key"]
-            candidates = result.get(key, [])
-            if not isinstance(candidates, list) or len(candidates) > 20:
+        for key, (entries, bad) in _read_window(fields, window, client).items():
+            if bad:
                 invalid.add(key)
-                continue
-            for candidate in candidates:
-                if not isinstance(candidate, dict):
-                    invalid.add(key)
-                    continue
-                quote = candidate.get("evidence_quote")
-                value = candidate.get("value")
-                if not isinstance(quote, str) or not quote.strip() or len(quote) > 4000 or quote not in window:
-                    invalid.add(key)
-                    continue
-                try:
-                    value = validate_metadata_values([{**field, "required": False}], {key: value})[key]
-                    # JSON rejects NaN/Infinity even though Python floats accept them.
-                    json.dumps(value, allow_nan=False)
-                except (ValueError, KeyError, TypeError):
-                    invalid.add(key)
-                    continue
+            for value, quote in entries:
                 offset = start + window.index(quote)
                 entry = {"value": value, "evidence": {"quote": quote, "char_start": offset, "char_end": offset + len(quote)}}
                 if not any(c["value"] == value for c in collected[key]):

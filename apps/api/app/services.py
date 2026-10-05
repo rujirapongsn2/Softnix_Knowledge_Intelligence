@@ -28,6 +28,7 @@ from .legal_resolver import resolve_legal_context
 from .legal_corpus import parse_legal_corpus_metadata
 from .document_templates import metadata_search_text, normalize_field_definitions
 from .metadata_search import apply_typed_predicates, decorate_sources, metadata_coverage, predicate_coverage
+from .legal_edits import keep_manual_edits
 from .metadata_extraction import process_metadata_job, queue_metadata_extraction
 from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, JobType, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .data_quality import build_document_quality_reports
@@ -2543,6 +2544,7 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
             # Header/change clauses are sufficient to preserve a traceable
             # legal instrument even when the optional LLM is unavailable.
             extracted = {}
+    previous = doc.legal_metadata
     if isinstance(extracted, dict):
         extracted["schema_version"] = 2
         extracted["instrument"] = {**(extracted.get("instrument") or {}), **deterministic["instrument"]}
@@ -2552,6 +2554,7 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
         doc.legal_metadata = extracted
     else:
         doc.legal_metadata = deterministic
+    doc.legal_metadata = keep_manual_edits(doc.legal_metadata, previous)
     sync_legal_document_graph(db, doc)
     upsert_legal_instrument(db, doc)
     link_provisions_to_chunks(db, doc)

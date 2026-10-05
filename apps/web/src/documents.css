@@ -414,3 +414,29 @@
   }
   .file-preview-sidebar { border-right: 0; border-bottom: 1px solid var(--color-border, #d9e5e7); }
 }
+.hint-anchor { display: inline-flex; min-width: 0; border-radius: 6px; }
+.hint-anchor:focus-visible { outline: 2px solid var(--color-kumo-brand, #2786C2); outline-offset: 2px; }
+.snx-field > .hint-anchor { display: block; }
+.hint-card {
+  position: fixed;
+  z-index: 1000;
+  display: grid;
+  gap: .3rem;
+  max-width: calc(100vw - 16px);
+  padding: .6rem .75rem;
+  border: 1px solid var(--color-kumo-line, #d8dde3);
+  border-radius: 8px;
+  background: var(--color-kumo-base, #fff);
+  color: var(--text-color-kumo-default, #1b2430);
+  box-shadow: 0 8px 24px #0000002b;
+  font-size: .78rem;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: left;
+  letter-spacing: 0;
+  pointer-events: none;
+}
+.hint-card p { margin: 0; }
+.hint-card .hint-pending { color: var(--text-color-kumo-subtle, #596675); }
+.hint-card .hint-action { padding-top: .3rem; border-top: 1px solid var(--color-kumo-line, #d8dde3); }
+.hint-card .hint-detail { overflow-wrap: anywhere; color: var(--text-color-kumo-subtle, #596675); font-size: .7rem; }

@@ -26,6 +26,7 @@ from .models import AuditLog, Document, DocumentLifecycle, DocumentMetadataTempl
 from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, custom_template_fields, list_templates, merge_profile_fields, metadata_search_text, resolve_template, template_code, validate_metadata_values
 from .data_quality import build_document_quality_report, build_knowledge_base_quality_report
 from .metadata_search import describe_schema
+from .legal_edits import with_manual_edits
 from .metadata_extraction import queue_metadata_extraction, update_status as update_metadata_status
 from .observability import metrics, now
 from .openrouter import OpenRouterClient
@@ -1236,9 +1237,7 @@ def update_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: 
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
-    current = doc.legal_metadata or {}
-    current.update(payload.metadata)
-    doc.legal_metadata = current
+    doc.legal_metadata = with_manual_edits(doc.legal_metadata, {**(doc.legal_metadata or {}), **payload.metadata})
     record_audit(db, "document.legal_metadata.update", user.id, "document", doc.id, {"fields": sorted(payload.metadata.keys())})
     db.commit()
     return {"status": "updated", "document_id": doc.id, "legal_metadata": doc.legal_metadata}
@@ -1363,7 +1362,7 @@ def replace_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user:
     doc = db.get(Document, document_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
-    doc.legal_metadata = payload.metadata
+    doc.legal_metadata = with_manual_edits(doc.legal_metadata, payload.metadata)
     record_audit(db, "document.legal_metadata.replace", user.id, "document", doc.id)
     db.commit()
     return {"status": "replaced", "document_id": doc.id, "legal_metadata": doc.legal_metadata}

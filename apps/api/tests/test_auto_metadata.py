@@ -447,12 +447,21 @@ def test_a_text_list_with_one_unusable_item_is_kept_for_review_not_discarded():
     assert observation["status"] == "suggested" and observation["candidates"][0]["value"] == ["land", "tax"]
 
 
+def test_a_text_list_in_a_document_read_only_in_part_is_partial_even_when_an_item_was_unusable():
+    text = "The land tax office. " + ("x" * 11990 + " ") * 21
+    assert len(text) > WINDOW * MAX_WINDOWS
+    answer = ITEMS[:2] + [{"value": "deed", "evidence_quote": "not in the document"}]
+    client, _ = by_window({"topics": [("The land", a) for a in answer]})
+    observation = extract_candidates([field("topics", field_type="text_list")], text, client)["topics"]
+    assert observation["status"] == "partial" and observation["coverage"] == "partial"
+
+
 def test_text_list_values_are_validated_stored_and_searchable():
     from app.document_templates import validate_metadata_values
 
     topics = {"key": "topics", "field_type": "text_list"}
     assert validate_metadata_values([topics], {"topics": ["land", "tax"]}) == {"topics": ["land", "tax"]}
-    for bad in ("land", ["land", "land"], ["land", ""], [1], ["x" * 1001], [f"t{i}" for i in range(51)]):
+    for bad in ("land", ["land", "land"], ["land", ""], [1], [["a"], ["a"]], [{"x": 1}], ["x" * 1001], [f"t{i}" for i in range(51)]):
         with pytest.raises(ValueError):
             validate_metadata_values([topics], {"topics": bad})
     api = next(client())

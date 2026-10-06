@@ -8,7 +8,7 @@ from sqlalchemy import inspect
 
 from test_api import client
 from app.db import SessionLocal
-from app.metadata_extraction import extract_candidates, process_metadata_job, queue_metadata_extraction
+from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, process_metadata_job, queue_metadata_extraction
 from app.metadata_search import MetadataPredicate, apply_typed_predicates, describe_schema
 from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
 from app.openrouter import OpenRouterClient
@@ -90,8 +90,8 @@ def test_fabricated_evidence_conflicts_and_partial_never_auto_accept():
     assert result["issuer"]["status"] == "invalid_evidence"
     result = extract_candidates([field()], text, extractor({"issuer": [{"value": "A", "evidence_quote": text}, {"value": "B", "evidence_quote": text}]}))
     assert result["issuer"]["status"] == "conflict"
-    result = extract_candidates([field()], "A" * 50000, extractor({"issuer": [{"value": "A", "evidence_quote": "A"}]}))
-    assert result["issuer"]["status"] == "partial"
+    result = extract_candidates([field()], "A" * (WINDOW * MAX_WINDOWS + 1), extractor({"issuer": [{"value": "A", "evidence_quote": "A"}]}))
+    assert result["issuer"]["status"] == "partial" and result["issuer"]["coverage"] == "partial"
 
 
 def test_dates_and_boolean_false_are_reviewable_and_invalid_types_rejected():
@@ -399,3 +399,68 @@ def test_a_quote_whose_words_are_not_in_the_document_is_still_rejected(quote):
     answer = {"purpose": [{"value": "Section 7", "evidence_quote": quote}]}
     observation = extract_candidates([field("purpose", field_type="textarea")], DOCUMENT, extractor(answer))["purpose"]
     assert observation["status"] == "invalid_evidence" and observation["candidates"] == []
+
+
+def by_window(answers):
+    """An extractor that answers from what the window actually contains, like a model reading it."""
+    calls = []
+
+    def extract(fields, text):
+        calls.append(len(text))
+        return {f["key"]: [dict(a) for marker, a in answers.get(f["key"], []) if marker in text] for f in fields}
+    return SimpleNamespace(extract_document_metadata=extract), calls
+
+
+def test_a_value_deep_in_a_long_document_is_found_and_the_field_is_not_partial():
+    text = ("x" * 11990 + " ") * 7 + "Purpose: to keep the register accurate. " + ("y" * 11990 + " ") * 2
+    assert 4 * WINDOW < text.index("Purpose") < len(text) <= WINDOW * MAX_WINDOWS
+    client, calls = by_window({"purpose": [("Purpose:", {"value": "to keep the register accurate", "evidence_quote": "to keep the register accurate"})]})
+    observation = extract_candidates([field("purpose")], text, client)["purpose"]
+    assert observation["status"] == "auto_accepted" and observation["coverage"] == "full"
+    stored = observation["candidates"][0]["evidence"]
+    assert text[stored["char_start"]:stored["char_end"]] == stored["quote"] and len(calls) == -(-len(text) // WINDOW)
+
+
+def test_a_sentence_crossing_a_window_boundary_is_found_once():
+    sentence = "Issuer: Land Department."
+    text = "x" * (WINDOW - 8) + sentence + "z" * 100
+    client, _ = by_window({"issuer": [(sentence, {"value": "Land Department", "evidence_quote": sentence})]})
+    observation = extract_candidates([field("issuer")], text, client)["issuer"]
+    assert observation["status"] == "auto_accepted" and len(observation["candidates"]) == 1 and WINDOW_OVERLAP > len(sentence)
+
+
+ITEMS = [{"value": "land", "evidence_quote": "land"}, {"value": "tax", "evidence_quote": "tax"}, {"value": "deed", "evidence_quote": "deed"}]
+
+
+def test_a_text_list_field_collects_items_into_one_value_each_backed_by_its_own_quote():
+    text = "The land tax deed office."
+    observation = extract_candidates([field("topics", field_type="text_list")], text, extractor({"topics": ITEMS}))["topics"]
+    assert observation["status"] == "auto_accepted" and len(observation["candidates"]) == 1
+    candidate = observation["candidates"][0]
+    assert candidate["value"] == ["land", "tax", "deed"] and [e["quote"] for e in candidate["item_evidence"]] == ["land", "tax", "deed"]
+
+
+def test_a_text_list_with_one_unusable_item_is_kept_for_review_not_discarded():
+    text = "The land tax office."
+    answer = {"topics": ITEMS[:2] + [{"value": "deed", "evidence_quote": "not in the document"}]}
+    observation = extract_candidates([field("topics", field_type="text_list")], text, extractor(answer))["topics"]
+    assert observation["status"] == "suggested" and observation["candidates"][0]["value"] == ["land", "tax"]
+
+
+def test_text_list_values_are_validated_stored_and_searchable():
+    from app.document_templates import validate_metadata_values
+
+    topics = {"key": "topics", "field_type": "text_list"}
+    assert validate_metadata_values([topics], {"topics": ["land", "tax"]}) == {"topics": ["land", "tax"]}
+    for bad in ("land", ["land", "land"], ["land", ""], [1], ["x" * 1001], [f"t{i}" for i in range(51)]):
+        with pytest.raises(ValueError):
+            validate_metadata_values([topics], {"topics": bad})
+    api = next(client())
+    kb, template, doc_id = setup_document(api, [field("topics", field_type="text_list", fill_mode="manual", extraction_description=None)], {"topics": ["land", "tax"]})
+    from app.services import sync_document_metadata_values
+
+    with SessionLocal() as db:
+        sync_document_metadata_values(db, db.get(Document, doc_id))
+        db.commit()
+        rows = db.query(DocumentMetadataValue).filter_by(document_id=doc_id, field_key="topics").all()
+        assert sorted(r.value_text for r in rows) == ["land", "tax"] and {r.value_type for r in rows} == {"text_list"}

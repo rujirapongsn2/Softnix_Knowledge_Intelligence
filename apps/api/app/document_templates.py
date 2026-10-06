@@ -126,6 +126,12 @@ def resolve_template(db: Session, knowledge_base_id: str, template_id: str | Non
     return result
 
 
+# Types whose value is a list; each item is stored, indexed and mapped to the graph on its own.
+LIST_FIELD_TYPES = frozenset({"multi_select", "text_list"})
+TEXT_LIST_MAX_ITEMS = 50
+TEXT_LIST_ITEM_MAX_CHARS = 1000
+
+
 def validate_metadata_values(fields: list[dict[str, Any]], values: dict[str, Any] | None, *, allow_extraction_pending: bool = False) -> dict[str, Any]:
     values = values or {}
     if not isinstance(values, dict):
@@ -158,6 +164,9 @@ def validate_metadata_values(fields: list[dict[str, Any]], values: dict[str, Any
             except ValueError as exc:
                 raise ValueError("DOCUMENT_METADATA_INVALID") from exc
         if kind == "select" and value not in field.get("options", []):
+            raise ValueError("DOCUMENT_METADATA_INVALID")
+        if kind == "text_list" and (not isinstance(value, list) or len(value) > TEXT_LIST_MAX_ITEMS or len(set(value)) != len(value)
+                                    or any(not isinstance(item, str) or not item.strip() or len(item) > TEXT_LIST_ITEM_MAX_CHARS for item in value)):
             raise ValueError("DOCUMENT_METADATA_INVALID")
         if kind == "multi_select":
             options = field.get("options", [])

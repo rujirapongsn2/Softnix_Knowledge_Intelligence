@@ -26,7 +26,7 @@ from .graph_store import Neo4jGraphStore
 from .legal_registry import AUTHORITY_LEVELS, classify_kind, normalize_family_key, parse_provision_refs, parse_thai_date, provision_number_matches, resolve_instrument_statuses
 from .legal_resolver import resolve_legal_context
 from .legal_corpus import parse_legal_corpus_metadata
-from .document_templates import metadata_search_text, normalize_field_definitions
+from .document_templates import LIST_FIELD_TYPES, metadata_search_text, normalize_field_definitions
 from .metadata_search import apply_typed_predicates, decorate_sources, metadata_coverage, predicate_coverage
 from .legal_edits import keep_manual_edits
 from .metadata_extraction import process_metadata_job, queue_metadata_extraction
@@ -153,7 +153,7 @@ def sync_document_metadata_values(db: Session, document: Document) -> None:
         if not field.get("filterable") or value in (None, ""):
             continue
         field_type = field.get("field_type", "text")
-        indexed_values = value if field_type == "multi_select" else [value]
+        indexed_values = value if field_type in LIST_FIELD_TYPES else [value]
         for item in indexed_values:
             db.add(DocumentMetadataValue(
                 knowledge_base_id=document.knowledge_base_id,
@@ -202,7 +202,7 @@ def sync_document_metadata_graph(db: Session, document: Document) -> dict[str, i
     entity_count, relationship_count = int(created_anchor), 0
     for field in mapped:
         raw_value = document.document_metadata.get(field["key"])
-        field_values = raw_value if field.get("field_type") == "multi_select" else [raw_value]
+        field_values = raw_value if field.get("field_type") in LIST_FIELD_TYPES else [raw_value]
         for raw_item in field_values:
             value = str(raw_item).strip()[:500]
             entity_type = str(field["graph_entity_type"]).strip()[:100]

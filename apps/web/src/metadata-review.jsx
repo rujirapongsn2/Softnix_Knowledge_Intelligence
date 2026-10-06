@@ -53,7 +53,7 @@ export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFi
         {values[field.key] !== undefined && <p className="metadata-effective-value">{Array.isArray(values[field.key]) ? values[field.key].join(", ") : String(values[field.key])}</p>}
         {(observation.candidates || []).map((candidate, index) => <div className="metadata-candidate" key={index}>
           <div><span>{Array.isArray(candidate.value) ? candidate.value.join(", ") : String(candidate.value)}</span>{needsReview(field) && <Button label={t("autoMetadata.confirm")} size="sm" variant="secondary" isDisabled={busy || running} onClick={() => review(field, "confirm", {candidate_index: index})}/>}</div>
-          <blockquote>{candidate.evidence.quote}</blockquote>
+          {(candidate.item_evidence || [candidate.evidence]).map((evidence, at) => <blockquote key={at}>{evidence.quote}</blockquote>)}
           <details><summary>{t("autoMetadata.sourceContext")}</summary><pre>{preview.text?.slice(Math.max(0, candidate.evidence.char_start - 220), candidate.evidence.char_end + 220)}</pre></details>
         </div>)}
         {editing === field.key ? <form onSubmit={event => { event.preventDefault(); review(field, "set", {value: draft[field.key], revision: draftRevision}); }}>

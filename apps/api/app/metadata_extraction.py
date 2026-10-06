@@ -168,10 +168,12 @@ def extract_candidates(fields, text, client):
         status = "suggested" if candidates else "not_found"
         if len(candidates) > 1:
             status = "conflict"
-        elif key in invalid:
-            status = "suggested" if candidates and field.get("field_type") == "text_list" else "invalid_evidence"
+        elif key in invalid and not (candidates and field.get("field_type") == "text_list"):
+            status = "invalid_evidence"
         elif truncated:
             status = "partial"
+        elif key in invalid:
+            status = "suggested"
         elif len(candidates) == 1 and _auto_acceptable(field, candidates[0]):
             status = "auto_accepted"
         observations[key] = {"status": status, "origin": "document_extraction", "candidates": candidates,

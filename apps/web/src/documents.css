@@ -54,13 +54,17 @@
 .template-field-help { grid-column: 1 / span 2; }
 .template-field-extraction { grid-column: 1 / -1; }
 .template-field-extraction textarea { min-height: 5.5rem; resize: vertical; }
-.template-field-options { grid-column: 3; }
+.template-field-type, .template-field-options { grid-column: 3 / -1; }
 .template-field-capabilities { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: .8rem; }
 .template-field-graph { grid-column: 1 / span 3; display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
 .template-field-advanced { grid-column: 1 / -1; border-top: 1px solid var(--color-border); padding-top: .45rem; }
 .template-field-advanced summary { cursor: pointer; color: var(--color-text-secondary); font-size: .8rem; font-weight: 700; }
 .template-field-advanced[open] summary { margin-bottom: .55rem; color: var(--color-text-primary); }
 .template-field-action { grid-column: 4; align-self: end; justify-self: end; }
+.template-field-section { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; align-items: end; gap: .65rem; }
+.template-field-stored { align-items: start; }
+.template-field-section + .template-field-section { border-top: 1px solid var(--color-border); padding-top: .55rem; }
+.template-field-section > h4 { grid-column: 1 / -1; margin: 0; color: var(--color-text-secondary); font-size: .8rem; font-weight: 700; }
 .document-type-drawer-overlay { position: fixed; inset: 0; z-index: 50; display: flex; justify-content: flex-end; background: rgba(10, 35, 45, .34); }
 .document-type-drawer { display: flex; flex-direction: column; gap: 1rem; width: min(640px, 100vw); height: 100%; overflow: auto; padding: 1.25rem; background: var(--color-background-surface); box-shadow: -18px 0 48px rgba(8, 42, 52, .2); }
 .document-type-drawer-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding-bottom: .85rem; border-bottom: 1px solid var(--color-border); }
@@ -138,7 +142,7 @@
   .document-pagination span { min-width: auto; }
   .metadata-field-grid, .document-metadata-values { grid-template-columns: 1fr; }
   .template-field-row { grid-template-columns: 1fr; align-items: stretch; }
-  .template-field-help, .template-field-extraction, .template-field-options, .template-field-graph, .template-field-capabilities, .template-field-action { grid-column: 1; }
+  .template-field-help, .template-field-extraction, .template-field-type, .template-field-options, .template-field-graph, .template-field-capabilities, .template-field-action { grid-column: 1; }
   .template-field-graph { grid-template-columns: 1fr; }
   .template-field-action { justify-self: stretch; }
   .template-list > div { align-items: flex-start; flex-direction: column; gap: .55rem; }

@@ -59,3 +59,7 @@ export const jobTip = (t, job) => {
 export const legalStatusTip = (t, status) => ({meaning: t(`hint.legalStatus.${oneOf(["in_force", "amended", "not_yet_effective", "superseded", "repealed"], status) || "unknown"}`)});
 
 export const reviewStatusTip = (t, status) => ({meaning: t(`hint.reviewStatus.${oneOf(["verified", "suggested", "rejected"], status) || "unreviewed"}`)});
+
+const FIELD_TYPE_HELP = {text: "textHelp", textarea: "textareaHelp", text_list: "textListHelp", select: "selectHelp", multi_select: "multiSelectHelp"};
+
+export const fieldTypeHelp = (t, fieldType) => FIELD_TYPE_HELP[fieldType] ? t(`documentType.editor.fieldType.${FIELD_TYPE_HELP[fieldType]}`) : undefined;

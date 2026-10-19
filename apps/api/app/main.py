@@ -37,7 +37,7 @@ from .retention import prune_observability
 from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
-from .job_queue import WORKER_LOST, disown, is_stale, lock_knowledge_base_graph
+from .job_queue import lock_knowledge_base_graph, release_if_stale
 from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, apply_answer_reference_contract, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, enrich_sources_with_file_links, entity_graph, process_next_job, public_document_base_url, queue_embedding_reindex, reference_file_available, reference_pdf_available, refresh_saved_answer_citations, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
@@ -1405,11 +1405,12 @@ def reprocess_document(document_id: str, user: User = Depends(current_admin), db
         ProcessingJob.document_id == doc.id,
         ProcessingJob.status.in_(["queued", "running"]),
     ).order_by(ProcessingJob.created_at.desc()).first()
-    if active and is_stale(active):
-        # The worker running it is gone (crash, restart): give up on that job and start over.
-        disown(active)  # the old worker's late commits are refused (claim token)
-        active.status, active.current_stage = "failed", "failed"
-        active.error_code, active.error_message = WORKER_LOST, "Superseded by a reprocess after the worker stopped."
+    if active and release_if_stale(db, active.id) is not None:
+        # The worker running it is gone (crash, restart): the job is handed over the way the
+        # sweep does it, and a re-queued one is dropped since the reprocess starts over.
+        if active.status == "queued":
+            active.status, active.current_stage = "failed", "failed"
+            active.error_message = "Superseded by a reprocess after the worker stopped."
         active = None
     if active:
         raise HTTPException(409, {
@@ -1437,10 +1438,8 @@ def soft_delete_document(db: Session, doc: Document) -> ProcessingJob:
     # in flight and then stops.  The purge below cannot start before that (one
     # running job per document), so it removes the finished record instead of
     # racing the ingest.  A running job whose worker is gone is released right away.
-    for running in db.query(ProcessingJob).filter(ProcessingJob.document_id == doc.id, ProcessingJob.status == "running").all():
-        if is_stale(running):
-            disown(running)
-            running.status, running.current_stage, running.error_code = "cancelled", "cancelled", "DOCUMENT_DELETED"
+    for (running_id,) in db.query(ProcessingJob.id).filter(ProcessingJob.document_id == doc.id, ProcessingJob.status == "running").all():
+        release_if_stale(db, running_id)  # the document is deleted, so a released job is cancelled
     # Keep the retrieval index in sync. A failed purge remains retryable as a
     # normal processing job, so a deleted source cannot silently block re-ingest.
     purge = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type=JobType.PURGE_REMOTE_INDEX)

@@ -166,6 +166,8 @@ def test_delete_cancels_queued_jobs_and_releases_a_stale_running_one():
             assert db.get(ProcessingJob, ids[2]).status == "cancelled"
             released = db.get(ProcessingJob, ids[3])
             assert released.status == "cancelled" and released.claim_token is None
+            # The same hand-over as the sweep: the loss is counted and the reason recorded.
+            assert (released.lost_count, released.error_code) == (1, "DOCUMENT_DELETED")
 
 
 # ------------------------------------------------------------ Finding 4

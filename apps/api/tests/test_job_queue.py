@@ -167,6 +167,35 @@ def test_stale_sweep_requeues_lost_jobs_and_leaves_live_ones():
         assert claim_next_job(db).id == lost.id
 
 
+def test_reprocess_hands_a_stale_job_over_the_way_the_sweep_does():
+    """A reprocess must not disagree with the sweep: the loss is counted and the metadata status reset."""
+    with TestClient(app) as client:
+        assert client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-horse-battery-staple"}).status_code == 200
+        with SessionLocal() as db:
+            kb = _kb(db)
+            metadata_doc, worn_doc = _doc(db, kb, "completed"), _doc(db, kb, "indexing")
+            metadata_doc.metadata_status = "running"
+            metadata = ProcessingJob(document_id=metadata_doc.id, knowledge_base_id=kb.id, job_type=JobType.EXTRACT_DOCUMENT_METADATA,
+                                     status="running", claim_token="dead-worker")
+            worn = ProcessingJob(document_id=worn_doc.id, knowledge_base_id=kb.id, job_type=JobType.PROCESS_DOCUMENT,
+                                 status="running", claim_token="dead-worker", lost_count=STALE_MAX_LOSSES - 1)
+            db.add_all([metadata, worn]); db.commit()
+            db.query(ProcessingJob).filter(ProcessingJob.id.in_([metadata.id, worn.id])).update({"updated_at": datetime.utcnow() - timedelta(hours=1)}, synchronize_session=False)
+            db.commit()
+            ids = metadata_doc.id, worn_doc.id, metadata.id, worn.id
+
+        assert client.post(f"/api/v1/documents/{ids[0]}/reprocess").status_code == 200
+        assert client.post(f"/api/v1/documents/{ids[1]}/reprocess").status_code == 200
+        with SessionLocal() as db:
+            old = db.get(ProcessingJob, ids[2])
+            assert (old.status, old.error_code, old.lost_count, old.claim_token) == ("failed", WORKER_LOST, 1, None)
+            assert old.error_message == "Superseded by a reprocess after the worker stopped."
+            assert db.get(Document, ids[0]).metadata_status == "queued"
+            worn = db.get(ProcessingJob, ids[3])
+            assert (worn.status, worn.lost_count) == ("failed", STALE_MAX_LOSSES)
+            assert db.get(Document, ids[1]).status == "queued", "the reprocess itself is queued"
+
+
 def test_reprocess_replaces_a_stale_running_job_but_not_a_live_one():
     with TestClient(app) as client:
         assert client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-horse-battery-staple"}).status_code == 200

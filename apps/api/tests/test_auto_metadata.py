@@ -90,8 +90,15 @@ def test_fabricated_evidence_conflicts_and_partial_never_auto_accept():
     assert result["issuer"]["status"] == "invalid_evidence"
     result = extract_candidates([field()], text, extractor({"issuer": [{"value": "A", "evidence_quote": text}, {"value": "B", "evidence_quote": text}]}))
     assert result["issuer"]["status"] == "conflict"
-    result = extract_candidates([field()], "A" * (WINDOW * MAX_WINDOWS + 1), extractor({"issuer": [{"value": "A", "evidence_quote": "A"}]}))
+    result = extract_candidates([field()], "A" * (WINDOW * MAX_WINDOWS + WINDOW_OVERLAP + 1), extractor({"issuer": [{"value": "A", "evidence_quote": "A"}]}))
     assert result["issuer"]["status"] == "partial" and result["issuer"]["coverage"] == "partial"
+
+
+def test_a_document_the_last_window_reads_to_its_end_has_full_coverage():
+    # The last window extends past MAX_WINDOWS * WINDOW by the overlap, so a document that fits there was read in full.
+    answer = {"issuer": [{"value": "A", "evidence_quote": "A"}]}
+    result = extract_candidates([field()], "A" * (WINDOW * MAX_WINDOWS + WINDOW_OVERLAP), extractor(answer))
+    assert result["issuer"]["coverage"] == "full" and result["issuer"]["status"] == "auto_accepted"
 
 
 def test_dates_and_boolean_false_are_reviewable_and_invalid_types_rejected():

@@ -142,7 +142,7 @@ def extract_candidates(fields, text, client):
     """Bound provider work and verify source quotes against the exact input version."""
     collected = {f["key"]: [] for f in fields}
     invalid = set()
-    truncated = len(text) > WINDOW * MAX_WINDOWS
+    truncated = len(text) > WINDOW * MAX_WINDOWS + WINDOW_OVERLAP  # the last window reads the overlap past the cap
     for start in range(0, min(len(text), WINDOW * MAX_WINDOWS), WINDOW):
         # The overlap keeps a sentence that crosses a window boundary whole in one of the two windows.
         window = text[start:start + WINDOW + WINDOW_OVERLAP]

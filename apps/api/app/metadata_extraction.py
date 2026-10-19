@@ -178,7 +178,7 @@ _THAI_DATE = re.compile(r"(?<!\d)(\d{1,2})\s*(" + "|".join(_THAI_MONTHS) + r")\s
 _THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 # A date field that names one particular date in a legal text: its quote must carry the phrase that introduces that date,
 # otherwise another date in the same sentence (the gazette date, say) could stand in for it.
-DATE_ANCHORS = {"signed_date": "ให้ไว้", "issued_date": "ราชกิจจานุเบกษา"}
+DATE_ANCHORS = {"signed_date": "ให้ไว้", "issued_date": "ราชกิจจานุเบกษา", "effective_date": "ใช้บังคับ"}
 # The anchor introduces the date it ends at most this many (normalized) characters before, as in "ให้ไว้ ณ วันที่ ๕ มกราคม".
 ANCHOR_REACH = 40
 
@@ -242,10 +242,11 @@ def _auto_acceptable(field, candidate):
 
 
 def _accepted_candidate(field, candidates):
-    """The candidate that may be published without a person, or None. Among conflicting dates, one that alone passes
-    the literal check wins: the others are dates the document mentions for something else, or computed ones."""
+    """The candidate that may be published without a person, or None. Among conflicting dates of a field with an
+    anchor, one that alone passes the anchored check wins: the others are dates the document mentions for something
+    else, or computed ones. Without an anchor nothing tells those apart, so the conflict stays."""
     passing = [c for c in candidates if _auto_acceptable(field, c)]
-    if len(passing) == 1 and (len(candidates) == 1 or field.get("field_type") == "date"):
+    if len(passing) == 1 and (len(candidates) == 1 or (field.get("field_type") == "date" and field["key"] in DATE_ANCHORS)):
         return passing[0]
     return None
 

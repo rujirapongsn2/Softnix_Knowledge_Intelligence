@@ -554,6 +554,21 @@ def test_conflicting_dates_resolve_to_the_one_the_quote_writes_with_its_anchor()
     assert two_written["status"] == "conflict"
 
 
+def test_a_written_date_beside_a_computed_one_stays_a_conflict_without_its_anchor():
+    gazette = "ราชกิจจานุเบกษา 6 มีนาคม 2551"
+    text = gazette + "\n" + COMPUTED
+    result = extract_date("effective_date", text, ("2008-03-06", gazette), ("2008-07-04", COMPUTED))
+    assert result["status"] == "conflict" and len(result["candidates"]) == 2
+    unanchored = extract_date("effective_date_end", text, ("2008-03-06", gazette), ("2008-07-04", COMPUTED))
+    assert unanchored["status"] == "conflict"
+
+
+def test_an_effective_date_written_after_its_anchor_is_accepted():
+    quote = "พระราชบัญญัตินี้ให้ใช้บังคับตั้งแต่วันที่ ๑ ธันวาคม พ.ศ. ๒๕๕๗ เป็นต้นไป"
+    result = extract_date("effective_date", quote, ("2014-12-01", quote))
+    assert result["status"] == "auto_accepted" and result["candidates"][0]["value"] == "2014-12-01"
+
+
 def test_reevaluation_publishes_stored_dates_that_now_pass_and_is_idempotent():
     api = next(client())
     kb, _, doc_id = setup_document(api, [date_field("signed_date"), date_field("effective_date"), field("issuer", required=False)])

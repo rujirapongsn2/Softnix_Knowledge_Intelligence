@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: str = ""
     openrouter_llm_model: str = "anthropic/claude-sonnet-5.5"
+    # Sent as OpenRouter's reasoning.effort; reasoning tokens count against max_tokens, and Sonnet 5.5 at its default
+    # effort spent 5.7k of a 6k budget on one extraction window and returned cut-off JSON. Empty sends nothing.
+    openrouter_reasoning_effort: str = "low"
     # Any OpenAI-compatible POST {base}/embeddings server; empty disables embeddings.
     embedding_base_url: str = ""
     embedding_api_key: str = ""

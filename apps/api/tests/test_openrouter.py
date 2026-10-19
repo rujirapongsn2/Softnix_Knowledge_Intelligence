@@ -159,3 +159,33 @@ def test_openrouter_chat_rejection_is_not_reported_as_outage(monkeypatch):
     except RuntimeError as exc:
         assert str(exc) == "OPENROUTER_REQUEST_REJECTED"
     get_settings.cache_clear()
+
+
+def _chat_bodies(monkeypatch, effort):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    if effort is None:
+        monkeypatch.delenv("OPENROUTER_REASONING_EFFORT", raising=False)
+    else:
+        monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", effort)
+    get_settings.cache_clear()
+    bodies = []
+
+    def handler(request: httpx.Request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"fields": {}}'}}]})
+
+    client = OpenRouterClient(httpx.Client(transport=httpx.MockTransport(handler)))
+    client.extract_document_metadata([{"key": "issuer"}], "text")
+    client.answer_from_sources("q", [{"citation_id": "S1", "title": "t", "excerpt": "e"}])
+    get_settings.cache_clear()
+    return bodies
+
+
+def test_every_chat_call_asks_for_low_reasoning_by_default_so_json_is_not_cut_off(monkeypatch):
+    bodies = _chat_bodies(monkeypatch, None)
+    assert [body.get("reasoning") for body in bodies] == [{"effort": "low"}, {"effort": "low"}]
+    assert bodies[0]["max_tokens"] >= 16000
+
+
+def test_an_empty_reasoning_effort_sends_no_reasoning_field(monkeypatch):
+    assert all("reasoning" not in body for body in _chat_bodies(monkeypatch, ""))

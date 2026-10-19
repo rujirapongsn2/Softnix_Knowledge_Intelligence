@@ -2399,11 +2399,12 @@ def query_feedback(result_id: str, payload: QueryFeedbackCreate, user: User = De
 
 @app.post("/api/v1/system/test-openrouter")
 def test_openrouter(_: User = Depends(current_admin)):
+    embedding = EmbeddingClient().check()
     try:
         llm = OpenRouterClient().check()
     except RuntimeError as exc:
-        raise HTTPException(503, {"code": str(exc), "message": "OpenRouter configuration check failed", "retryable": True})
-    return {**llm, **EmbeddingClient().check()}
+        raise HTTPException(503, {"code": str(exc), "message": "OpenRouter configuration check failed", "retryable": True, **embedding})
+    return {**llm, **embedding}
 
 
 @app.get("/api/v1/system/graph-projection")

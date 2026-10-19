@@ -9,10 +9,11 @@ api, worker และ LightRAG เรียก embedding ผ่าน OpenAI-com
 ```sh
 brew install llama.cpp
 llama-server -hf ggml-org/embeddinggemma-2-GGUF:BF16 --no-mmproj --embeddings \
-  --host 0.0.0.0 --port 8090 -ngl 99 -c 8192 -b 8192 -ub 8192 --parallel 4 --api-key <key>
+  --host 0.0.0.0 --port 8090 -ngl 99 -c 32768 -b 8192 -ub 8192 --parallel 4 --api-key <key>
 ```
 
 - `-b`/`-ub 8192` คือความยาวสูงสุดของ input หนึ่งชิ้น (token) ชิ้นที่ยาวกว่านี้ได้ HTTP 500 และเอกสารจะขึ้น `EMBEDDING_REQUEST_TOO_LARGE`
+- `-c` ถูกแบ่งให้แต่ละ slot เท่าๆ กัน (`-c 32768 --parallel 4` ได้ slot ละ 8192 token) ถ้าใช้ `-c 8192` แต่ละ slot ได้แค่ 2048 token และคำอธิบาย entity ที่ยาวของ LightRAG จะ embed ไม่ผ่าน
 - `--api-key` ไม่บังคับ ถ้าไม่ใส่ ให้ปล่อย `EMBEDDING_API_KEY` ว่าง ถ้าเปิดพอร์ตให้เครื่องอื่นเข้าถึง ควรตั้ง key เสมอ
 
 ทดสอบ:
@@ -44,7 +45,7 @@ curl -s http://127.0.0.1:8090/v1/embeddings -H 'Content-Type: application/json' 
     <string>--host</string><string>0.0.0.0</string>
     <string>--port</string><string>8090</string>
     <string>-ngl</string><string>99</string>
-    <string>-c</string><string>8192</string>
+    <string>-c</string><string>32768</string>
     <string>-b</string><string>8192</string>
     <string>-ub</string><string>8192</string>
     <string>--parallel</string><string>4</string>

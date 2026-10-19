@@ -2696,6 +2696,9 @@ def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
         sync_document_metadata_graph(db, doc)
         db.commit()
         job.current_stage, job.progress_percent = "embedding", 60
+        # Committed before the embedding calls so the job row is not left locked while they run;
+        # otherwise every heartbeat times out and a slow embed looks like a dead worker.
+        db.commit()
         embed_document_chunks(db, doc.id)
         db.commit()
         # A document deleted meanwhile is never sent to the retrieval engine.

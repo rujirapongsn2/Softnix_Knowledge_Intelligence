@@ -12,7 +12,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.embeddings import EmbeddingClient, EmbeddingPurpose, embedding_batches
 from app.main import app
-from app.models import Document, DocumentChunk, KnowledgeBase
+from app.models import Document, DocumentChunk, JobType, KnowledgeBase, ProcessingJob
 from app.openrouter import OpenRouterClient
 
 
@@ -213,3 +213,42 @@ def test_semantic_query_is_embedded_as_query(embedding_env):
     result = services.query_database_vectors(postgres, "ภาษีที่ดิน", [], 5, trace)
     assert calls == [(["ภาษีที่ดิน"], EmbeddingPurpose.QUERY)]
     assert result.sources == [] and trace[-1]["status"] == "unavailable" and trace[-1]["detail"] == "EMBEDDING_UNAVAILABLE"
+
+
+def test_system_check_still_reports_embeddings_when_the_llm_check_fails(embedding_env):
+    def failing_llm_check(_self):
+        raise RuntimeError("OPENROUTER_AUTH_FAILED")
+    embedding_env.setattr(OpenRouterClient, "check", failing_llm_check)
+    embedding_env.setattr(EmbeddingClient, "embed_texts", lambda _self, texts, _purpose: [[0.0] * 3 for _ in texts])
+    with TestClient(app) as client:
+        assert client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-horse-battery-staple"}).status_code == 200
+        response = client.post("/api/v1/system/test-openrouter")
+    assert response.status_code == 503
+    error = response.json()["error"]
+    assert error["code"] == "OPENROUTER_AUTH_FAILED"
+    assert error["embedding_model_available"] is True and error["embedding_host"] == "embed.local:8090"
+
+
+def test_embedding_stage_is_committed_before_the_embedding_calls(embedding_env):
+    seen_stages = []
+
+    def embed_texts(_self, texts, _purpose):
+        with SessionLocal() as other:
+            seen_stages.append(other.get(ProcessingJob, job_id).current_stage)
+        return [[0.5] * 3 for _ in texts]
+    embedding_env.setattr(EmbeddingClient, "embed_texts", embed_texts)
+    embedding_env.setattr(services.LightRAGRetrievalEngine, "enabled", property(lambda _self: False))
+    suffix = uuid.uuid4().hex[:8]
+    with TestClient(app), SessionLocal() as db:
+        kb = KnowledgeBase(code=f"embedding-stage-{suffix}", name=f"Embedding stage {suffix}", status="active", retrieval_config={})
+        db.add(kb); db.flush()
+        document = Document(knowledge_base_id=kb.id, original_filename="stage.txt", stored_filename="stage.txt",
+                            storage_path="/tmp/stage.txt", mime_type="text/plain", file_size=5, checksum_sha256=suffix * 8,
+                            title="Stage", document_type="general", tags=[], status="completed", extracted_text="stage text " * 20)
+        db.add(document); db.flush()
+        job = ProcessingJob(document_id=document.id, knowledge_base_id=kb.id, job_type=JobType.REINDEX_EMBEDDINGS)
+        db.add(job); db.commit()
+        job_id = job.id
+        while services.process_next_job(db) and not seen_stages:
+            pass
+    assert seen_stages and seen_stages[0] == "embedding"

@@ -2,12 +2,13 @@
 import hashlib
 import json
 import re
+from datetime import date
 
 from .document_templates import TEXT_LIST_MAX_ITEMS, metadata_search_text, validate_metadata_values
 from .models import Document, JobType, ProcessingJob
 from .openrouter import OpenRouterClient
 
-EXTRACTOR_VERSION = "1"
+EXTRACTOR_VERSION = "2"
 WINDOW = 12000
 WINDOW_OVERLAP = 1000
 # 240,000 characters. A longer document is read up to here and its fields are marked partial.
@@ -130,8 +131,40 @@ def _evidence(window, start, quote):
     return {"quote": quote, "char_start": offset, "char_end": offset + len(quote)}
 
 
+_THAI_MONTHS = {name: number for number, name in enumerate(
+    ["มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+     "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"], start=1)}
+_THAI_DATE = re.compile(r"(?<!\d)(\d{1,2})\s*(" + "|".join(_THAI_MONTHS) + r")\s*(พ\s*\.?\s*ศ\s*\.?)?\s*(\d{4})(?!\d)")
+_THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+# A date field that names one particular date in a legal text: its quote must carry the phrase that introduces that date,
+# otherwise another date in the same sentence (the gazette date, say) could stand in for it.
+DATE_ANCHORS = {"signed_date": "ให้ไว้", "issued_date": "ราชกิจจานุเบกษา"}
+
+
+def _normalize_thai(text):
+    # PDF text often spells sara am as nikhahit + sara aa.
+    return text.replace("\u0e4d\u0e32", "\u0e33").translate(_THAI_DIGITS)
+
+
+def thai_dates_in(quote):
+    """ISO (Gregorian) dates written as "<day> <Thai month> [พ.ศ.] <year>" in the quote. A year above 2400 is Buddhist Era."""
+    dates = set()
+    for day, month, era, year in _THAI_DATE.findall(_normalize_thai(quote)):
+        year = int(year)
+        if year > 2400:
+            year -= 543
+        elif era:
+            continue
+        try:
+            dates.add(date(year, _THAI_MONTHS[month], int(day)).isoformat())
+        except ValueError:
+            continue
+    return dates
+
+
 def _auto_acceptable(field, candidate):
-    """Only values that are literally their own quote pass without a person. Dates, numbers, booleans and graph facts need review."""
+    """Only values that are literally their own quote pass without a person. A date passes when the quote writes exactly
+    that date (and its anchor phrase); a computed date never does. Numbers, booleans and graph facts need review."""
     if field.get("review_policy", "evidence") != "evidence" or field.get("graph_relationship"):
         return False
     kind, value = field.get("field_type", "text"), candidate["value"]
@@ -139,7 +172,19 @@ def _auto_acceptable(field, candidate):
         return isinstance(value, str) and value in candidate["evidence"]["quote"]
     if kind == "text_list":
         return all(item in evidence["quote"] for item, evidence in zip(value, candidate["item_evidence"]))
+    if kind == "date":
+        quote = candidate["evidence"]["quote"]
+        return value in thai_dates_in(quote) and DATE_ANCHORS.get(field["key"], "") in _normalize_thai(quote)
     return False
+
+
+def _accepted_candidate(field, candidates):
+    """The candidate that may be published without a person, or None. Among conflicting dates, one that alone passes
+    the literal check wins: the others are dates the document mentions for something else, or computed ones."""
+    passing = [c for c in candidates if _auto_acceptable(field, c)]
+    if len(passing) == 1 and (len(candidates) == 1 or field.get("field_type") == "date"):
+        return passing[0]
+    return None
 
 
 def extract_candidates(fields, text, client):
@@ -168,8 +213,9 @@ def extract_candidates(fields, text, client):
         if field.get("field_type") == "text_list" and candidates:
             # The items found are one value; each keeps the quote that backs it.
             candidates = [{"value": [c["value"] for c in candidates], "evidence": candidates[0]["evidence"], "item_evidence": [c["evidence"] for c in candidates]}]
+        accepted = _accepted_candidate(field, candidates) if not truncated and key not in invalid else None
         status = "suggested" if candidates else "not_found"
-        if len(candidates) > 1:
+        if len(candidates) > 1 and not accepted:
             status = "conflict"
         elif key in invalid and not (candidates and field.get("field_type") == "text_list"):
             status = "invalid_evidence"
@@ -177,12 +223,47 @@ def extract_candidates(fields, text, client):
             status = "partial"
         elif key in invalid:
             status = "suggested"
-        elif len(candidates) == 1 and _auto_acceptable(field, candidates[0]):
-            status = "auto_accepted"
+        elif accepted:
+            status, candidates = "auto_accepted", [accepted]
         observations[key] = {"status": status, "origin": "document_extraction", "candidates": candidates,
                              "content_version": digest, "extractor_version": EXTRACTOR_VERSION,
                              "coverage": "partial" if truncated else "full", "locked": False}
     return observations
+
+
+def reevaluate_observations(db, document):
+    """Apply the current date rules to stored date candidates without asking the provider again, and refresh the
+    review status. Other field types' rules are unchanged, so their stored status already says what they would now.
+    The caller holds the KB graph lock and the document row lock. Returns the number of fields published."""
+    from .services import sync_document_metadata_graph, sync_document_metadata_values
+
+    digest = hashlib.sha256((document.extracted_text or "").encode()).hexdigest()
+    values = dict(document.document_metadata or {})
+    observations = dict(document.metadata_observations or {})
+    accepted = 0
+    for field in document.metadata_template_fields or []:
+        observation = observations.get(field["key"], {})
+        if (field.get("fill_mode") != "extract" or field.get("field_type") != "date" or observation.get("locked")
+                or observation.get("origin") != "document_extraction" or observation.get("status") not in {"suggested", "conflict"}
+                or observation.get("coverage") != "full" or observation.get("content_version") != digest
+                or observation.get("template_version", document.metadata_template_version) != document.metadata_template_version):
+            continue
+        candidate = _accepted_candidate(field, observation.get("candidates") or [])
+        if candidate:
+            values[field["key"]] = candidate["value"]
+            observations[field["key"]] = {**observation, "status": "auto_accepted", "candidates": [candidate]}
+            accepted += 1
+    if accepted:
+        document.document_metadata = values
+        document.metadata_observations = observations
+        document.metadata_revision += 1
+        document.metadata_search_text = metadata_search_text(document.metadata_template_fields, values)
+        sync_document_metadata_values(db, document)
+        sync_document_metadata_graph(db, document)
+    # A queued, running or failed extraction owns the status until it finishes.
+    if accepted or document.metadata_status in {"needs_review", "complete"}:
+        update_status(document)
+    return accepted
 
 
 def process_metadata_job(db, job):

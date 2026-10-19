@@ -506,3 +506,80 @@ def test_text_list_values_are_validated_stored_and_searchable():
         db.commit()
         rows = db.query(DocumentMetadataValue).filter_by(document_id=doc_id, field_key="topics").all()
         assert sorted(r.value_text for r in rows) == ["land", "tax"] and {r.value_type for r in rows} == {"text_list"}
+
+
+SIGNED = "ให้ไว้ ณ วันที่ ๑๖ มกราคม พ.ศ. ๒๕๕๘"
+GAZETTE = "เล่ม ๑๓๒ ตอนที่ ๔ ก ราชกิจจานุเบกษา ๒๒ มกราคม ๒๕๕๘"
+COMPUTED = "พระราชบัญญัตินี้ให้ใช้บังคับเมื่อพ้นกำหนดหนึ่งร้อยยี่สิบวันนับแต่วันประกาศ"
+
+
+def date_field(key):
+    return field(key, field_type="date", required=False)
+
+
+def extract_date(key, text, *answers):
+    return extract_candidates([date_field(key)], text, extractor({key: [{"value": value, "evidence_quote": quote} for value, quote in answers]}))[key]
+
+
+@pytest.mark.parametrize("key, quote, value, status", [
+    ("signed_date", SIGNED, "2015-01-16", "auto_accepted"),
+    ("signed_date", GAZETTE, "2015-01-22", "suggested"),
+    ("issued_date", GAZETTE, "2015-01-22", "auto_accepted"),
+    ("effective_date", COMPUTED, "2008-06-05", "suggested"),
+    ("signed_date", "ให้ไว้ ณ วันที่ ๒๐ กันยายน พ.ศ. ๒๕๓๔", "2534-09-20", "suggested"),
+])
+def test_a_date_is_accepted_only_when_its_quote_writes_that_date_and_the_fields_anchor(key, quote, value, status):
+    assert extract_date(key, quote, (value, quote))["status"] == status
+
+
+def test_conflicting_dates_resolve_to_the_one_the_quote_writes_with_its_anchor():
+    text = SIGNED + "\n" + GAZETTE
+    result = extract_date("signed_date", text, ("2015-01-16", SIGNED), ("2015-01-22", GAZETTE))
+    assert result["status"] == "auto_accepted"
+    assert [c["value"] for c in result["candidates"]] == ["2015-01-16"]
+    two_written = extract_date("effective_date", text, ("2015-01-16", SIGNED), ("2015-01-22", GAZETTE))
+    assert two_written["status"] == "conflict"
+
+
+def test_reevaluation_publishes_stored_dates_that_now_pass_and_is_idempotent():
+    api = next(client())
+    kb, _, doc_id = setup_document(api, [date_field("signed_date"), date_field("effective_date"), field("issuer", required=False)])
+    text = SIGNED + "\n" + GAZETTE + "\n" + COMPUTED
+
+    def stored(value, quote):
+        return {"value": value, "evidence": {"quote": quote, "char_start": text.index(quote), "char_end": text.index(quote) + len(quote)}}
+    with SessionLocal() as db:
+        document = db.get(Document, doc_id)
+        document.extracted_text = text
+        base = {"origin": "document_extraction", "content_version": hashlib.sha256(text.encode()).hexdigest(), "extractor_version": "1",
+                "coverage": "full", "locked": False, "template_version": document.metadata_template_version}
+        document.metadata_observations = {
+            "signed_date": {**base, "status": "conflict", "candidates": [stored("2015-01-16", SIGNED), stored("2015-01-22", GAZETTE)]},
+            "effective_date": {**base, "status": "suggested", "candidates": [stored("2008-06-05", COMPUTED)]},
+            "issuer": {**base, "status": "not_found", "candidates": []},
+        }
+        document.metadata_status = "needs_review"
+        revision = document.metadata_revision
+        db.commit()
+    response = api.post(f"/api/v1/knowledge-bases/{kb['id']}/metadata-reevaluate")
+    assert response.status_code == 200 and response.json() == {"documents": 1, "fields": 1}
+    preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
+    assert preview["document_metadata"] == {"signed_date": "2015-01-16"}
+    assert preview["metadata_observations"]["signed_date"]["status"] == "auto_accepted"
+    assert preview["metadata_observations"]["effective_date"]["status"] == "suggested"
+    assert preview["metadata_status"] == "needs_review" and preview["metadata_revision"] == revision + 1
+    with SessionLocal() as db:
+        assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id, field_key="signed_date").count() == 1
+    assert api.post(f"/api/v1/knowledge-bases/{kb['id']}/metadata-reevaluate").json() == {"documents": 0, "fields": 0}
+
+
+def test_reevaluation_marks_a_document_complete_when_only_unfound_optional_fields_remained():
+    api = next(client())
+    kb, _, doc_id = setup_document(api, [field("issuer", required=False)])
+    with SessionLocal() as db:
+        document = db.get(Document, doc_id)
+        document.metadata_observations = {"issuer": {"status": "not_found", "origin": "document_extraction", "coverage": "full", "locked": False, "candidates": []}}
+        document.metadata_status = "needs_review"
+        db.commit()
+    assert api.post(f"/api/v1/knowledge-bases/{kb['id']}/metadata-reevaluate").json() == {"documents": 1, "fields": 0}
+    assert api.get(f"/api/v1/documents/{doc_id}/text").json()["metadata_status"] == "complete"

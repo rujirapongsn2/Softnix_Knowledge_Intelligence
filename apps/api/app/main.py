@@ -27,7 +27,7 @@ from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, cu
 from .data_quality import build_document_quality_report, build_knowledge_base_quality_report
 from .metadata_search import describe_schema
 from .legal_edits import with_manual_edits
-from .metadata_extraction import queue_metadata_extraction, update_status as update_metadata_status
+from .metadata_extraction import queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status
 from .observability import metrics, now
 from .embeddings import EmbeddingClient
 from .openrouter import OpenRouterClient
@@ -1322,6 +1322,25 @@ def extract_custom_metadata(document_id: str, payload: MetadataExtractionRequest
     record_audit(db, "document.metadata.extract", user.id, "document", doc.id, {"queued": queued})
     db.commit()
     return {"queued": queued, "metadata_status": doc.metadata_status}
+
+
+@app.post("/api/v1/knowledge-bases/{kb_id}/metadata-reevaluate")
+def reevaluate_custom_metadata(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
+    # Lock order Knowledge Base -> document: take the KB graph lock before the row locks.
+    lock_knowledge_base_graph(db, kb_id)
+    changed_documents = changed_fields = 0
+    for doc in db.query(Document).filter(Document.knowledge_base_id == kb_id, Document.live()).order_by(Document.id).with_for_update():
+        status = doc.metadata_status
+        fields = reevaluate_observations(db, doc)
+        changed_fields += fields
+        changed_documents += bool(fields or doc.metadata_status != status)
+    record_audit(db, "knowledge_base.metadata.reevaluate", user.id, "knowledge_base", kb_id, {"documents": changed_documents, "fields": changed_fields})
+    db.commit()
+    return {"documents": changed_documents, "fields": changed_fields}
 
 
 @app.post("/api/v1/documents/{document_id}/metadata-review")

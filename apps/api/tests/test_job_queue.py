@@ -68,6 +68,19 @@ def test_claim_respects_follow_up_priority_and_document_exclusivity():
         assert claim_next_job(db).id == blocked_follow_up.id
 
 
+def test_a_claimed_job_leaves_its_queued_stage_behind():
+    with SessionLocal() as db:
+        _isolate_queue(db)
+        doc = _doc(db, _kb(db))
+        job = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type=JobType.PROCESS_DOCUMENT,
+                            current_stage="retry_wait", error_code=WORKER_LOST)
+        db.add(job); db.commit()
+        claimed = claim_next_job(db)
+        assert claimed.id == job.id and claimed.status == "running"
+        # A running job must not show the stage it waited in; the runner's first stage follows.
+        assert claimed.current_stage == "claimed"
+
+
 def test_claim_skips_jobs_not_yet_due():
     with SessionLocal() as db:
         _isolate_queue(db)

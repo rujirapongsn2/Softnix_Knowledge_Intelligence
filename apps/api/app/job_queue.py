@@ -142,7 +142,7 @@ def claim_next_job(db: Session) -> ProcessingJob | None:
             query = query.with_for_update(skip_locked=True, of=ProcessingJob)
         for job in query.all():
             if _scope_is_free(db, job):
-                job.status, job.claim_token = "running", str(uuid.uuid4())
+                job.status, job.current_stage, job.claim_token = "running", "claimed", str(uuid.uuid4())
                 db.commit()
                 return job
         db.rollback()

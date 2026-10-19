@@ -37,7 +37,7 @@ from .openrouter import OpenRouterClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
 from .graph_retirement import drop_document_evidence
-from .job_queue import FOLLOW_UP_JOB_TYPES, ClaimLost, claim_next_graph_event, claim_next_job, job_heartbeat, lock_knowledge_base_graph, own_job
+from .job_queue import ClaimLost, claim_next_graph_event, claim_next_job, job_heartbeat, lock_knowledge_base_graph, own_job
 from .remote_index import HealOutcome, purge_remote_record, resolve_remote_duplicate
 from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, RetrievalEvidence, classify_track_failure, describe_engine_failure
 from .retry_policy import PROCESSING_RETRY_POLICIES, PURGE_RETRYABLE_CODES, PURGE_RETRY, purge_busy_delay, PURGE_MAX_BUSY_DEFERRALS, schedule_retry
@@ -2490,10 +2490,6 @@ def queue_embedding_reindex(db: Session, knowledge_base_id: str, force: bool = F
     return queued
 
 
-# Follow-up stages run before new full pipelines (F4); the claim order lives in job_queue.
-_FOLLOW_UP_JOB_TYPES = FOLLOW_UP_JOB_TYPES
-
-
 def _run_purge_job(db: Session, job: ProcessingJob) -> None:
     """Cascade a platform soft-delete into the remote retrieval index so ghost sources stop occupying LightRAG's content-hash namespace.
 
@@ -2655,7 +2651,7 @@ def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
         db.commit()
         return True
     if job.job_type == JobType.EXTRACT_DOCUMENT_METADATA:
-        process_metadata_job(db, job, claimed=True)
+        process_metadata_job(db, job)
         return True
     reindex_only = job.job_type == JobType.REINDEX_EMBEDDINGS
     legal_only = job.job_type == JobType.EXTRACT_LEGAL_METADATA

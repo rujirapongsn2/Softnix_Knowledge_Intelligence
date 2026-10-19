@@ -181,21 +181,15 @@ def extract_candidates(fields, text, client):
     return observations
 
 
-def process_metadata_job(db, job, claimed: bool = False):
+def process_metadata_job(db, job):
     """Independent retry and compare-and-set publication after slow provider work.
 
-    ``claimed`` is True when the queue already moved the job to running
-    (job_queue.claim_next_job); otherwise the job is claimed here.
+    The job was claimed by job_queue.claim_next_job (running, with a claim token).
     """
     from .job_queue import ClaimLost, lock_knowledge_base_graph
     from .retry_policy import PROCESSING_RETRY_POLICIES, schedule_retry
     from .services import sync_document_metadata_graph, sync_document_metadata_values
 
-    if not claimed:
-        updated = db.query(ProcessingJob).filter_by(id=job.id, status="queued").update({"status": "running"}, synchronize_session=False)
-        if not updated:
-            db.rollback()
-            return
     db.refresh(job)
     document = db.query(Document).filter_by(id=job.document_id).with_for_update().one()
     if not document.is_live:

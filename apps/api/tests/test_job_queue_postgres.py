@@ -177,7 +177,7 @@ def test_metadata_job_and_rebuild_take_locks_in_the_same_order(Session, monkeypa
                 kb_held.wait(5)
                 metadata_waiting.set()
                 db.execute(text("SET lock_timeout = '5s'"))
-                metadata_extraction.process_metadata_job(db, job, claimed=True)
+                metadata_extraction.process_metadata_job(db, job)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -204,7 +204,7 @@ def test_document_row_is_free_while_the_metadata_job_waits_for_the_kb_lock(Sessi
         lock_knowledge_base_graph(holder, kb_id)
         worker = Session()
         job = claim_next_job(worker)
-        thread = threading.Thread(target=metadata_extraction.process_metadata_job, args=(worker, job), kwargs={"claimed": True})
+        thread = threading.Thread(target=metadata_extraction.process_metadata_job, args=(worker, job))
         thread.start()
         time.sleep(0.5)
         with Session() as probe:

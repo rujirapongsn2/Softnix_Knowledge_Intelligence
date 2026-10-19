@@ -8,6 +8,7 @@ from sqlalchemy import inspect
 
 from test_api import client
 from app.db import SessionLocal
+from app.job_queue import claim_next_job
 from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, process_metadata_job, queue_metadata_extraction
 from app.metadata_search import MetadataPredicate, apply_typed_predicates, describe_schema
 from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
@@ -137,13 +138,22 @@ def setup_document(api, fields=None, values=None):
     return kb, template, doc_id
 
 
+def claim(db, job_id):
+    """Claim the job the way the worker does. Other modules' leftover jobs are parked first (one shared database)."""
+    db.query(ProcessingJob).filter(ProcessingJob.status.in_(["queued", "running"]), ProcessingJob.id != job_id).update({"status": "cancelled"}, synchronize_session=False)
+    db.commit()
+    job = claim_next_job(db)
+    assert job is not None and job.id == job_id
+    return job
+
+
 def queue_and_run(doc_id):
     with SessionLocal() as db:
         assert queue_metadata_extraction(db, db.get(Document, doc_id))
         assert not queue_metadata_extraction(db, db.get(Document, doc_id))
         db.commit()
         job = db.query(ProcessingJob).filter_by(document_id=doc_id, job_type="EXTRACT_DOCUMENT_METADATA").order_by(ProcessingJob.created_at.desc()).first()
-        process_metadata_job(db, job)
+        process_metadata_job(db, claim(db, job.id))
 
 
 def test_job_and_review_publish_only_verified_graph(monkeypatch):
@@ -318,7 +328,7 @@ def test_source_change_replaces_auto_value_only_after_success(monkeypatch):
         "issuer": [{"value": "Revenue Department", "evidence_quote": "Issuer: Revenue Department."}],
     })
     with SessionLocal() as db:
-        process_metadata_job(db, db.get(ProcessingJob, job.id))
+        process_metadata_job(db, claim(db, job.id))
         assert db.get(Document, doc_id).document_metadata == {"issuer": "Revenue Department"}
 
 

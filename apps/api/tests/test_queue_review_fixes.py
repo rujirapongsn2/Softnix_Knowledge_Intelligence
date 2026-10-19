@@ -121,6 +121,32 @@ def test_delete_during_indexing_waits_for_the_ingest_then_purges(monkeypatch):
             assert purge.job_type == JobType.PURGE_REMOTE_INDEX and purge.document_id == doc_id
 
 
+def test_delete_during_legal_extraction_writes_no_registry_facts(monkeypatch):
+    with TestClient(app) as client:
+        _login(client)
+        with SessionLocal() as db:
+            doc = _doc(db, _kb(db)); job = _job(db, doc, JobType.EXTRACT_LEGAL_METADATA)
+            doc_id, job_id = doc.id, job.id
+        writes = []
+
+        def parse(_text, _title):
+            # The user deletes the document while the legal header is being read.
+            assert client.delete(f"/api/v1/documents/{doc_id}").status_code < 300
+            return {"instrument": {"version_role": "consolidated"}, "change_events": [], "amendments": [], "provenance": {}}
+
+        monkeypatch.setattr(services, "extract_text", lambda _doc: "body")
+        monkeypatch.setattr(services, "parse_legal_corpus_metadata", parse)
+        for name in ("sync_legal_document_graph", "upsert_legal_instrument", "link_provisions_to_chunks", "resolve_instrument_statuses"):
+            monkeypatch.setattr(services, name, lambda *_a, _name=name, **_k: writes.append(_name))
+        with SessionLocal() as db:
+            assert services.process_next_job(db) is True
+            db.expire_all()
+            job = db.get(ProcessingJob, job_id)
+            assert (job.status, job.error_code) == ("cancelled", "DOCUMENT_DELETED")
+            assert writes == [], "legal registry and graph facts were written for a deleted document"
+            assert db.get(Document, doc_id).legal_metadata is None
+
+
 def test_delete_cancels_queued_jobs_and_releases_a_stale_running_one():
     with TestClient(app) as client:
         _login(client)

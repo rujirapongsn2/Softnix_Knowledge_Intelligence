@@ -1431,11 +1431,12 @@ def soft_delete_document(db: Session, doc: Document) -> ProcessingJob:
     db.query(ProcessingJob).filter(
         ProcessingJob.document_id == doc.id, ProcessingJob.status == "queued",
     ).update({"status": "cancelled", "current_stage": "cancelled", "error_code": "DOCUMENT_DELETED"}, synchronize_session=False)
-    # A running job is left to its worker: it notices the deletion, lets the
-    # retrieval engine finish the ingest in flight and then stops.  The purge
-    # below cannot start before that (one running job per document), so it
-    # removes the finished record instead of racing the ingest.  A running job
-    # whose worker is gone is released right away.
+    # A running job is left to its worker: every job re-reads the document
+    # before it writes results (_abandon_if_deleted, the row-locked checks of
+    # the legal and metadata jobs), lets the retrieval engine finish an ingest
+    # in flight and then stops.  The purge below cannot start before that (one
+    # running job per document), so it removes the finished record instead of
+    # racing the ingest.  A running job whose worker is gone is released right away.
     for running in db.query(ProcessingJob).filter(ProcessingJob.document_id == doc.id, ProcessingJob.status == "running").all():
         if is_stale(running):
             disown(running)

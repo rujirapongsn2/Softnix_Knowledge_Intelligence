@@ -2568,6 +2568,13 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
             extracted = {}
     # Registry and legal-graph writes of one Knowledge Base run one worker at a time.
     lock_knowledge_base_graph(db, doc.knowledge_base_id)
+    # Re-read the document under its row lock: a delete that landed during the
+    # model call must leave no registry or graph facts behind.
+    db.refresh(doc, with_for_update=True)
+    if not doc.is_live:
+        job.status, job.current_stage, job.error_code = "cancelled", "cancelled", "DOCUMENT_DELETED"
+        db.commit()
+        return
     previous = doc.legal_metadata
     if isinstance(extracted, dict):
         extracted["schema_version"] = 2
@@ -2672,7 +2679,7 @@ def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
             text = extract_text(doc)
         if not reindex_only:
             doc.extracted_text = text
-        if not legal_only and _abandon_if_deleted(db, job, doc):
+        if _abandon_if_deleted(db, job, doc):
             return True
         if legal_only:
             _extract_legal_metadata(db, job, doc, text)

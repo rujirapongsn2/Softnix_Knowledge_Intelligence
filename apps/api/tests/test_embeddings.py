@@ -343,3 +343,38 @@ def test_a_reindex_waiting_to_retry_keeps_its_document_searchable(embedding_env)
         job = db.get(ProcessingJob, job_id)
         assert (job.status, job.current_stage, job.error_code) == ("queued", "retry_wait", "EMBEDDING_UNAVAILABLE")
         assert db.get(Document, document_id).status == "completed"
+
+
+@pytest.mark.parametrize("base_url", ["http://[bad/v1", "http://embed.local:port/v1", "http://" + "a" * 300 + ".local/v1"])
+def test_system_status_reports_a_malformed_embedding_url_as_unavailable(embedding_env, base_url):
+    embedding_env.setenv("EMBEDDING_BASE_URL", base_url)
+    get_settings.cache_clear()
+    assert EmbeddingClient().check()["embedding_model_available"] is False
+    with TestClient(app) as client:
+        response = _system_status(client)
+    assert response.status_code == 503
+    assert response.json()["error"]["details"]["embeddings"] == "unavailable"
+
+
+def test_system_status_does_not_wait_long_for_a_silent_embedding_server(embedding_env):
+    import socket
+    import time
+
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        embedding_env.setenv("EMBEDDING_BASE_URL", f"http://127.0.0.1:{server.getsockname()[1]}/v1")
+        get_settings.cache_clear()
+        with TestClient(app) as client:
+            started = time.monotonic()
+            response = _system_status(client)
+            elapsed = time.monotonic() - started
+    assert response.status_code == 503 and response.json()["error"]["details"]["embeddings"] == "unavailable"
+    assert elapsed < 10
+
+
+def test_a_base_url_httpx_cannot_parse_is_a_configuration_fault_not_an_outage(embedding_env):
+    embedding_env.setenv("EMBEDDING_BASE_URL", "http://embed.local:port/v1")
+    get_settings.cache_clear()
+    with pytest.raises(RuntimeError, match="EMBEDDING_NOT_CONFIGURED"):
+        EmbeddingClient().embed_texts(["text"], EmbeddingPurpose.DOCUMENT)

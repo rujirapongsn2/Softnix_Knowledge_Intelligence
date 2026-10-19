@@ -182,7 +182,8 @@ def _probe_dependencies(db: Session) -> tuple[dict, dict]:
         except (httpx.HTTPError, OSError):
             failures["ocr_chain"] = "unavailable"
     if settings.embedding_base_url.strip():
-        if EmbeddingClient().check()["embedding_model_available"]: dependencies["embeddings"] = "ready"
+        # A short timeout of its own: a slow embedding server must not hold up readiness for the client's full 30s.
+        if EmbeddingClient(timeout=3).check()["embedding_model_available"]: dependencies["embeddings"] = "ready"
         else: failures["embeddings"] = "unavailable"
     else:
         dependencies["embeddings"] = "not_configured"

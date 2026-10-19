@@ -71,9 +71,10 @@ def embedding_error_code(exc: Exception) -> str:
 
 
 class EmbeddingClient:
-    def __init__(self, client: httpx.Client | None = None):
+    def __init__(self, client: httpx.Client | None = None, timeout: float = 30):
         self.settings = get_settings()
         self._client = client
+        self._timeout = timeout
         self._prefixes = {EmbeddingPurpose.QUERY: self.settings.embedding_query_prefix,
                           EmbeddingPurpose.DOCUMENT: self.settings.embedding_document_prefix}
 
@@ -87,7 +88,7 @@ class EmbeddingClient:
         if not texts:
             return []
         prefix = self._prefixes[purpose]
-        client = self._client or httpx.Client(timeout=remaining_timeout(30))
+        client = self._client or httpx.Client(timeout=remaining_timeout(self._timeout))
         try:
             vectors: list[list[float]] = []
             for batch in embedding_batches([prefix + text for text in texts]):
@@ -95,6 +96,9 @@ class EmbeddingClient:
             return vectors
         except httpx.HTTPError as exc:
             raise RuntimeError(embedding_error_code(exc)) from exc
+        except (httpx.InvalidURL, ValueError) as exc:
+            # A malformed EMBEDDING_BASE_URL is a configuration fault: retrying the job cannot fix it.
+            raise RuntimeError("EMBEDDING_NOT_CONFIGURED") from exc
         finally:
             if self._client is None:
                 client.close()
@@ -117,10 +121,15 @@ class EmbeddingClient:
 
     def check(self) -> dict[str, Any]:
         """Embed one probe text; never raises, so a missing embedding server does not hide the LLM result."""
+        try:
+            host = urlsplit(self.settings.embedding_base_url.strip()).netloc or None
+        except ValueError:
+            host = None
         report = {"embedding_model": self.settings.embedding_model, "embedding_dimension": self.settings.embedding_dimension,
-                  "embedding_host": urlsplit(self.settings.embedding_base_url.strip()).netloc or None}
+                  "embedding_host": host}
         try:
             self.embed_texts(["ping"], EmbeddingPurpose.QUERY)
-        except RuntimeError as exc:
-            return {**report, "embedding_model_available": False, "embedding_error": str(exc)}
+        except Exception as exc:
+            code = str(exc) if isinstance(exc, RuntimeError) and str(exc).startswith("EMBEDDING_") else "EMBEDDING_UNAVAILABLE"
+            return {**report, "embedding_model_available": False, "embedding_error": code}
         return {**report, "embedding_model_available": True}

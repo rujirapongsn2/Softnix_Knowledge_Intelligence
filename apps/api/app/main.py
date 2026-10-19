@@ -27,8 +27,10 @@ from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, cu
 from .data_quality import build_document_quality_report, build_knowledge_base_quality_report
 from .metadata_search import describe_schema
 from .legal_edits import with_manual_edits
-from .metadata_extraction import queue_metadata_extraction, update_status as update_metadata_status
+from .metadata_extraction import content_digest, field_review_states, queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status, usable_values, with_review_outcome
+from .metadata_quality import metadata_quality_report
 from .observability import metrics, now
+from .embeddings import EmbeddingClient
 from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
@@ -36,6 +38,7 @@ from .retention import prune_observability
 from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
+from .job_queue import lock_knowledge_base_graph, release_if_stale
 from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, apply_answer_reference_contract, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, enrich_sources_with_file_links, entity_graph, process_next_job, public_document_base_url, queue_embedding_reindex, reference_file_available, reference_pdf_available, refresh_saved_answer_citations, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
@@ -141,7 +144,9 @@ def _probe_dependencies(db: Session) -> tuple[dict, dict]:
     """Probe every backend dependency; return (ready, failed) service maps.
 
     A service left unconfigured (empty env) appears in NEITHER map, so callers
-    can tell "down" apart from "not in use". Results are cached for
+    can tell "down" apart from "not in use".  Embeddings are the exception and
+    read "not_configured": an upgrade that never set EMBEDDING_BASE_URL loses
+    vector search silently otherwise.  Results are cached for
     _PROBE_CACHE_TTL_SECONDS to keep the dashboard's auto-refresh cheap.
     """
     now = _time.monotonic()
@@ -176,6 +181,12 @@ def _probe_dependencies(db: Session) -> tuple[dict, dict]:
             dependencies["ocr_chain"] = "ready"
         except (httpx.HTTPError, OSError):
             failures["ocr_chain"] = "unavailable"
+    if settings.embedding_base_url.strip():
+        # A short timeout of its own: a slow embedding server must not hold up readiness for the client's full 30s.
+        if EmbeddingClient(timeout=3).check()["embedding_model_available"]: dependencies["embeddings"] = "ready"
+        else: failures["embeddings"] = "unavailable"
+    else:
+        dependencies["embeddings"] = "not_configured"
     _PROBE_CACHE["result"] = (now, (dependencies, failures))
     return dependencies, failures
 
@@ -964,6 +975,10 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
             "total": len(results), "queued_count": queued_count, "failed_count": failed_count, "results": results}
 
 
+# A failed extraction left fields for a person, so both review filters list it.
+METADATA_STATUS_FILTERS = {"needs_review": ["unverified", "needs_attention", "failed"], "needs_attention": ["needs_attention", "failed"]}
+
+
 @app.get("/api/v1/knowledge-bases/{kb_id}/documents/page", response_model=DocumentPageOut)
 def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, offset: int = 0,
                    search: str | None = None, status: str | None = None, document_type: str | None = None,
@@ -999,7 +1014,7 @@ def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, o
                 raise HTTPException(400, {"code": "DOCUMENT_TEMPLATE_INVALID", "message": "Document type is invalid.", "retryable": False})
             rows = rows.filter(Document.metadata_template_id == template_id)
     if metadata_status:
-        rows = rows.filter(Document.metadata_status.in_(["needs_review", "failed"]) if metadata_status == "needs_review" else Document.metadata_status == metadata_status)
+        rows = rows.filter(Document.metadata_status.in_(METADATA_STATUS_FILTERS.get(metadata_status, [metadata_status])))
     total = rows.count()
     documents = rows.order_by(Document.created_at.desc()).offset(offset).limit(limit).all()
     has_legal_documents = db.query(Document.id).filter(
@@ -1097,7 +1112,8 @@ def document_text(document_id: str, user: User = Depends(current_admin), db: Ses
     return {"document_id": doc.id, "status": doc.status, "document_type": doc.document_type, "metadata_template_id": doc.metadata_template_id,
             "metadata_template_name": doc.metadata_template_name, "metadata_template_version": doc.metadata_template_version,
             "metadata_template_fields": doc.metadata_template_fields or [],
-            "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text, "error_code": doc.error_code, "error_message": doc.error_message, "legal_metadata": doc.legal_metadata,
+            "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text,
+            "metadata_field_states": field_review_states(doc.metadata_template_fields, doc.document_metadata, doc.metadata_observations), "error_code": doc.error_code, "error_message": doc.error_message, "legal_metadata": doc.legal_metadata,
             "quality": build_document_quality_report(db, doc),
             "reference_file": reference_file_view(doc), "reference_pdf": reference_pdf_view(doc)}
 
@@ -1249,6 +1265,9 @@ def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, 
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
+    if payload.values is not None:
+        # Graph writes below: KB graph lock first, before any document row is written.
+        lock_knowledge_base_graph(db, doc.knowledge_base_id)
     if "published_at" in payload.model_fields_set:
         doc.published_at = payload.published_at
     if payload.values is not None:
@@ -1261,16 +1280,25 @@ def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, 
             if not fields and doc.metadata_template_name is None:
                 template = resolve_template(db, doc.knowledge_base_id, doc.metadata_template_id, doc.document_type)
                 fields = template.get("fields") or []
+            previous = doc.document_metadata or {}
             doc.document_metadata = validate_metadata_values(fields, payload.values, allow_extraction_pending=True)
             observations = dict(doc.metadata_observations or {})
             for field in fields:
                 key = field["key"]
-                observations[key] = {**observations.get(key, {}), "status": "human_verified" if key in doc.document_metadata else "not_found_confirmed",
+                # A client may send the whole form back. Only a value a person changed (or one typed without any
+                # observation) is their answer; an untouched AI value keeps its trust and stays open to extraction.
+                unchanged = (key in previous, previous.get(key)) == (key in doc.document_metadata, doc.document_metadata.get(key))
+                if unchanged and (key in observations or key not in doc.document_metadata):
+                    continue
+                observation = observations.get(key, {})
+                if observation.get("status") not in {"human_verified", "not_found_confirmed"}:
+                    observation = with_review_outcome(observation, doc.document_metadata.get(key))
+                observations[key] = {**observation, "status": "human_verified" if key in doc.document_metadata else "not_found_confirmed",
                                      "origin": "manual", "locked": True, "reviewed_by": user.id, "reviewed_at": datetime.utcnow().isoformat()}
             doc.metadata_observations = observations
             doc.metadata_revision += 1
             update_metadata_status(doc)
-            doc.metadata_search_text = metadata_search_text(fields, doc.document_metadata)
+            doc.metadata_search_text = metadata_search_text(fields, usable_values(doc))
             sync_document_metadata_values(db, doc)
             sync_document_metadata_graph(db, doc)
         except ValueError as exc:
@@ -1312,8 +1340,39 @@ def extract_custom_metadata(document_id: str, payload: MetadataExtractionRequest
     return {"queued": queued, "metadata_status": doc.metadata_status}
 
 
+@app.post("/api/v1/knowledge-bases/{kb_id}/metadata-reevaluate")
+def reevaluate_custom_metadata(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
+    # Lock order Knowledge Base -> document: take the KB graph lock before the row locks.
+    lock_knowledge_base_graph(db, kb_id)
+    changed_documents = changed_fields = 0
+    for doc in db.query(Document).filter(Document.knowledge_base_id == kb_id, Document.live()).order_by(Document.id).with_for_update():
+        status = doc.metadata_status
+        fields = reevaluate_observations(db, doc)
+        changed_fields += fields
+        changed_documents += bool(fields or doc.metadata_status != status)
+    record_audit(db, "knowledge_base.metadata.reevaluate", user.id, "knowledge_base", kb_id, {"documents": changed_documents, "fields": changed_fields})
+    db.commit()
+    return {"documents": changed_documents, "fields": changed_fields}
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/metadata-quality")
+def custom_metadata_quality(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
+    return metadata_quality_report(db, kb_id)
+
+
 @app.post("/api/v1/documents/{document_id}/metadata-review")
 def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    # Lock order Knowledge Base -> document: take the KB graph lock before the row lock.
+    kb_id = db.query(Document.knowledge_base_id).filter_by(id=document_id).scalar()
+    lock_knowledge_base_graph(db, kb_id)
     doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
@@ -1334,13 +1393,14 @@ def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, use
             candidates = observation.get("candidates", [])
             if payload.candidate_index >= len(candidates):
                 raise HTTPException(400, "Candidate not found")
-            if observation.get("content_version") != hashlib.sha256((doc.extracted_text or "").encode()).hexdigest():
+            if observation.get("content_version") != content_digest(doc.extracted_text):
                 raise HTTPException(409, "Source changed. Extract metadata again.")
             value = candidates[payload.candidate_index]["value"]
         try:
             values[payload.field_key] = validate_metadata_values([{**field, "required": True}], {payload.field_key: value})[payload.field_key]
         except (ValueError, KeyError):
             raise HTTPException(400, "Invalid metadata value")
+    observation = with_review_outcome(observation, values.get(payload.field_key))
     observation.update(status="not_found_confirmed" if payload.action == "not_found" else "human_verified",
                        locked=True, reviewed_by=user.id, reviewed_at=datetime.utcnow().isoformat())
     if payload.action == "set":
@@ -1348,7 +1408,7 @@ def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, use
     observations[payload.field_key] = observation
     doc.document_metadata, doc.metadata_observations = values, observations
     doc.metadata_revision += 1
-    doc.metadata_search_text = metadata_search_text(doc.metadata_template_fields, values)
+    doc.metadata_search_text = metadata_search_text(doc.metadata_template_fields, usable_values(doc))
     update_metadata_status(doc)
     sync_document_metadata_values(db, doc)
     sync_document_metadata_graph(db, doc)
@@ -1390,6 +1450,16 @@ def reprocess_document(document_id: str, user: User = Depends(current_admin), db
         ProcessingJob.document_id == doc.id,
         ProcessingJob.status.in_(["queued", "running"]),
     ).order_by(ProcessingJob.created_at.desc()).first()
+    if active and release_if_stale(db, active.id) is not None:
+        # The worker running it is gone (crash, restart): the job is handed over the way the
+        # sweep does it, and a re-queued one is dropped since the reprocess starts over.
+        if active.status == "queued":
+            active.status, active.current_stage = "failed", "failed"
+            active.error_message = "Superseded by a reprocess after the worker stopped."
+            if active.job_type == JobType.EXTRACT_DOCUMENT_METADATA:
+                # No extraction is queued now (the reprocess queues one once the text is ready): the values on hand decide.
+                update_metadata_status(doc)
+        active = None
     if active:
         raise HTTPException(409, {
             "code": "DOCUMENT_PROCESSING_IN_PROGRESS",
@@ -1408,9 +1478,16 @@ def soft_delete_document(db: Session, doc: Document) -> ProcessingJob:
     """Hide a document and asynchronously remove its remote retrieval source."""
     doc.deleted_at, doc.status = datetime.utcnow(), "deleted"
     db.query(ProcessingJob).filter(
-        ProcessingJob.document_id == doc.id,
-        ProcessingJob.status.in_(["queued", "running"]),
-    ).update({"status": "cancelled"}, synchronize_session=False)
+        ProcessingJob.document_id == doc.id, ProcessingJob.status == "queued",
+    ).update({"status": "cancelled", "current_stage": "cancelled", "error_code": "DOCUMENT_DELETED"}, synchronize_session=False)
+    # A running job is left to its worker: every job re-reads the document
+    # before it writes results (_abandon_if_deleted, the row-locked checks of
+    # the legal and metadata jobs), lets the retrieval engine finish an ingest
+    # in flight and then stops.  The purge below cannot start before that (one
+    # running job per document), so it removes the finished record instead of
+    # racing the ingest.  A running job whose worker is gone is released right away.
+    for (running_id,) in db.query(ProcessingJob.id).filter(ProcessingJob.document_id == doc.id, ProcessingJob.status == "running").all():
+        release_if_stale(db, running_id)  # the document is deleted, so a released job is cancelled
     # Keep the retrieval index in sync. A failed purge remains retryable as a
     # normal processing job, so a deleted source cannot silently block re-ingest.
     purge = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type=JobType.PURGE_REMOTE_INDEX)
@@ -1772,6 +1849,7 @@ def review_legal_relationship(relationship_id: str, payload: LegalRelationshipRe
         raise HTTPException(404, "Suggested legal relationship not found")
     if relationship.review_status != "suggested":
         raise HTTPException(409, {"code": "LEGAL_RELATIONSHIP_ALREADY_REVIEWED", "message": "This legal suggestion has already been reviewed.", "retryable": False})
+    lock_knowledge_base_graph(db, relationship.knowledge_base_id)
     relationship.review_status = payload.status
     relationship.attributes = {**(relationship.attributes or {}), "review_note": payload.note, "reviewed_by": user.username, "reviewed_at": datetime.utcnow().isoformat()}
     db.add(GraphProjectionEvent(event_type="relationship", relationship_id=relationship.id))
@@ -1901,6 +1979,7 @@ def resolve_legal_registry(kb_id: str, user: User = Depends(current_admin), db: 
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
     assert_kb_access(db, user, kb_id)
+    lock_knowledge_base_graph(db, kb_id)
     result = resolve_instrument_statuses(db, kb_id)
     record_audit(db, "legal_registry.resolve", user.id, "knowledge_base", kb_id, result)
     db.commit()
@@ -1915,10 +1994,13 @@ def sync_knowledge_base_graph(kb_id: str, user: User = Depends(current_admin), d
     totals = {"entities": 0, "relationships": 0}
     documents = db.query(Document).filter_by(knowledge_base_id=kb_id, status="completed").filter(Document.live()).all()
     for document in documents:
+        # Takes the KB graph lock itself after its remote reads, and commits.
         result = sync_lightrag_document_graph(db, document)
         totals["entities"] += result["entities"]
         totals["relationships"] += result["relationships"]
+        lock_knowledge_base_graph(db, kb_id)
         result = sync_legal_document_graph(db, document)
+        db.commit()  # one document at a time, so the lock is not held across the next document's remote reads
         totals["entities"] += result["entities"]
         totals["relationships"] += result["relationships"]
     record_audit(db, "graph.sync", user.id, "knowledge_base", kb_id, {**totals, "documents": len(documents)})
@@ -2372,10 +2454,12 @@ def query_feedback(result_id: str, payload: QueryFeedbackCreate, user: User = De
 
 @app.post("/api/v1/system/test-openrouter")
 def test_openrouter(_: User = Depends(current_admin)):
+    embedding = EmbeddingClient().check()
     try:
-        return OpenRouterClient().check()
+        llm = OpenRouterClient().check()
     except RuntimeError as exc:
-        raise HTTPException(503, {"code": str(exc), "message": "OpenRouter configuration check failed", "retryable": True})
+        raise HTTPException(503, {"code": str(exc), "message": "OpenRouter configuration check failed", "retryable": True, **embedding})
+    return {**llm, **embedding}
 
 
 @app.get("/api/v1/system/graph-projection")
@@ -2575,7 +2659,7 @@ def list_mcp_activity(limit: int = 50, _: User = Depends(current_admin), db: Ses
 
 MCP_TOOLS = [
     {"name": "describe_knowledge_schema", "description": "Discover authorized metadata templates, typed filter operators, and paginated coverage. Unknown metadata does not mean no matching documents.", "inputSchema": {"type": "object", "additionalProperties": False, "properties": {"offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}}},
-    {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning. Returns ski.answer.v1 structuredContent with answer, claims, references, and backward-compatible sources. Each reference includes ski.quality.v1; never use not_queryable evidence and disclose warnings for needs_review evidence.", "inputSchema": QueryRequest.model_json_schema()},
+    {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning. Returns ski.answer.v1 structuredContent with answer, claims, references, and backward-compatible sources. Each reference includes ski.quality.v1; never use not_queryable evidence and disclose warnings for needs_review evidence. Each source's metadata_provenance gives every metadata value a trust: use verified and auto_verified values freely, say so when an answer rests on an unverified value, and never rely on a blocked one.", "inputSchema": QueryRequest.model_json_schema()},
     {"name": "document_inventory_summary", "description": "Count and group non-deleted documents from the scoped document and legal registries", "inputSchema": DocumentInventoryRequest.model_json_schema()},
     {"name": "find_entities", "description": "Find entities by name or alias", "inputSchema": {"type": "object", "properties": {"search_text": {"type": "string"}}, "required": ["search_text"]}},
     {"name": "analyze_relationships", "description": "Analyze entity relationships", "inputSchema": {"type": "object", "properties": {"subjects": {"type": "array"}, "question": {"type": "string"}}, "required": ["subjects", "question"]}},

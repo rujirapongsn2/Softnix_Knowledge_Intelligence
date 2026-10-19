@@ -162,7 +162,9 @@ def _build_document_quality_report(document: Document, context: dict[str, Any], 
     metadata_score = 35 * custom_coverage + 35 * required_coverage
     if document.metadata_status in {"complete", "not_started"}:
         metadata_score += 15
-    elif document.metadata_status == "needs_review":
+    elif document.metadata_status == "unverified":
+        metadata_score += 10
+    elif document.metadata_status == "needs_attention":
         metadata_score += 5
     if is_legal:
         metadata_score += 15 if document.legal_metadata else 0
@@ -213,7 +215,8 @@ def _build_document_quality_report(document: Document, context: dict[str, Any], 
     if empty_pages: warnings.append("empty_ocr_pages")
     if required_coverage < 1: warnings.append("required_metadata_missing")
     elif custom_coverage < 1: warnings.append("metadata_incomplete")
-    if document.metadata_status == "needs_review": warnings.append("metadata_needs_review")
+    if document.metadata_status == "unverified": warnings.append("metadata_unverified")
+    if document.metadata_status == "needs_attention": warnings.append("metadata_needs_attention")
     if conflicts: warnings.append("metadata_evidence_conflict")
     if consistency_conflicts: warnings.append("metadata_consistency_conflict")
     if is_legal and not document.legal_metadata: warnings.append("legal_metadata_missing")

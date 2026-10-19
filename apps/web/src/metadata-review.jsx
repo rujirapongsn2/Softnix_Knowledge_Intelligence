@@ -1,6 +1,9 @@
 import React, {useEffect, useState} from "react";
 import {Button} from "./ui.jsx";
 import {useLanguage} from "./language.jsx";
+import {fieldReview, fieldsByUrgency, waitingFields} from "./metadata-states.mjs";
+
+const display = value => Array.isArray(value) ? value.join(", ") : String(value);
 
 export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFields}) {
   const {t} = useLanguage();
@@ -13,18 +16,9 @@ export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFi
   useEffect(() => { setEditing(null); setDraft({}); setError(""); }, [preview.document_id]);
   const observations = preview.metadata_observations || {};
   const values = preview.document_metadata || {};
-  const needsReview = field => {
-    if (field.fill_mode !== "extract") return false;
-    const observation = observations[field.key] || {};
-    if (observation.locked || observation.status === "not_found_confirmed") return false;
-    // A manually supplied value is already authoritative.  A prior automatic
-    // value stays visible while a changed source is re-extracted, but a new
-    // suggestion/conflict still needs review before it replaces that value.
-    if (values[field.key] !== undefined && observation.origin !== "document_extraction") return false;
-    return values[field.key] === undefined || observation.status !== "auto_accepted";
-  };
-  const reviewFields = fields.filter(needsReview);
-  const visible = all ? fields : reviewFields;
+  const states = preview.metadata_field_states || {};
+  const reviewFields = waitingFields(fields, states);
+  const visible = all ? [...fieldsByUrgency(fields, states), ...fields.filter(field => !(field.key in states))] : reviewFields;
   const running = ["queued", "running"].includes(preview.metadata_status);
   const run = async (endpoint, body) => {
     setBusy(true); setError("");
@@ -47,19 +41,23 @@ export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFi
     {!visible.length && <p>{t(fields.length ? "autoMetadata.nothingToReview" : "documentPreview.metadata.noFields")}</p>}
     {visible.map(field => {
       const observation = observations[field.key] || {};
+      const state = states[field.key];
+      const waiting = state !== undefined && fieldReview(state) !== "complete";
       const status = observation.status || (values[field.key] !== undefined ? "legacy_manual" : "not_started");
-      return <article className="metadata-review-field" key={field.key}>
-        <div className="preview-heading"><strong>{field.label}</strong><span className="metadata-status">{t(`autoMetadata.${status}`)}</span></div>
-        {values[field.key] !== undefined && <p className="metadata-effective-value">{Array.isArray(values[field.key]) ? values[field.key].join(", ") : String(values[field.key])}</p>}
+      return <article className={`metadata-review-field${state ? ` metadata-field-${fieldReview(state)}` : ""}`} key={field.key}>
+        <div className="preview-heading"><strong>{field.label}</strong><span className="metadata-field-marker">{state ? t(`autoMetadata.state.${state}`) : t(`autoMetadata.${status}`)}</span></div>
+        {state && <span className="metadata-status">{t(`autoMetadata.${status}`)}</span>}
+        {values[field.key] !== undefined && <p className="metadata-effective-value">{display(values[field.key])}</p>}
+        {state === "unverified" && values[field.key] !== undefined && <p className="metadata-in-use-help">{t("autoMetadata.inUseHelp")}</p>}
         {(observation.candidates || []).map((candidate, index) => <div className="metadata-candidate" key={index}>
-          <div><span>{Array.isArray(candidate.value) ? candidate.value.join(", ") : String(candidate.value)}</span>{needsReview(field) && <Button label={t("autoMetadata.confirm")} size="sm" variant="secondary" isDisabled={busy || running} onClick={() => review(field, "confirm", {candidate_index: index})}/>}</div>
+          <div><span>{display(candidate.value)}</span>{waiting && <Button label={t("autoMetadata.confirm")} size="sm" variant="secondary" isDisabled={busy || running} onClick={() => review(field, "confirm", {candidate_index: index})}/>}</div>
           {(candidate.item_evidence || [candidate.evidence]).map((evidence, at) => <blockquote key={at}>{evidence.quote}</blockquote>)}
           <details><summary>{t("autoMetadata.sourceContext")}</summary><pre>{preview.text?.slice(Math.max(0, candidate.evidence.char_start - 220), candidate.evidence.char_end + 220)}</pre></details>
         </div>)}
         {editing === field.key ? <form onSubmit={event => { event.preventDefault(); review(field, "set", {value: draft[field.key], revision: draftRevision}); }}>
           <MetadataFields fields={[{...field, required: true}]} values={draft} onChange={setDraft} isDisabled={busy}/>
           <div className="preview-actions"><Button label={t("common.save")} type="submit" size="sm" isDisabled={busy}/><Button label={t("common.cancel")} type="button" size="sm" variant="ghost" onClick={() => setEditing(null)}/></div>
-        </form> : <div className="preview-actions"><Button label={t("common.edit")} size="sm" variant="ghost" isDisabled={busy} onClick={() => { setEditing(field.key); setDraftRevision(preview.metadata_revision); setDraft({[field.key]: values[field.key] ?? observation.candidates?.[0]?.value ?? ""}); }}/>{needsReview(field) && <Button label={t("autoMetadata.notFound")} size="sm" variant="ghost" isDisabled={busy || running} onClick={() => review(field, "not_found")}/>}</div>}
+        </form> : <div className="preview-actions"><Button label={t("common.edit")} size="sm" variant="ghost" isDisabled={busy} onClick={() => { setEditing(field.key); setDraftRevision(preview.metadata_revision); setDraft({[field.key]: values[field.key] ?? observation.candidates?.[0]?.value ?? ""}); }}/>{waiting && <Button label={t("autoMetadata.notFound")} size="sm" variant="ghost" isDisabled={busy || running} onClick={() => review(field, "not_found")}/>}</div>}
       </article>;
     })}
   </section>;

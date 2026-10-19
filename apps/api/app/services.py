@@ -29,16 +29,18 @@ from .legal_corpus import parse_legal_corpus_metadata
 from .document_templates import LIST_FIELD_TYPES, metadata_search_text, normalize_field_definitions
 from .metadata_search import apply_typed_predicates, decorate_sources, metadata_coverage, predicate_coverage
 from .legal_edits import keep_manual_edits
-from .metadata_extraction import process_metadata_job, queue_metadata_extraction
+from .metadata_extraction import process_metadata_job, queue_metadata_extraction, trust_of, usable_values
 from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, JobType, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .data_quality import build_document_quality_reports
+from .embeddings import EmbeddingClient, EmbeddingPurpose
 from .openrouter import OpenRouterClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
 from .graph_retirement import drop_document_evidence
+from .job_queue import ClaimLost, claim_next_graph_event, claim_next_job, job_heartbeat, lock_knowledge_base_graph, own_job
 from .remote_index import HealOutcome, purge_remote_record, resolve_remote_duplicate
 from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, RetrievalEvidence, classify_track_failure, describe_engine_failure
-from .retry_policy import PROCESSING_RETRY_POLICIES, PURGE_RETRYABLE_CODES, PURGE_RETRY, schedule_retry
+from .retry_policy import PROCESSING_RETRY_POLICIES, PURGE_RETRYABLE_CODES, PURGE_RETRY, purge_busy_delay, PURGE_MAX_BUSY_DEFERRALS, schedule_retry
 
 SUPPORTED_EXTENSIONS = {".pdf", ".doc", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".html", ".htm", ".csv", ".json"}
 REFERENCE_FILE_EXTENSIONS = {".pdf", ".doc", ".docx", ".xlsx", ".xls", ".txt"}
@@ -146,7 +148,7 @@ def sync_document_metadata_values(db: Session, document: Document) -> None:
     """Maintain the indexed projection used by exact metadata filters."""
     db.query(DocumentMetadataValue).filter(DocumentMetadataValue.document_id == document.id).delete(synchronize_session=False)
     fields = normalize_field_definitions(document.metadata_template_fields)
-    values = document.document_metadata or {}
+    values = usable_values(document)
     for field in fields:
         key = field.get("key")
         value = values.get(key) if key else None
@@ -178,8 +180,7 @@ def sync_document_metadata_graph(db: Session, document: Document) -> dict[str, i
     fields = normalize_field_definitions(document.metadata_template_fields)
     mapped = [field for field in fields if field.get("graph_relationship") and field.get("graph_entity_type")
               and document.document_metadata.get(field.get("key")) not in (None, "")
-              and (document.metadata_observations or {}).get(field.get("key"), {}).get("status", "legacy_manual")
-              in {"human_verified", "legacy_manual"}]
+              and trust_of((document.metadata_observations or {}).get(field.get("key"))) == "verified"]
     if not mapped:
         return {"entities": 0, "relationships": 0}
     anchor_key = f"metadata:document:{document.id}"
@@ -259,6 +260,8 @@ def sync_lightrag_document_graph(db: Session, document: Document, max_labels: in
     marker = f"softnix-kb={document.knowledge_base_id}__doc={document.id}__"
     graphs: list[dict] = []
     try:
+        # Remote reads happen before the Knowledge Base graph lock is taken:
+        # up to max_labels HTTP calls must not hold up other workers.
         for label in engine.graph_labels()[:max_labels]:
             graph = engine.graph(label, max_depth=1, max_nodes=100)
             if any(marker in str(node.get("properties", {}).get("file_path", "")) for node in graph.get("nodes", [])):
@@ -267,6 +270,9 @@ def sync_lightrag_document_graph(db: Session, document: Document, max_labels: in
         # Graph sync must never mark a successfully indexed document as failed.
         return {"entities": 0, "relationships": 0}
 
+    # Only the local upserts below are serialized per Knowledge Base; the lock
+    # lasts until the commit at the end of this function.
+    lock_knowledge_base_graph(db, document.knowledge_base_id)
     raw_nodes: dict[str, dict] = {}
     raw_edges: dict[str, dict] = {}
     for graph in graphs:
@@ -2452,13 +2458,14 @@ def link_provisions_to_chunks(db: Session, document: Document) -> int:
 
 
 def embed_document_chunks(db: Session, document_id: str) -> None:
+    """Embed the document's chunks; without an embedding endpoint the stage is skipped (vector search is optional)."""
     chunks = db.query(DocumentChunk).filter_by(document_id=document_id).order_by(DocumentChunk.chunk_index).all()
     if not chunks:
         return
-    client = OpenRouterClient()
-    if not client.embeddings_enabled:
+    client = EmbeddingClient()
+    if not client.enabled:
         return
-    vectors = client.embed_texts([chunk.content for chunk in chunks])
+    vectors = client.embed_texts([chunk.content for chunk in chunks], EmbeddingPurpose.DOCUMENT)
     for chunk, vector in zip(chunks, vectors, strict=True):
         chunk.embedding = vector
     db.flush()
@@ -2483,31 +2490,41 @@ def queue_embedding_reindex(db: Session, knowledge_base_id: str, force: bool = F
     return queued
 
 
-# Follow-up stages run after a document is already searchable and are cheap;
-# running them before new full pipelines keeps a legal document's registry
-# extraction from queueing minutes behind freshly uploaded bulk work (F4).
-_FOLLOW_UP_JOB_TYPES = (JobType.EXTRACT_LEGAL_METADATA, JobType.REINDEX_EMBEDDINGS, JobType.EXTRACT_DOCUMENT_METADATA)
-
-
 def _run_purge_job(db: Session, job: ProcessingJob) -> None:
-    """Cascade a platform soft-delete into the remote retrieval index so ghost sources stop occupying LightRAG's content-hash namespace."""
-    job.status, job.current_stage, job.progress_percent, job.attempt_count = "running", "purging_remote_index", 10, job.attempt_count + 1
+    """Cascade a platform soft-delete into the remote retrieval index so ghost sources stop occupying LightRAG's content-hash namespace.
+
+    LightRAG answers "busy" while its pipeline indexes other documents, which
+    can last as long as a long ingest.  A busy answer postpones the purge with
+    its own backoff (deferral_count) and does not use up a failure attempt.
+    """
+    job.status, job.current_stage, job.progress_percent = "running", "purging_remote_index", 10
     db.commit()
     try:
         doc = db.get(Document, job.document_id)
         if not doc:
             raise RuntimeError("DOCUMENT_NOT_FOUND")
         engine = LightRAGRetrievalEngine()
-        if engine.enabled:
+        # A document restored after its deletion owns its remote record again.
+        if engine.enabled and not doc.is_live:
             purge_remote_record(engine, doc)
         job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
+        job.error_code, job.error_message = None, None  # a purge that waited out a busy engine succeeded
+    except ClaimLost:
+        raise
     except Exception as exc:
-        logger.exception("remote index purge failed", extra={"job_id": job.id, "document_id": job.document_id})
+        db.rollback()
+        logger.warning("remote index purge did not complete", exc_info=True, extra={"job_id": job.id, "document_id": job.document_id})
         code = str(exc) if str(exc).startswith("RETRIEVAL_ENGINE_") else "REMOTE_INDEX_PURGE_FAILED"
-        if schedule_retry(job, PURGE_RETRY if code in PURGE_RETRYABLE_CODES else None):
-            job.status, job.error_code, job.error_message = "queued", code, "Remote engine busy or unavailable; purge retry scheduled."
+        if code == "RETRIEVAL_ENGINE_BUSY" and (job.deferral_count or 0) < PURGE_MAX_BUSY_DEFERRALS:
+            job.deferral_count = (job.deferral_count or 0) + 1
+            job.next_attempt_at = datetime.utcnow() + timedelta(seconds=purge_busy_delay(job.deferral_count))
+            job.status, job.current_stage, job.error_code, job.error_message = "queued", "retry_wait", code, "Remote engine busy; purge postponed."
         else:
-            job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "REMOTE_INDEX_PURGE_FAILED", str(exc)[:2000]
+            job.attempt_count += 1
+            if schedule_retry(job, PURGE_RETRY if code in PURGE_RETRYABLE_CODES else None):
+                job.status, job.error_code, job.error_message = "queued", code, "Remote engine busy or unavailable; purge retry scheduled."
+            else:
+                job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "REMOTE_INDEX_PURGE_FAILED", str(exc)[:2000]
     db.commit()
 
 
@@ -2518,9 +2535,13 @@ def _run_legal_graph_rebuild_job(db: Session, job: ProcessingJob) -> None:
     try:
         if not job.knowledge_base_id:
             raise RuntimeError("KNOWLEDGE_BASE_NOT_FOUND")
+        lock_knowledge_base_graph(db, job.knowledge_base_id)
         rebuild_legal_graph(db, job.knowledge_base_id)
         job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
+    except ClaimLost:
+        raise
     except Exception as exc:
+        db.rollback()
         logger.exception("legal graph rebuild failed", extra={"job_id": job.id, "knowledge_base_id": job.knowledge_base_id})
         job.status, job.current_stage, job.error_code, job.error_message = "failed", "failed", "LEGAL_GRAPH_REBUILD_FAILED", str(exc)[:2000]
     db.commit()
@@ -2544,6 +2565,15 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
             # Header/change clauses are sufficient to preserve a traceable
             # legal instrument even when the optional LLM is unavailable.
             extracted = {}
+    # Registry and legal-graph writes of one Knowledge Base run one worker at a time.
+    lock_knowledge_base_graph(db, doc.knowledge_base_id)
+    # Re-read the document under its row lock: a delete that landed during the
+    # model call must leave no registry or graph facts behind.
+    db.refresh(doc, with_for_update=True)
+    if not doc.is_live:
+        job.status, job.current_stage, job.error_code = "cancelled", "cancelled", "DOCUMENT_DELETED"
+        db.commit()
+        return
     previous = doc.legal_metadata
     if isinstance(extracted, dict):
         extracted["schema_version"] = 2
@@ -2600,20 +2630,23 @@ _STANDALONE_JOBS = {JobType.PURGE_REMOTE_INDEX: _run_purge_job, JobType.REBUILD_
 
 
 def process_next_job(db: Session) -> bool:
-    # Cleanup work (remote-index purges) yields to user-facing jobs: a purge
-    # sitting in the queue must not consume a worker slot (or a one-shot
-    # /internal/process-next tick) while real documents wait.
-    job = db.query(ProcessingJob).filter(
-        ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow(),
-        ProcessingJob.job_type.in_(_FOLLOW_UP_JOB_TYPES),
-    ).order_by(ProcessingJob.created_at).first() or db.query(ProcessingJob).filter(
-        ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow(),
-        ProcessingJob.job_type != JobType.PURGE_REMOTE_INDEX,
-    ).order_by(ProcessingJob.created_at).first() or db.query(ProcessingJob).filter(
-        ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow()
-    ).order_by(ProcessingJob.created_at).first()
+    """Claim one runnable job (safe across worker processes) and run it with a heartbeat."""
+    job = claim_next_job(db)
     if not job:
         return False
+    job_id = job.id
+    try:
+        with own_job(db, job), job_heartbeat(db, job.id, token=job.claim_token):
+            _run_claimed_job(db, job)
+    except ClaimLost:
+        # The job was swept as stale or superseded by a reprocess while this
+        # worker ran it: discard everything this worker had not committed.
+        db.rollback()
+        logger.warning("dropped the results of a job this worker no longer owns", extra={"job_id": job_id})
+    return True
+
+
+def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
     # Standalone jobs run before the deleted-document check: a purge exists because its document was deleted.
     runner = _STANDALONE_JOBS.get(job.job_type)
     if runner:
@@ -2645,6 +2678,8 @@ def process_next_job(db: Session) -> bool:
             text = extract_text(doc)
         if not reindex_only:
             doc.extracted_text = text
+        if _abandon_if_deleted(db, job, doc):
+            return True
         if legal_only:
             _extract_legal_metadata(db, job, doc, text)
             return True
@@ -2659,18 +2694,32 @@ def process_next_job(db: Session) -> bool:
         else:
             replace_document_chunks(db, doc, text)
         db.commit()
+        lock_knowledge_base_graph(db, doc.knowledge_base_id)
         sync_document_metadata_values(db, doc)
         sync_document_metadata_graph(db, doc)
         db.commit()
         job.current_stage, job.progress_percent = "embedding", 60
+        # Committed before the embedding calls so the job row is not left locked while they run;
+        # otherwise every heartbeat times out and a slow embed looks like a dead worker.
+        db.commit()
+        if reindex_only and not EmbeddingClient().enabled:
+            raise RuntimeError("EMBEDDING_NOT_CONFIGURED")  # a reindex exists only for the vectors: never complete it empty
         embed_document_chunks(db, doc.id)
         db.commit()
+        # A document deleted meanwhile is never sent to the retrieval engine.
+        if _abandon_if_deleted(db, job, doc):
+            return True
         engine = LightRAGRetrievalEngine()
         if engine.enabled and not reindex_only:
             job.current_stage, job.progress_percent = "indexing", 70
             doc.status = "indexing"
             db.commit()
+            # If the document is deleted during ingest this still waits for the
+            # engine to settle, so the purge that follows finds and removes the
+            # finished record instead of racing the ingest.
             index_in_engine(db, engine, doc, text, job)
+            if _abandon_if_deleted(db, job, doc):
+                return True
             sync_lightrag_document_graph(db, doc)
         if _abandon_if_deleted(db, job, doc):
             return True
@@ -2693,8 +2742,13 @@ def process_next_job(db: Session) -> bool:
         # from — clear the job-level error the same way the document view does
         # (doc-level clear above covers F2's user-visible case).
         job.error_code, job.error_message = None, None
+    except ClaimLost:
+        raise
     except Exception as exc:
-        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
+        # The session may be unusable (failed flush, deadlock victim): start clean
+        # before recording the failure.
+        db.rollback()
+        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_AUTH_FAILED", "OPENROUTER_CREDITS_EXHAUSTED", "OPENROUTER_REQUEST_REJECTED", "EMBEDDING_NOT_CONFIGURED", "EMBEDDING_UNAVAILABLE", "EMBEDDING_AUTH_FAILED", "EMBEDDING_CREDITS_EXHAUSTED", "EMBEDDING_REQUEST_TOO_LARGE", "EMBEDDING_REQUEST_REJECTED", "EMBEDDING_INVALID_RESPONSE", "EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
         logger.exception("document processing failed", extra={"document_id": doc.id, "job_id": job.id, "error_code": code})
         if _abandon_if_deleted(db, job, doc):
             return True
@@ -2706,12 +2760,18 @@ def process_next_job(db: Session) -> bool:
             # the content collides with) so the document view can say why, not just the code.
             message = describe_engine_failure(code, exc.detail if isinstance(exc, RetrievalEngineError) else None, message)
         job.error_code, job.error_message = code, message
+        # Follow-up jobs work on a document that is already searchable; their failure or retry must
+        # not move it out of "completed", which every retrieval channel filters on.
+        follow_up = legal_only or reindex_only
         if schedule_retry(job, PROCESSING_RETRY_POLICIES.get(code)):
             job.status, job.current_stage = "queued", "retry_wait"
-            doc.status, doc.error_code, doc.error_message = "queued", code, "Temporary dependency failure; retry scheduled."
+            if not follow_up:
+                doc.status, doc.error_code, doc.error_message = "queued", code, "Temporary dependency failure; retry scheduled."
         else:
             if legal_only:
                 job.error_message = "Legal metadata extraction failed; the source document remains available."
+            elif reindex_only:
+                job.error_message = f"{message} The document stays searchable without fresh vectors."
             elif code == "OCR_REQUIRED":
                 doc.status, doc.error_code, doc.error_message = "ocr_required", code, "This PDF has no text layer. OCR is required before it can be searched."
             else:
@@ -2737,13 +2797,9 @@ def process_next_graph_projection(db: Session) -> bool:
     store = Neo4jGraphStore()
     if not store.enabled:
         return False
-    event = db.query(GraphProjectionEvent).filter(
-        GraphProjectionEvent.status == "queued", GraphProjectionEvent.next_attempt_at <= datetime.utcnow()
-    ).order_by(GraphProjectionEvent.created_at).first()
+    event = claim_next_graph_event(db)
     if not event:
         return False
-    event.status, event.attempt_count = "running", event.attempt_count + 1
-    db.commit()
     try:
         # A deleted row is projected as a removal so Neo4j never keeps facts PostgreSQL dropped.
         if event.event_type == "entity" and event.entity_id:
@@ -2765,7 +2821,8 @@ def process_next_graph_projection(db: Session) -> bool:
                 else:
                     store.delete_relationship(event.relationship_id)
         event.status, event.completed_at, event.last_error = "completed", datetime.utcnow(), None
-    except (httpx.HTTPError, RuntimeError) as exc:
+    except Exception as exc:
+        db.rollback()
         event.status = "queued"
         event.last_error = str(exc)[:2000]
         event.next_attempt_at = datetime.utcnow() + timedelta(seconds=min(60, 2 ** event.attempt_count))
@@ -3213,15 +3270,15 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
         _append_retrieval_trace(trace, channel="semantic_vector", system="PostgreSQL + pgvector", status="skipped",
                                 started_at=started_at, detail="PostgreSQL is not the active database")
         return RetrievalEvidence([], [], [], [])
-    client = OpenRouterClient()
-    if not client.embeddings_enabled:
+    client = EmbeddingClient()
+    if not client.enabled:
         _append_retrieval_trace(trace, channel="semantic_vector", system="PostgreSQL + pgvector", status="skipped",
                                 started_at=started_at, detail="embedding provider is not configured")
         return RetrievalEvidence([], [], [], [])
     try:
-        query_vector = client.embed_texts([query])[0]
+        query_vector = client.embed_texts([query], EmbeddingPurpose.QUERY)[0]
     except RuntimeError as exc:
-        _append_retrieval_trace(trace, channel="semantic_vector", system="OpenRouter embeddings → PostgreSQL + pgvector",
+        _append_retrieval_trace(trace, channel="semantic_vector", system="Embedding server → PostgreSQL + pgvector",
                                 status="unavailable", started_at=started_at, detail=str(exc))
         return RetrievalEvidence([], [], [], [])
     distance = DocumentChunk.embedding.cosine_distance(query_vector)
@@ -3239,7 +3296,7 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
                 "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": max(0.0, 1.0 - float(item_distance)),
                 "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}
                for i, (chunk, document, item_distance) in enumerate(records, 1)]
-    _append_retrieval_trace(trace, channel="semantic_vector", system="OpenRouter embeddings → PostgreSQL + pgvector",
+    _append_retrieval_trace(trace, channel="semantic_vector", system="Embedding server → PostgreSQL + pgvector",
                             status="used", started_at=started_at, result_count=len(sources), detail="cosine similarity")
     return RetrievalEvidence(sources, [], [], [])
 

@@ -11,7 +11,8 @@ docker compose ps
 ตั้งค่าอย่างน้อย:
 
 - `APP_SECRET_KEY`, `TOKEN_HASH_SECRET`, `INITIAL_ADMIN_PASSWORD` เป็นค่าที่สุ่มใหม่และไม่ commit
-- `OPENROUTER_API_KEY` สำหรับ embedding, extraction และ answer generation
+- `OPENROUTER_API_KEY` สำหรับ extraction, answer generation และ LightRAG graph extraction (โมเดลเริ่มต้น `anthropic/claude-sonnet-5.5`)
+- `EMBEDDING_BASE_URL` (+ `EMBEDDING_API_KEY` ถ้า server ตั้ง key) ชี้ไปที่ embedding server แบบ OpenAI-compatible ดู [deploy/embedding-server](../deploy/embedding-server/README.md)
 - `LIGHTRAG_API_KEY` เป็น credential ภายในของ LightRAG
 - `WEB_PORT` (ค่าเริ่มต้น 8081), `API_PORT` (ค่าเริ่มต้น 8001)
 - `EXT_OCR_KEY` หากต้องการ OCR PDF สแกน
@@ -55,7 +56,7 @@ docker compose ps
 ## การเปลี่ยนแปลงที่มักต้องทำเพิ่ม
 
 - เพิ่ม `MAX_FILE_SIZE_MB` แล้ว rebuild `web` และ `api` เพื่อให้ file picker, proxy และ API ใช้ค่าเดียวกัน (ค่าเริ่มต้น 100 MB)
-- เปลี่ยน embedding model/dimension ต้อง reindex embeddings ทั้ง Knowledge Base อย่างควบคุม (ค่าเริ่มต้น dimension 1536)
+- เปลี่ยน embedding model/dimension (ค่าเริ่มต้น `embeddinggemma-2`, 768 มิติ) ต้องรัน migration ปรับคอลัมน์ vector, reindex embeddings ทุก Knowledge Base และ ingest LightRAG ใหม่ ดูขั้นตอนใน [deploy/embedding-server](../deploy/embedding-server/README.md)
 - เพิ่ม/แก้ `published_at` ได้ตอน upload หรือผ่าน `PATCH /api/v1/documents/{id}/metadata`; ไม่มีการ backfill อัตโนมัติ
 - nginx ฝั่ง web resolve ชื่อ service `api` ซ้ำผ่าน Docker DNS จึงรองรับการ recreate API container โดยไม่ต้อง restart web ตาม
 - migration `0023_token_ingest_scope` ถอน wildcard ของ `allowed_tools` (รายการว่างเคยหมายถึง "ทุก tool") โดยเขียนชื่อ tool ทั้ง 9 ตัวลงในแถวเดิมที่ค่าว่าง สิทธิ์ของ token เก่าจึงเท่าเดิมทุกใบ และ `allowed_scopes` เริ่มต้นเป็นรายการว่าง = ยังไม่มีใบใดเขียนได้ ต้องเปิด "Write access" ให้ใบใหม่เองเมื่อจะใช้ Ingestion API

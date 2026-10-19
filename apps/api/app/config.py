@@ -30,7 +30,11 @@ class Settings(BaseSettings):
     lightrag_base_url: str = ""
     lightrag_api_key: str = ""
     lightrag_timeout_seconds: int = 120
-    lightrag_processing_timeout_seconds: int = 300
+    lightrag_processing_timeout_seconds: int = 900
+    # Queue health: a running job refreshes updated_at every job_heartbeat_seconds; one not refreshed for
+    # job_stale_after_seconds lost its worker and is re-queued by the stale-job sweep.
+    job_heartbeat_seconds: int = 30
+    job_stale_after_seconds: int = 900
     lightrag_workspace_prefix: str = "skip-"
     neo4j_http_url: str = ""
     neo4j_username: str = "neo4j"
@@ -39,9 +43,19 @@ class Settings(BaseSettings):
     neo4j_timeout_seconds: int = 5
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: str = ""
-    openrouter_llm_model: str = "openai/gpt-4o-mini"
-    openrouter_embedding_model: str = "openai/text-embedding-3-small"
-    openrouter_embedding_dimension: int = 1536
+    openrouter_llm_model: str = "anthropic/claude-sonnet-5.5"
+    # Sent as OpenRouter's reasoning.effort; reasoning tokens count against max_tokens, and Sonnet 5.5 at its default
+    # effort spent 5.7k of a 6k budget on one extraction window and returned cut-off JSON. Empty sends nothing.
+    openrouter_reasoning_effort: str = "low"
+    # Any OpenAI-compatible POST {base}/embeddings server; empty disables embeddings.
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""
+    embedding_model: str = "embeddinggemma-2"
+    # Also sizes the pgvector column; see migration 0039 for changing it on an existing database.
+    embedding_dimension: int = 768
+    # embeddinggemma's task prompts; the query and document sides must use matching ones.
+    embedding_query_prefix: str = "task: search result | query: "
+    embedding_document_prefix: str = "title: none | text: "
     openrouter_rerank_model: str = ""
     rerank_candidate_limit: int = 20
     openrouter_app_url: str = ""

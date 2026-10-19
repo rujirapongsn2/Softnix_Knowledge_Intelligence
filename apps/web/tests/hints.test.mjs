@@ -22,20 +22,24 @@ for (const lang of ["en", "th"]) {
     assert.ok(errorGuide(t, "NOT_A_KNOWN_CODE").action);
   });
 
-  test(`${lang}: the review hint names the fields waiting by label`, () => {
-    const document = {metadata_template_fields: [{key: "party", label: "Party"}], metadata_pending_fields: ["party", "other"]};
-    assert.match(metadataReviewTip(t, document).pending, /Party, other/);
+  test(`${lang}: the review hint names the waiting fields by label, most urgent first, and says whether something needs fixing`, () => {
+    const document = {metadata_status: "needs_attention", metadata_template_fields: [{key: "party", label: "Party"}, {key: "other"}, {key: "done", label: "Done"}],
+      metadata_field_states: {party: "unverified", other: "blocked", done: "verified"}};
+    assert.match(metadataReviewTip(t, document).pending, /other, Party$/);
+    assert.equal(metadataReviewTip(t, document).meaning, t("hint.metadata.needs_attention"));
+    assert.equal(metadataReviewTip(t, {...document, metadata_status: "unverified"}).meaning, t("hint.metadata.unverified"));
     assert.equal(metadataReviewTip(t, {}).pending, null);
   });
 
   test(`${lang}: every status filter option has a hint`, () => {
-    for (const value of ["all", "metadata_review", "queued", "extracting", "indexing", "completed", "failed", "ocr_required", "deleted"]) assert.ok(statusFilterTip(t, value).meaning, value);
+    for (const value of ["all", "metadata_review", "metadata_attention", "queued", "extracting", "indexing", "completed", "failed", "ocr_required", "deleted"]) assert.ok(statusFilterTip(t, value).meaning, value);
   });
 
   test(`${lang}: users, services, jobs, legal and review statuses all have a hint`, () => {
     for (const role of ["user", "manager", "admin"]) assert.ok(roleTip(t, role).meaning, role);
     assert.equal(roleTip(t, "guest"), null);
-    assert.ok(userStatusTip(t, true).meaning && userStatusTip(t, false).meaning && serviceTip(t, true).meaning && serviceTip(t, false).meaning);
+    assert.ok(userStatusTip(t, true).meaning && userStatusTip(t, false).meaning && serviceTip(t, "ready").meaning && serviceTip(t, "unavailable").meaning);
+    assert.notEqual(serviceTip(t, "not_configured").meaning, serviceTip(t, "unavailable").meaning, "an unset optional service is not described as down");
     for (const status of ["in_force", "amended", "not_yet_effective", "unknown", "superseded", "repealed", "anything"]) assert.ok(legalStatusTip(t, status).meaning, status);
     for (const status of ["verified", "suggested", "rejected", "unreviewed", undefined]) assert.ok(reviewStatusTip(t, status).meaning, String(status));
   });

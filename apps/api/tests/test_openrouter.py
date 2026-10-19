@@ -2,43 +2,30 @@ import json
 
 import httpx
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.openrouter import OpenRouterClient
 
 
-def test_openrouter_check_uses_bearer_and_reports_models(monkeypatch):
+def test_llm_model_defaults_to_claude_sonnet(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_LLM_MODEL", raising=False)
+    assert Settings(_env_file=None).openrouter_llm_model == "anthropic/claude-sonnet-5.5"
+
+
+def test_openrouter_check_uses_bearer_and_reports_llm_model(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("OPENROUTER_LLM_MODEL", "provider/llm")
-    monkeypatch.setenv("OPENROUTER_EMBEDDING_MODEL", "provider/embed")
     get_settings.cache_clear()
+    paths = []
 
     def handler(request: httpx.Request):
         assert request.headers["Authorization"] == "Bearer test-key"
-        if request.url.path == "/api/v1/models":
-            return httpx.Response(200, json={"data": [{"id": "provider/llm"}]})
-        assert request.url.path == "/api/v1/embeddings/models"
-        return httpx.Response(200, json={"data": [{"id": "provider/embed"}]})
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"data": [{"id": "provider/llm"}]})
 
     client = OpenRouterClient(httpx.Client(transport=httpx.MockTransport(handler)))
     result = client.check()
-    assert result["status"] == "ready"
-    assert result["llm_model_available"] is True
-    assert result["embedding_model_available"] is True
-    get_settings.cache_clear()
-
-
-def test_openrouter_embeddings_are_sorted_and_dimension_checked(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setenv("OPENROUTER_EMBEDDING_DIMENSION", "3")
-    get_settings.cache_clear()
-
-    def handler(request: httpx.Request):
-        assert request.url.path == "/api/v1/embeddings"
-        assert request.headers["Authorization"] == "Bearer test-key"
-        return httpx.Response(200, json={"data": [{"index": 1, "embedding": [4, 5, 6]}, {"index": 0, "embedding": [1, 2, 3]}]})
-
-    client = OpenRouterClient(httpx.Client(transport=httpx.MockTransport(handler)))
-    assert client.embed_texts(["first", "second"]) == [[1, 2, 3], [4, 5, 6]]
+    assert result == {"status": "ready", "llm_model": "provider/llm", "llm_model_available": True}
+    assert paths == ["/api/v1/models"]
     get_settings.cache_clear()
 
 
@@ -121,3 +108,84 @@ def test_openrouter_metadata_extraction_accepts_fenced_json(monkeypatch):
         "Issuer: Land Department",
     )["issuer"][0]["value"] == "Land Department"
     get_settings.cache_clear()
+
+
+def _failing_answer(monkeypatch, status, body):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    get_settings.cache_clear()
+    client = OpenRouterClient(httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(status, json=body))))
+    try:
+        client.answer_from_sources("q", [{"citation_id": "S1", "title": "t", "excerpt": "e"}])
+    except RuntimeError as exc:
+        return str(exc)
+    finally:
+        get_settings.cache_clear()
+    raise AssertionError("expected a failure")
+
+
+def test_openrouter_error_codes_separate_rejected_requests_from_outages(monkeypatch):
+    assert _failing_answer(monkeypatch, 400, {"error": {"message": "bad model"}}) == "OPENROUTER_REQUEST_REJECTED"
+    assert _failing_answer(monkeypatch, 404, {"error": {"message": "no endpoints"}}) == "OPENROUTER_REQUEST_REJECTED"
+    assert _failing_answer(monkeypatch, 401, {"error": {"message": "No auth credentials found"}}) == "OPENROUTER_AUTH_FAILED"
+    assert _failing_answer(monkeypatch, 402, {"error": {"message": "Insufficient credits"}}) == "OPENROUTER_CREDITS_EXHAUSTED"
+    for status in (408, 429, 500, 502, 503):
+        assert _failing_answer(monkeypatch, status, {"error": {"message": "x"}}) == "OPENROUTER_UNAVAILABLE", status
+
+
+def test_openrouter_network_error_stays_unavailable(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request):
+        raise httpx.ConnectError("dns failure", request=request)
+
+    client = OpenRouterClient(httpx.Client(transport=httpx.MockTransport(handler)))
+    try:
+        client.answer_from_sources("q", [{"citation_id": "S1", "title": "t", "excerpt": "e"}])
+        raise AssertionError("expected a failure")
+    except RuntimeError as exc:
+        assert str(exc) == "OPENROUTER_UNAVAILABLE"
+    get_settings.cache_clear()
+
+
+def test_openrouter_chat_rejection_is_not_reported_as_outage(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    get_settings.cache_clear()
+    client = OpenRouterClient(httpx.Client(transport=httpx.MockTransport(
+        lambda _request: httpx.Response(400, json={"error": {"message": "maximum context length exceeded"}}))))
+    try:
+        client.answer_from_sources("q", [{"citation_id": "S1", "title": "t", "excerpt": "e"}])
+        raise AssertionError("expected a failure")
+    except RuntimeError as exc:
+        assert str(exc) == "OPENROUTER_REQUEST_REJECTED"
+    get_settings.cache_clear()
+
+
+def _chat_bodies(monkeypatch, effort):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    if effort is None:
+        monkeypatch.delenv("OPENROUTER_REASONING_EFFORT", raising=False)
+    else:
+        monkeypatch.setenv("OPENROUTER_REASONING_EFFORT", effort)
+    get_settings.cache_clear()
+    bodies = []
+
+    def handler(request: httpx.Request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"fields": {}}'}}]})
+
+    client = OpenRouterClient(httpx.Client(transport=httpx.MockTransport(handler)))
+    client.extract_document_metadata([{"key": "issuer"}], "text")
+    client.answer_from_sources("q", [{"citation_id": "S1", "title": "t", "excerpt": "e"}])
+    get_settings.cache_clear()
+    return bodies
+
+
+def test_every_chat_call_asks_for_low_reasoning_by_default_so_json_is_not_cut_off(monkeypatch):
+    bodies = _chat_bodies(monkeypatch, None)
+    assert [body.get("reasoning") for body in bodies] == [{"effort": "low"}, {"effort": "low"}]
+    assert bodies[0]["max_tokens"] >= 16000
+
+
+def test_an_empty_reasoning_effort_sends_no_reasoning_field(monkeypatch):
+    assert all("reasoning" not in body for body in _chat_bodies(monkeypatch, ""))

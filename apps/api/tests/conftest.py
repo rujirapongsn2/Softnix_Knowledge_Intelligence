@@ -10,5 +10,6 @@ os.environ.update({
     "LIGHTRAG_BASE_URL": "",
     "REDIS_URL": "",
     "OPENROUTER_API_KEY": "",
+    "EMBEDDING_BASE_URL": "",
     "EXT_OCR_KEY": "",
 })

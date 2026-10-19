@@ -8,7 +8,8 @@ from sqlalchemy import inspect
 
 from test_api import client
 from app.db import SessionLocal
-from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, process_metadata_job, queue_metadata_extraction
+from app.job_queue import claim_next_job
+from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, field_review_states, process_metadata_job, queue_metadata_extraction
 from app.metadata_search import MetadataPredicate, apply_typed_predicates, describe_schema
 from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
 from app.openrouter import OpenRouterClient
@@ -90,8 +91,15 @@ def test_fabricated_evidence_conflicts_and_partial_never_auto_accept():
     assert result["issuer"]["status"] == "invalid_evidence"
     result = extract_candidates([field()], text, extractor({"issuer": [{"value": "A", "evidence_quote": text}, {"value": "B", "evidence_quote": text}]}))
     assert result["issuer"]["status"] == "conflict"
-    result = extract_candidates([field()], "A" * (WINDOW * MAX_WINDOWS + 1), extractor({"issuer": [{"value": "A", "evidence_quote": "A"}]}))
+    result = extract_candidates([field()], "A" * (WINDOW * MAX_WINDOWS + WINDOW_OVERLAP + 1), extractor({"issuer": [{"value": "A", "evidence_quote": "A"}]}))
     assert result["issuer"]["status"] == "partial" and result["issuer"]["coverage"] == "partial"
+
+
+def test_a_document_the_last_window_reads_to_its_end_has_full_coverage():
+    # The last window extends past MAX_WINDOWS * WINDOW by the overlap, so a document that fits there was read in full.
+    answer = {"issuer": [{"value": "A", "evidence_quote": "A"}]}
+    result = extract_candidates([field()], "A" * (WINDOW * MAX_WINDOWS + WINDOW_OVERLAP), extractor(answer))
+    assert result["issuer"]["coverage"] == "full" and result["issuer"]["status"] == "auto_accepted"
 
 
 def test_dates_and_boolean_false_are_reviewable_and_invalid_types_rejected():
@@ -130,23 +138,32 @@ def setup_document(api, fields=None, values=None):
     return kb, template, doc_id
 
 
+def claim(db, job_id):
+    """Claim the job the way the worker does. Other modules' leftover jobs are parked first (one shared database)."""
+    db.query(ProcessingJob).filter(ProcessingJob.status.in_(["queued", "running"]), ProcessingJob.id != job_id).update({"status": "cancelled"}, synchronize_session=False)
+    db.commit()
+    job = claim_next_job(db)
+    assert job is not None and job.id == job_id
+    return job
+
+
 def queue_and_run(doc_id):
     with SessionLocal() as db:
         assert queue_metadata_extraction(db, db.get(Document, doc_id))
         assert not queue_metadata_extraction(db, db.get(Document, doc_id))
         db.commit()
         job = db.query(ProcessingJob).filter_by(document_id=doc_id, job_type="EXTRACT_DOCUMENT_METADATA").order_by(ProcessingJob.created_at.desc()).first()
-        process_metadata_job(db, job)
+        process_metadata_job(db, claim(db, job.id))
 
 
-def test_job_and_review_publish_only_verified_graph(monkeypatch):
+def test_an_unverified_graph_field_is_in_use_but_reaches_the_graph_only_once_a_person_confirms_it(monkeypatch):
     api = next(client())
     kb, template, doc_id = setup_document(api, [field(graph_entity_type="Organization", graph_relationship="ISSUED_BY")])
     monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {"issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}]})
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
-    assert preview["status"] == "completed" and preview["metadata_status"] == "needs_review"
-    assert preview["document_metadata"] == {}
+    assert preview["status"] == "completed" and preview["metadata_status"] == "unverified"
+    assert preview["document_metadata"] == {"issuer": "Land Department"} and preview["metadata_field_states"] == {"issuer": "unverified"}
     with SessionLocal() as db:
         assert db.query(Relationship).filter_by(knowledge_base_id=kb["id"]).count() == 0
     review = {"revision": preview["metadata_revision"], "field_key": "issuer", "action": "confirm"}
@@ -156,6 +173,22 @@ def test_job_and_review_publish_only_verified_graph(monkeypatch):
         assert db.query(Relationship).filter_by(knowledge_base_id=kb["id"], review_status="verified").count() == 1
         assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id, value_text="Land Department").count() == 1
         assert not queue_metadata_extraction(db, db.get(Document, doc_id))
+
+
+def test_an_optional_field_not_found_in_a_fully_read_document_leaves_nothing_to_review(monkeypatch):
+    api = next(client())
+    _, _, doc_id = setup_document(api, [field(required=False)])
+    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {"issuer": []})
+    queue_and_run(doc_id)
+    preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
+    assert preview["metadata_observations"]["issuer"]["status"] == "not_found"
+    assert preview["metadata_status"] == "complete" and preview["document_metadata"] == {}
+
+
+@pytest.mark.parametrize("required, coverage, state", [(False, "partial", "unchecked"), (True, "full", "missing")])
+def test_a_field_not_found_still_waits_for_a_person_when_the_read_was_partial_or_the_field_is_required(required, coverage, state):
+    observations = {"issuer": {"status": "not_found", "origin": "document_extraction", "coverage": coverage, "locked": False}}
+    assert field_review_states([field(required=required)], {}, observations) == {"issuer": state}
 
 
 def test_failure_keeps_document_searchable(monkeypatch):
@@ -311,7 +344,7 @@ def test_source_change_replaces_auto_value_only_after_success(monkeypatch):
         "issuer": [{"value": "Revenue Department", "evidence_quote": "Issuer: Revenue Department."}],
     })
     with SessionLocal() as db:
-        process_metadata_job(db, db.get(ProcessingJob, job.id))
+        process_metadata_job(db, claim(db, job.id))
         assert db.get(Document, doc_id).document_metadata == {"issuer": "Revenue Department"}
 
 
@@ -447,12 +480,21 @@ def test_a_text_list_with_one_unusable_item_is_kept_for_review_not_discarded():
     assert observation["status"] == "suggested" and observation["candidates"][0]["value"] == ["land", "tax"]
 
 
+def test_a_text_list_in_a_document_read_only_in_part_is_partial_even_when_an_item_was_unusable():
+    text = "The land tax office. " + ("x" * 11990 + " ") * 21
+    assert len(text) > WINDOW * MAX_WINDOWS
+    answer = ITEMS[:2] + [{"value": "deed", "evidence_quote": "not in the document"}]
+    client, _ = by_window({"topics": [("The land", a) for a in answer]})
+    observation = extract_candidates([field("topics", field_type="text_list")], text, client)["topics"]
+    assert observation["status"] == "partial" and observation["coverage"] == "partial"
+
+
 def test_text_list_values_are_validated_stored_and_searchable():
     from app.document_templates import validate_metadata_values
 
     topics = {"key": "topics", "field_type": "text_list"}
     assert validate_metadata_values([topics], {"topics": ["land", "tax"]}) == {"topics": ["land", "tax"]}
-    for bad in ("land", ["land", "land"], ["land", ""], [1], ["x" * 1001], [f"t{i}" for i in range(51)]):
+    for bad in ("land", ["land", "land"], ["land", ""], [1], [["a"], ["a"]], [{"x": 1}], ["x" * 1001], [f"t{i}" for i in range(51)]):
         with pytest.raises(ValueError):
             validate_metadata_values([topics], {"topics": bad})
     api = next(client())
@@ -464,3 +506,110 @@ def test_text_list_values_are_validated_stored_and_searchable():
         db.commit()
         rows = db.query(DocumentMetadataValue).filter_by(document_id=doc_id, field_key="topics").all()
         assert sorted(r.value_text for r in rows) == ["land", "tax"] and {r.value_type for r in rows} == {"text_list"}
+
+
+SIGNED = "ให้ไว้ ณ วันที่ ๑๖ มกราคม พ.ศ. ๒๕๕๘"
+GAZETTE = "เล่ม ๑๓๒ ตอนที่ ๔ ก ราชกิจจานุเบกษา ๒๒ มกราคม ๒๕๕๘"
+COMPUTED = "พระราชบัญญัตินี้ให้ใช้บังคับเมื่อพ้นกำหนดหนึ่งร้อยยี่สิบวันนับแต่วันประกาศ"
+
+
+def date_field(key):
+    return field(key, field_type="date", required=False)
+
+
+def extract_date(key, text, *answers):
+    return extract_candidates([date_field(key)], text, extractor({key: [{"value": value, "evidence_quote": quote} for value, quote in answers]}))[key]
+
+
+@pytest.mark.parametrize("key, quote, value, status", [
+    ("signed_date", SIGNED, "2015-01-16", "auto_accepted"),
+    ("signed_date", GAZETTE, "2015-01-22", "suggested"),
+    ("issued_date", GAZETTE, "2015-01-22", "auto_accepted"),
+    ("effective_date", COMPUTED, "2008-06-05", "suggested"),
+    ("signed_date", "ให้ไว้ ณ วันที่ ๒๐ กันยายน พ.ศ. ๒๕๓๔", "2534-09-20", "suggested"),
+])
+def test_a_date_is_accepted_only_when_its_quote_writes_that_date_and_the_fields_anchor(key, quote, value, status):
+    assert extract_date(key, quote, (value, quote))["status"] == status
+
+
+SIGNED_THEN_GAZETTE = "ให้ไว้ ณ วันที่ ๕ มกราคม พ.ศ. ๒๕๖๗ เป็นปีที่ ๗๙ ในรัชกาลปัจจุบัน ประกาศในราชกิจจานุเบกษา ๑๐ มกราคม ๒๕๖๗"
+
+
+@pytest.mark.parametrize("key, value, status", [
+    ("signed_date", "2024-01-10", "suggested"),
+    ("signed_date", "2024-01-05", "auto_accepted"),
+    ("issued_date", "2024-01-10", "auto_accepted"),
+    ("issued_date", "2024-01-05", "suggested"),
+])
+def test_a_date_passes_only_when_its_own_anchor_introduces_it(key, value, status):
+    assert extract_date(key, SIGNED_THEN_GAZETTE, (value, SIGNED_THEN_GAZETTE))["status"] == status
+
+
+def test_conflicting_dates_resolve_to_the_one_the_quote_writes_with_its_anchor():
+    text = SIGNED + "\n" + GAZETTE
+    result = extract_date("signed_date", text, ("2015-01-16", SIGNED), ("2015-01-22", GAZETTE))
+    assert result["status"] == "auto_accepted"
+    assert [c["value"] for c in result["candidates"]] == ["2015-01-16"]
+    two_written = extract_date("effective_date", text, ("2015-01-16", SIGNED), ("2015-01-22", GAZETTE))
+    assert two_written["status"] == "conflict"
+
+
+def test_a_written_date_beside_a_computed_one_stays_a_conflict_without_its_anchor():
+    gazette = "ราชกิจจานุเบกษา 6 มีนาคม 2551"
+    text = gazette + "\n" + COMPUTED
+    result = extract_date("effective_date", text, ("2008-03-06", gazette), ("2008-07-04", COMPUTED))
+    assert result["status"] == "conflict" and len(result["candidates"]) == 2
+    unanchored = extract_date("effective_date_end", text, ("2008-03-06", gazette), ("2008-07-04", COMPUTED))
+    assert unanchored["status"] == "conflict"
+
+
+def test_an_effective_date_written_after_its_anchor_is_accepted():
+    quote = "พระราชบัญญัตินี้ให้ใช้บังคับตั้งแต่วันที่ ๑ ธันวาคม พ.ศ. ๒๕๕๗ เป็นต้นไป"
+    result = extract_date("effective_date", quote, ("2014-12-01", quote))
+    assert result["status"] == "auto_accepted" and result["candidates"][0]["value"] == "2014-12-01"
+
+
+def test_reevaluation_publishes_stored_dates_that_now_pass_and_is_idempotent():
+    api = next(client())
+    kb, _, doc_id = setup_document(api, [date_field("signed_date"), date_field("effective_date"), field("issuer", required=False)])
+    text = SIGNED + "\n" + GAZETTE + "\n" + COMPUTED
+
+    def stored(value, quote):
+        return {"value": value, "evidence": {"quote": quote, "char_start": text.index(quote), "char_end": text.index(quote) + len(quote)}}
+    with SessionLocal() as db:
+        document = db.get(Document, doc_id)
+        document.extracted_text = text
+        base = {"origin": "document_extraction", "content_version": hashlib.sha256(text.encode()).hexdigest(), "extractor_version": "1",
+                "coverage": "full", "locked": False, "template_version": document.metadata_template_version}
+        document.metadata_observations = {
+            "signed_date": {**base, "status": "conflict", "candidates": [stored("2015-01-16", SIGNED), stored("2015-01-22", GAZETTE)]},
+            "effective_date": {**base, "status": "suggested", "candidates": [stored("2008-06-05", COMPUTED)]},
+            "issuer": {**base, "status": "not_found", "candidates": []},
+        }
+        document.metadata_status = "needs_review"
+        revision = document.metadata_revision
+        db.commit()
+    response = api.post(f"/api/v1/knowledge-bases/{kb['id']}/metadata-reevaluate")
+    assert response.status_code == 200 and response.json() == {"documents": 1, "fields": 2}
+    preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
+    assert preview["document_metadata"] == {"signed_date": "2015-01-16", "effective_date": "2008-06-05"}
+    assert preview["metadata_observations"]["signed_date"]["status"] == "auto_accepted"
+    assert preview["metadata_observations"]["effective_date"]["status"] == "suggested"
+    assert preview["metadata_field_states"] == {"signed_date": "auto_verified", "effective_date": "unverified", "issuer": "not_found"}
+    assert preview["metadata_status"] == "unverified" and preview["metadata_revision"] == revision + 1
+    with SessionLocal() as db:
+        assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id, field_key="signed_date").count() == 1
+        assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id, field_key="effective_date").one().value_date.isoformat() == "2008-06-05"
+    assert api.post(f"/api/v1/knowledge-bases/{kb['id']}/metadata-reevaluate").json() == {"documents": 0, "fields": 0}
+
+
+def test_reevaluation_marks_a_document_complete_when_only_unfound_optional_fields_remained():
+    api = next(client())
+    kb, _, doc_id = setup_document(api, [field("issuer", required=False)])
+    with SessionLocal() as db:
+        document = db.get(Document, doc_id)
+        document.metadata_observations = {"issuer": {"status": "not_found", "origin": "document_extraction", "coverage": "full", "locked": False, "candidates": []}}
+        document.metadata_status = "needs_review"
+        db.commit()
+    assert api.post(f"/api/v1/knowledge-bases/{kb['id']}/metadata-reevaluate").json() == {"documents": 1, "fields": 0}
+    assert api.get(f"/api/v1/documents/{doc_id}/text").json()["metadata_status"] == "complete"

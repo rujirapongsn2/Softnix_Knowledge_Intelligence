@@ -78,6 +78,8 @@ claude mcp add --transport http softnix-knowledge "https://your-softnix-host/mcp
 
 Agent ต้องไม่ใช้ reference ที่เป็น `not_queryable`; สำหรับ `needs_review` ให้แสดงข้อจำกัดจาก `warnings` และยังต้องอ้างอิงข้อความหลักฐานตามปกติ คะแนนคุณภาพใช้ประกอบการเลือกแหล่งข้อมูล ไม่ใช้แทน relevance ของคำถาม
 
+ค่า metadata ของแต่ละ source มี `metadata_provenance[key].trust`: `verified` (คนตรวจแล้ว) และ `auto_verified` (ตรงกับข้อความที่อ้างในเอกสาร) ใช้ได้ตามปกติ `unverified` คือค่าที่ AI อ่านได้แต่ยังไม่มีคนตรวจ Agent ต้องแจ้งเมื่อคำตอบอาศัยค่านี้ และห้ามใช้ค่า `blocked`
+
 ตัวอย่าง:
 
 ```json

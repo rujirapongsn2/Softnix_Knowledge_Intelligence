@@ -444,3 +444,28 @@
 .hint-card .hint-pending { color: var(--text-color-kumo-subtle, #596675); }
 .hint-card .hint-action { padding-top: .3rem; border-top: 1px solid var(--color-kumo-line, #d8dde3); }
 .hint-card .hint-detail { overflow-wrap: anywhere; color: var(--text-color-kumo-subtle, #596675); font-size: .7rem; }
+.metadata-review-badge-attention {background:#c83c3c14;color:#b03030}
+.metadata-review-badge-attention::before {background:#c83c3c}
+.metadata-review-badge-unverified {background:#ca7a1314;color:#94570a}
+.metadata-review-badge-unverified::before {background:#ca7a13}
+.metadata-field-marker {font-size:.78rem;font-weight:700;overflow-wrap:anywhere}
+.metadata-field-needs_attention {border-left:4px solid #c83c3c}
+.metadata-field-needs_attention .metadata-field-marker {color:#b03030}
+.metadata-field-unverified {border-left:4px solid #ca7a13}
+.metadata-field-unverified .metadata-field-marker {color:#94570a}
+.metadata-field-complete .metadata-field-marker {color:#176b4a}
+.metadata-in-use-help {margin:.25rem 0 0;color:var(--color-text-secondary);font-size:.82rem}
+.metadata-quality {display:grid;gap:1rem}
+.metadata-quality .section-title {gap:1rem;flex-wrap:wrap}
+.metadata-quality-table {border:1px solid var(--color-border);border-radius:14px;overflow:hidden;background:var(--color-background-surface)}
+.metadata-quality-row {display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1.6fr) repeat(5,minmax(0,.8fr));gap:.75rem;align-items:center;padding:.75rem 1rem;border-bottom:1px solid var(--color-border);font-size:.88rem}
+.metadata-quality-row:last-child {border-bottom:0}
+.metadata-quality-row>span {display:grid;gap:.15rem;min-width:0;overflow-wrap:anywhere}
+.metadata-quality-row small {color:var(--color-text-secondary);font-size:.75rem}
+.metadata-quality-head {background:#f7fafb;font-size:.75rem;font-weight:700;color:var(--color-text-secondary)}
+.metadata-quality-alert {color:#b03030;font-weight:750}
+.metadata-quality-next {margin:0}
+.metadata-quality-next h3 {margin:0 0 .25rem}
+.metadata-next-action.metadata-field-needs_attention,.metadata-next-action.metadata-field-unverified {border-left-width:4px}
+.metadata-next-value {max-width:16rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-secondary);font-size:.85rem}
+@media(max-width:700px){.metadata-quality-head{display:none}.metadata-quality-row{grid-template-columns:repeat(2,minmax(0,1fr))}.metadata-quality-row>span[data-label]::before{content:attr(data-label);color:var(--color-text-secondary);font-size:.72rem}.metadata-next-value{max-width:8rem}}

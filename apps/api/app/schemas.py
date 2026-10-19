@@ -148,14 +148,13 @@ class DocumentOut(ORMModel):
     processing_job_type: str | None = None
     processing_job_stage: str | None = None
     processing_job_progress_percent: int | None = None
-    metadata_pending_fields: list[str] = Field(default_factory=list)
+    metadata_field_states: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def list_pending_review_fields(self):
-        from .metadata_extraction import pending_review_keys
+    def list_field_review_states(self):
+        from .metadata_extraction import field_review_states
 
-        if self.metadata_status == "needs_review":
-            self.metadata_pending_fields = pending_review_keys(self.metadata_template_fields, self.document_metadata, self.metadata_observations)
+        self.metadata_field_states = field_review_states(self.metadata_template_fields, self.document_metadata, self.metadata_observations)
         return self
 
 

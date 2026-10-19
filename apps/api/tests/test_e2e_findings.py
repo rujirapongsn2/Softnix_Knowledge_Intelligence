@@ -23,6 +23,7 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 
 import app.services as services  # noqa: E402
+from app.job_queue import FOLLOW_UP_JOB_TYPES  # noqa: E402
 from app.retrieval import LightRAGRetrievalEngine, classify_track_failure  # noqa: E402
 from app.retry_policy import DEFAULT_RETRY, PROCESSING_RETRY_POLICIES  # noqa: E402
 
@@ -305,7 +306,7 @@ def test_follow_up_jobs_take_priority():
 
         picked = db.query(ProcessingJob).filter(
             ProcessingJob.status == "queued",
-            ProcessingJob.job_type.in_(services._FOLLOW_UP_JOB_TYPES),
+            ProcessingJob.job_type.in_(FOLLOW_UP_JOB_TYPES),
         ).order_by(ProcessingJob.created_at).first()
         assert picked is not None
         assert picked.id == later_followup.id  # follow-up wins despite later created_at

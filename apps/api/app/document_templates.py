@@ -165,8 +165,9 @@ def validate_metadata_values(fields: list[dict[str, Any]], values: dict[str, Any
                 raise ValueError("DOCUMENT_METADATA_INVALID") from exc
         if kind == "select" and value not in field.get("options", []):
             raise ValueError("DOCUMENT_METADATA_INVALID")
-        if kind == "text_list" and (not isinstance(value, list) or len(value) > TEXT_LIST_MAX_ITEMS or len(set(value)) != len(value)
-                                    or any(not isinstance(item, str) or not item.strip() or len(item) > TEXT_LIST_ITEM_MAX_CHARS for item in value)):
+        if kind == "text_list" and (not isinstance(value, list) or len(value) > TEXT_LIST_MAX_ITEMS
+                                    or any(not isinstance(item, str) or not item.strip() or len(item) > TEXT_LIST_ITEM_MAX_CHARS for item in value)
+                                    or len(set(value)) != len(value)):
             raise ValueError("DOCUMENT_METADATA_INVALID")
         if kind == "multi_select":
             options = field.get("options", [])

@@ -229,3 +229,12 @@ def test_removing_an_ai_value_from_the_form_rejects_it(monkeypatch):
     observations = api.get(f"/api/v1/documents/{doc_id}/text").json()["metadata_observations"]
     assert (observations["issuer"]["status"], observations["issuer"]["review_outcome"]) == ("not_found_confirmed", "rejected")
     assert observations["office"]["status"] == "suggested"
+
+
+@pytest.mark.parametrize("candidate_index, outcome", [(0, "confirmed"), (1, "corrected")])
+def test_confirming_a_lower_ranked_candidate_corrects_the_top_one(monkeypatch, candidate_index, outcome):
+    api = next(client())
+    _, _, doc_id = setup_document(api)
+    extract(monkeypatch, doc_id, issuer=["Land Dept", "Land Office"])
+    observation = review(api, doc_id, "issuer", "confirm", candidate_index=candidate_index)
+    assert (observation["review_outcome"], observation["ai_value"]) == (outcome, "Land Dept")

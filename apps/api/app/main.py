@@ -1399,7 +1399,7 @@ def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, use
             values[payload.field_key] = validate_metadata_values([{**field, "required": True}], {payload.field_key: value})[payload.field_key]
         except (ValueError, KeyError):
             raise HTTPException(400, "Invalid metadata value")
-    observation = with_review_outcome(observation, values.get(payload.field_key), confirmed=payload.action == "confirm")
+    observation = with_review_outcome(observation, values.get(payload.field_key))
     observation.update(status="not_found_confirmed" if payload.action == "not_found" else "human_verified",
                        locked=True, reviewed_by=user.id, reviewed_at=datetime.utcnow().isoformat())
     if payload.action == "set":

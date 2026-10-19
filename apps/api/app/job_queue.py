@@ -15,7 +15,10 @@ Several worker processes share the ``processing_jobs`` table.
   ``sweep_stale_jobs``.
 
 Lock order: a transaction that writes a Knowledge Base's graph takes
-``lock_knowledge_base_graph`` before it writes any document row.
+``lock_knowledge_base_graph`` before it writes any document row.  A hand-over
+of a running job (sweep, reprocess, delete) goes through ``release_if_stale``,
+which locks the document row before the job row and never waits for either;
+the worker's commit guard waits only for its own job row.
 """
 from __future__ import annotations
 
@@ -242,22 +245,47 @@ def release_stale_job(db: Session, job: ProcessingJob) -> str:
     return "queued"
 
 
+def _lock_row(db: Session, model, row_id: str):
+    """The row locked for update, or None when another transaction holds it (or it is gone)."""
+    return db.query(model).filter_by(id=row_id).populate_existing().with_for_update(skip_locked=True).one_or_none()
+
+
+def release_if_stale(db: Session, job_id: str, now: datetime | None = None) -> str | None:
+    """Hand over a running job whose worker disappeared; None when it is live, held or gone.
+
+    Every hand-over comes through here.  The document row is locked before the
+    job row, and neither lock is waited for: a held row belongs to a live
+    transaction (the worker's own commit, or another hand-over), so the job is
+    left alone this round.  The worker's commit guard waits only for the job
+    row, so no cycle can form between a worker and a hand-over.
+    """
+    db.flush()  # the caller's pending document writes (a delete) take their row lock first
+    document_id = db.query(ProcessingJob.document_id).filter_by(id=job_id).scalar()
+    if document_id and _lock_row(db, Document, document_id) is None and db.query(Document.id).filter_by(id=document_id).scalar():
+        return None
+    job = _lock_row(db, ProcessingJob, job_id)
+    if job is None or not is_stale(job, now):
+        return None
+    return release_stale_job(db, job)
+
+
 def sweep_stale_jobs(db: Session, now: datetime | None = None) -> int:
     """Re-queue running jobs and graph events whose heartbeat stopped. Returns how many were released."""
     if not try_singleton(db, "stale-job-sweep"):
         db.rollback()
         return 0
     cutoff = stale_cutoff(now)
-    query = db.query(ProcessingJob).filter(ProcessingJob.status == "running", ProcessingJob.updated_at < cutoff)
+    stale = db.query(ProcessingJob.id).filter(ProcessingJob.status == "running", ProcessingJob.updated_at < cutoff).all()
     events = db.query(GraphProjectionEvent).filter(GraphProjectionEvent.status == "running", GraphProjectionEvent.updated_at < cutoff)
     if is_postgres(db):
-        query, events = query.with_for_update(skip_locked=True), events.with_for_update(skip_locked=True)
+        events = events.with_for_update(skip_locked=True)
     released = 0
-    for job in query.all():
-        outcome = release_stale_job(db, job)
+    for (job_id,) in stale:
+        outcome = release_if_stale(db, job_id, now)
+        if outcome is None:
+            continue
         released += 1
-        logger.warning("released a stale running job", extra={"job_id": job.id, "job_type": job.job_type,
-                                                               "document_id": job.document_id, "outcome": outcome})
+        logger.warning("released a stale running job", extra={"job_id": job_id, "outcome": outcome})
     for event_row in events.all():
         if event_row.attempt_count >= GRAPH_EVENT_MAX_ATTEMPTS:
             event_row.status, event_row.last_error = "failed", WORKER_LOST

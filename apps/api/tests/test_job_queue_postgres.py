@@ -240,3 +240,43 @@ def test_claim_token_rejects_a_superseded_worker_and_its_heartbeat(Session):
         api.expire_all()
         row = api.get(ProcessingJob, job.id)
         assert row.status == "failed" and row.claim_token is None and row.updated_at < old + timedelta(minutes=1)
+
+
+def test_sweep_never_waits_for_a_document_row_a_live_worker_holds(Session):
+    """Review finding A: the sweep locked the job row and then waited for the document
+    row the worker's transaction already held, while the worker's commit guard waited
+    for the job row: a deadlock, and the loser recorded a spurious failure.
+    """
+    _seed(Session, documents=1, jobs_per_document=1)
+    errors: list[BaseException] = []
+    released: list[int] = []
+    with Session() as worker, Session() as sweeper:
+        job = claim_next_job(worker)
+        sweeper.query(ProcessingJob).filter_by(id=job.id).update({"updated_at": datetime.utcnow() - timedelta(hours=1)}, synchronize_session=False)
+        sweeper.query(Document).filter_by(id=job.document_id).update({"status": "extracting"}, synchronize_session=False)
+        sweeper.commit()
+        with own_job(worker, job):
+            worker.get(Document, job.document_id).status = "indexing"
+            worker.flush()  # the worker's open transaction now holds the document row
+
+            def sweep():
+                try:
+                    released.append(sweep_stale_jobs(sweeper))
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            thread = threading.Thread(target=sweep)
+            thread.start()
+            time.sleep(0.5)
+            try:
+                job.progress_percent = 20
+                worker.commit()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+                worker.rollback()
+            thread.join(timeout=15)
+    assert errors == []
+    assert released == [0], "a job whose worker holds its document row is alive and must be left alone"
+    with Session() as db:
+        row = db.get(ProcessingJob, job.id)
+        assert row.status == "running" and row.claim_token == job.claim_token and row.progress_percent == 20

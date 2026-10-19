@@ -29,7 +29,8 @@ def extraction_fields(document):
 
 
 # Observation status -> (extraction publishes its single candidate, trust of a published value). A value with no
-# observation was typed or imported by a person. "not_found" only carries a value kept from an earlier source version.
+# observation was typed or imported by a person. "not_found" only carries a value kept from an earlier source version;
+# a value beside "not_found_confirmed" was entered by a person after they said the document has none.
 PUBLICATION = {
     "human_verified": (True, "verified"),
     "legacy_manual": (True, "verified"),
@@ -39,7 +40,7 @@ PUBLICATION = {
     "conflict": (False, "blocked"),
     "invalid_evidence": (False, "blocked"),
     "not_found": (False, "unverified"),
-    "not_found_confirmed": (False, None),
+    "not_found_confirmed": (False, "verified"),
 }
 # Field review state -> what it asks of the document: nothing, a check when someone has time, or a person now.
 FIELD_STATES = {"verified": "complete", "auto_verified": "complete", "not_found": "complete",

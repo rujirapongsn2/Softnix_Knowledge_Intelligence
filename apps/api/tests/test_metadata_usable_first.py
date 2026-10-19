@@ -6,7 +6,8 @@ import pytest
 from test_api import client
 from test_auto_metadata import field, queue_and_run, setup_document
 from app.db import SessionLocal
-from app.metadata_extraction import trust_of
+from app.metadata_extraction import FIELD_STATES, PUBLICATION, field_state, trust_of, update_status
+from app.metadata_quality import STATES
 from app.metadata_search import decorate_sources
 from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
 from app.openrouter import OpenRouterClient
@@ -22,7 +23,8 @@ def page(api, kb, metadata_status):
 
 @pytest.mark.parametrize("status, trust", [("human_verified", "verified"), ("legacy_manual", "verified"), (None, "verified"),
                                            ("auto_accepted", "auto_verified"), ("suggested", "unverified"), ("partial", "unverified"),
-                                           ("conflict", "blocked"), ("invalid_evidence", "blocked")])
+                                           ("conflict", "blocked"), ("invalid_evidence", "blocked"),
+                                           ("not_found_confirmed", "verified")])
 def test_each_observation_status_gives_its_value_one_trust(status, trust):
     assert trust_of({"status": status} if status else {}) == trust
 
@@ -238,3 +240,26 @@ def test_confirming_a_lower_ranked_candidate_corrects_the_top_one(monkeypatch, c
     extract(monkeypatch, doc_id, issuer=["Land Dept", "Land Office"])
     observation = review(api, doc_id, "issuer", "confirm", candidate_index=candidate_index)
     assert (observation["review_outcome"], observation["ai_value"]) == (outcome, "Land Dept")
+
+
+def test_every_trust_and_field_state_is_a_review_state():
+    assert {trust for _, trust in PUBLICATION.values()} <= set(FIELD_STATES) and set(STATES) == set(FIELD_STATES)
+    observations = [{}, *({"status": status, "coverage": "full"} for status in PUBLICATION)]
+    for required in (True, False):
+        for values in ({}, {"issuer": "Land Department"}):
+            for observation in observations:
+                assert field_state(field("issuer", required=required), values, observation) in FIELD_STATES
+
+
+def test_a_value_entered_after_confirming_the_field_is_absent_counts_as_verified():
+    api = next(client())
+    kb, _, doc_id = setup_document(api)
+    with SessionLocal() as db:
+        document = db.get(Document, doc_id)
+        document.document_metadata = {"issuer": "Land Department"}
+        document.metadata_observations = {"issuer": {"status": "not_found_confirmed", "origin": "manual", "locked": True}}
+        update_status(document)
+        assert document.metadata_status == "complete"
+        db.commit()
+    response = api.get(f"/api/v1/knowledge-bases/{kb['id']}/metadata-quality")
+    assert response.status_code == 200 and response.json()["fields"][0]["counts"]["verified"] == 1

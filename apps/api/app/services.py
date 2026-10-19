@@ -2761,12 +2761,18 @@ def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
             # the content collides with) so the document view can say why, not just the code.
             message = describe_engine_failure(code, exc.detail if isinstance(exc, RetrievalEngineError) else None, message)
         job.error_code, job.error_message = code, message
+        # Follow-up jobs work on a document that is already searchable; their failure or retry must
+        # not move it out of "completed", which every retrieval channel filters on.
+        follow_up = legal_only or reindex_only
         if schedule_retry(job, PROCESSING_RETRY_POLICIES.get(code)):
             job.status, job.current_stage = "queued", "retry_wait"
-            doc.status, doc.error_code, doc.error_message = "queued", code, "Temporary dependency failure; retry scheduled."
+            if not follow_up:
+                doc.status, doc.error_code, doc.error_message = "queued", code, "Temporary dependency failure; retry scheduled."
         else:
             if legal_only:
                 job.error_message = "Legal metadata extraction failed; the source document remains available."
+            elif reindex_only:
+                job.error_message = f"{message} The document stays searchable without fresh vectors."
             elif code == "OCR_REQUIRED":
                 doc.status, doc.error_code, doc.error_message = "ocr_required", code, "This PDF has no text layer. OCR is required before it can be searched."
             else:

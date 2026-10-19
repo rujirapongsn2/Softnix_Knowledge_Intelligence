@@ -284,7 +284,8 @@ def test_a_reindex_without_an_embedding_endpoint_fails_instead_of_completing(emb
         document_id, job_id = document.id, job.id
         job = _run_until_settled(db, job_id)
         assert (job.status, job.error_code) == ("failed", "EMBEDDING_NOT_CONFIGURED")
-        assert db.get(Document, document_id).error_code == "EMBEDDING_NOT_CONFIGURED"
+        db.expire_all()
+        assert (db.get(Document, document_id).status, db.get(Document, document_id).error_code) == ("completed", None)
         assert not any(chunk.embedding for chunk in db.query(DocumentChunk).filter_by(document_id=document_id))
 
 
@@ -324,3 +325,21 @@ def test_system_status_probes_a_configured_embedding_endpoint(embedding_env):
         response = _system_status(client)
     assert response.status_code == 503
     assert response.json()["error"]["details"]["embeddings"] == "unavailable"
+
+
+def test_a_reindex_waiting_to_retry_keeps_its_document_searchable(embedding_env):
+    def unavailable(_self, _texts, _purpose):
+        raise RuntimeError("EMBEDDING_UNAVAILABLE")
+    embedding_env.setattr(EmbeddingClient, "embed_texts", unavailable)
+    embedding_env.setattr(services.LightRAGRetrievalEngine, "enabled", property(lambda _self: False))
+    with TestClient(app), SessionLocal() as db:
+        document = _completed_document(db, uuid.uuid4().hex[:8])
+        job = ProcessingJob(document_id=document.id, knowledge_base_id=document.knowledge_base_id, job_type=JobType.REINDEX_EMBEDDINGS)
+        db.add(job); db.commit()
+        document_id, job_id = document.id, job.id
+        while db.get(ProcessingJob, job_id).attempt_count == 0:
+            assert services.process_next_job(db), "the reindex was never claimed"
+            db.expire_all()
+        job = db.get(ProcessingJob, job_id)
+        assert (job.status, job.current_stage, job.error_code) == ("queued", "retry_wait", "EMBEDDING_UNAVAILABLE")
+        assert db.get(Document, document_id).status == "completed"

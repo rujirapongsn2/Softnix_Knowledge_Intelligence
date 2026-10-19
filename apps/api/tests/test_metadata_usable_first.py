@@ -8,7 +8,7 @@ from test_auto_metadata import field, queue_and_run, setup_document
 from app.db import SessionLocal
 from app.metadata_extraction import trust_of
 from app.metadata_search import decorate_sources
-from app.models import Document, DocumentMetadataValue, ProcessingJob
+from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
 from app.openrouter import OpenRouterClient
 
 
@@ -201,3 +201,31 @@ def test_saving_the_whole_form_records_an_outcome_only_for_fields_not_reviewed_b
     assert (observations["issuer"]["review_outcome"], observations["issuer"]["ai_value"]) == ("corrected", "Land Dept")
     assert observations["office"]["review_outcome"] == "confirmed"
 
+
+
+def test_saving_the_form_marks_only_the_changed_field_as_reviewed(monkeypatch):
+    api = next(client())
+    kb, _, doc_id = setup_document(api, [field("issuer", graph_entity_type="Organization", graph_relationship="ISSUED_BY"),
+                                         field("office", graph_entity_type="Office", graph_relationship="FILED_AT")])
+    extract(monkeypatch, doc_id, issuer=["Land Dept"], office=["Land Office"])
+    response = api.patch(f"/api/v1/documents/{doc_id}/metadata", json={"values": {"issuer": "Land Department", "office": "Land Office"}})
+    assert response.status_code == 200, response.text
+    preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
+    issuer, office = preview["metadata_observations"]["issuer"], preview["metadata_observations"]["office"]
+    assert (issuer["status"], issuer["review_outcome"], issuer["locked"]) == ("human_verified", "corrected", True)
+    assert office["status"] == "suggested" and "review_outcome" not in office and not office["locked"]
+    assert preview["metadata_field_states"] == {"issuer": "verified", "office": "unverified"}
+    with SessionLocal() as db:
+        assert {r.relationship_type for r in db.query(Relationship).filter_by(knowledge_base_id=kb["id"], origin="metadata")} == {"ISSUED_BY"}
+    office_quality = next(f for f in api.get(f"/api/v1/knowledge-bases/{kb['id']}/metadata-quality").json()["fields"] if f["field_key"] == "office")
+    assert office_quality["outcomes"] == {"confirmed": 0, "corrected": 0, "rejected": 0} and office_quality["ai_accuracy"] is None
+
+
+def test_removing_an_ai_value_from_the_form_rejects_it(monkeypatch):
+    api = next(client())
+    _, _, doc_id = setup_document(api, [field("issuer"), field("office")])
+    extract(monkeypatch, doc_id, issuer=["Land Dept"], office=["Land Office"])
+    assert api.patch(f"/api/v1/documents/{doc_id}/metadata", json={"values": {"office": "Land Office"}}).status_code == 200
+    observations = api.get(f"/api/v1/documents/{doc_id}/text").json()["metadata_observations"]
+    assert (observations["issuer"]["status"], observations["issuer"]["review_outcome"]) == ("not_found_confirmed", "rejected")
+    assert observations["office"]["status"] == "suggested"

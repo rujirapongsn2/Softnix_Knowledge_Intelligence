@@ -1279,10 +1279,16 @@ def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, 
             if not fields and doc.metadata_template_name is None:
                 template = resolve_template(db, doc.knowledge_base_id, doc.metadata_template_id, doc.document_type)
                 fields = template.get("fields") or []
+            previous = doc.document_metadata or {}
             doc.document_metadata = validate_metadata_values(fields, payload.values, allow_extraction_pending=True)
             observations = dict(doc.metadata_observations or {})
             for field in fields:
                 key = field["key"]
+                # A client may send the whole form back. Only a value a person changed (or one typed without any
+                # observation) is their answer; an untouched AI value keeps its trust and stays open to extraction.
+                unchanged = (key in previous, previous.get(key)) == (key in doc.document_metadata, doc.document_metadata.get(key))
+                if unchanged and (key in observations or key not in doc.document_metadata):
+                    continue
                 observation = observations.get(key, {})
                 if observation.get("status") not in {"human_verified", "not_found_confirmed"}:
                     observation = with_review_outcome(observation, doc.document_metadata.get(key))

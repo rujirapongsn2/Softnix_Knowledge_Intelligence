@@ -35,7 +35,8 @@ for (const lang of ["en", "th"]) {
   test(`${lang}: users, services, jobs, legal and review statuses all have a hint`, () => {
     for (const role of ["user", "manager", "admin"]) assert.ok(roleTip(t, role).meaning, role);
     assert.equal(roleTip(t, "guest"), null);
-    assert.ok(userStatusTip(t, true).meaning && userStatusTip(t, false).meaning && serviceTip(t, true).meaning && serviceTip(t, false).meaning);
+    assert.ok(userStatusTip(t, true).meaning && userStatusTip(t, false).meaning && serviceTip(t, "ready").meaning && serviceTip(t, "unavailable").meaning);
+    assert.notEqual(serviceTip(t, "not_configured").meaning, serviceTip(t, "unavailable").meaning, "an unset optional service is not described as down");
     for (const status of ["in_force", "amended", "not_yet_effective", "unknown", "superseded", "repealed", "anything"]) assert.ok(legalStatusTip(t, status).meaning, status);
     for (const status of ["verified", "suggested", "rejected", "unreviewed", undefined]) assert.ok(reviewStatusTip(t, status).meaning, String(status));
   });

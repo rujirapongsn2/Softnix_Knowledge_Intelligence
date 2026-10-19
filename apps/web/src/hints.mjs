@@ -48,7 +48,7 @@ export const roleTip = (t, role) => oneOf(["user", "manager", "admin"], role) &&
 
 export const userStatusTip = (t, isActive) => ({meaning: t(isActive ? "hint.userStatus.active" : "hint.userStatus.inactive")});
 
-export const serviceTip = (t, isReady) => ({meaning: t(isReady ? "hint.service.up" : "hint.service.down")});
+export const serviceTip = (t, state) => ({meaning: t(state === "ready" ? "hint.service.up" : state === "not_configured" ? "hint.service.notConfigured" : "hint.service.down")});
 
 export const jobTip = (t, job) => {
   if (!oneOf(["queued", "running", "completed", "failed", "cancelled"], job.status)) return null;

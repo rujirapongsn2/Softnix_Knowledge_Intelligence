@@ -7,7 +7,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import services
+from app import main as main_module, services
 from app.config import get_settings
 from app.db import SessionLocal
 from app.embeddings import EmbeddingClient, EmbeddingPurpose, embedding_batches
@@ -252,3 +252,75 @@ def test_embedding_stage_is_committed_before_the_embedding_calls(embedding_env):
         while services.process_next_job(db) and not seen_stages:
             pass
     assert seen_stages and seen_stages[0] == "embedding"
+
+
+def _completed_document(db, suffix):
+    kb = KnowledgeBase(code=f"embedding-reindex-{suffix}", name=f"Embedding reindex {suffix}", status="active", retrieval_config={})
+    db.add(kb); db.flush()
+    document = Document(knowledge_base_id=kb.id, original_filename="reindex.txt", stored_filename="reindex.txt",
+                        storage_path="/tmp/reindex.txt", mime_type="text/plain", file_size=5, checksum_sha256=suffix * 8,
+                        title="Reindex", document_type="general", tags=[], status="completed", extracted_text="reindex text " * 20)
+    db.add(document); db.flush()
+    return document
+
+
+def _run_until_settled(db, job_id):
+    for _ in range(100):
+        db.expire_all()
+        if db.get(ProcessingJob, job_id).status not in ("queued", "running"):
+            return db.get(ProcessingJob, job_id)
+        assert services.process_next_job(db), "the job is still queued but nothing is claimable"
+    pytest.fail("the job never settled")
+
+
+def test_a_reindex_without_an_embedding_endpoint_fails_instead_of_completing(embedding_env):
+    embedding_env.setenv("EMBEDDING_BASE_URL", "")
+    get_settings.cache_clear()
+    embedding_env.setattr(services.LightRAGRetrievalEngine, "enabled", property(lambda _self: False))
+    with TestClient(app), SessionLocal() as db:
+        document = _completed_document(db, uuid.uuid4().hex[:8])
+        job = ProcessingJob(document_id=document.id, knowledge_base_id=document.knowledge_base_id, job_type=JobType.REINDEX_EMBEDDINGS)
+        db.add(job); db.commit()
+        document_id, job_id = document.id, job.id
+        job = _run_until_settled(db, job_id)
+        assert (job.status, job.error_code) == ("failed", "EMBEDDING_NOT_CONFIGURED")
+        assert db.get(Document, document_id).error_code == "EMBEDDING_NOT_CONFIGURED"
+        assert not any(chunk.embedding for chunk in db.query(DocumentChunk).filter_by(document_id=document_id))
+
+
+def test_the_pipeline_still_skips_embeddings_when_no_endpoint_is_set(embedding_env):
+    embedding_env.setenv("EMBEDDING_BASE_URL", "")
+    get_settings.cache_clear()
+    embedding_env.setattr(EmbeddingClient, "embed_texts", lambda *_: pytest.fail("no embedding call expected"))
+    with TestClient(app), SessionLocal() as db:
+        services.embed_document_chunks(db, _completed_document(db, uuid.uuid4().hex[:8]).id)
+        db.rollback()
+
+
+def _system_status(client):
+    main_module._PROBE_CACHE.clear()
+    assert client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-horse-battery-staple"}).status_code == 200
+    return client.get("/api/v1/system/status")
+
+
+def test_system_status_reports_unconfigured_embeddings_without_degrading(embedding_env):
+    embedding_env.setenv("EMBEDDING_BASE_URL", "")
+    get_settings.cache_clear()
+    with TestClient(app) as client:
+        response = _system_status(client)
+    assert response.status_code == 200
+    assert response.json()["dependencies"]["embeddings"] == "not_configured"
+
+
+def test_system_status_probes_a_configured_embedding_endpoint(embedding_env):
+    embedding_env.setattr(EmbeddingClient, "embed_texts", lambda _self, texts, _purpose: [[0.0] * 3 for _ in texts])
+    with TestClient(app) as client:
+        response = _system_status(client)
+        assert response.status_code == 200 and response.json()["dependencies"]["embeddings"] == "ready"
+
+        def down(_self, _texts, _purpose):
+            raise RuntimeError("EMBEDDING_UNAVAILABLE")
+        embedding_env.setattr(EmbeddingClient, "embed_texts", down)
+        response = _system_status(client)
+    assert response.status_code == 503
+    assert response.json()["error"]["details"]["embeddings"] == "unavailable"

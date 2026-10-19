@@ -143,7 +143,9 @@ def _probe_dependencies(db: Session) -> tuple[dict, dict]:
     """Probe every backend dependency; return (ready, failed) service maps.
 
     A service left unconfigured (empty env) appears in NEITHER map, so callers
-    can tell "down" apart from "not in use". Results are cached for
+    can tell "down" apart from "not in use".  Embeddings are the exception and
+    read "not_configured": an upgrade that never set EMBEDDING_BASE_URL loses
+    vector search silently otherwise.  Results are cached for
     _PROBE_CACHE_TTL_SECONDS to keep the dashboard's auto-refresh cheap.
     """
     now = _time.monotonic()
@@ -178,6 +180,11 @@ def _probe_dependencies(db: Session) -> tuple[dict, dict]:
             dependencies["ocr_chain"] = "ready"
         except (httpx.HTTPError, OSError):
             failures["ocr_chain"] = "unavailable"
+    if settings.embedding_base_url.strip():
+        if EmbeddingClient().check()["embedding_model_available"]: dependencies["embeddings"] = "ready"
+        else: failures["embeddings"] = "unavailable"
+    else:
+        dependencies["embeddings"] = "not_configured"
     _PROBE_CACHE["result"] = (now, (dependencies, failures))
     return dependencies, failures
 

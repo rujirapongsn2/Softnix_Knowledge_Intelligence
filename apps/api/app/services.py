@@ -2459,6 +2459,7 @@ def link_provisions_to_chunks(db: Session, document: Document) -> int:
 
 
 def embed_document_chunks(db: Session, document_id: str) -> None:
+    """Embed the document's chunks; without an embedding endpoint the stage is skipped (vector search is optional)."""
     chunks = db.query(DocumentChunk).filter_by(document_id=document_id).order_by(DocumentChunk.chunk_index).all()
     if not chunks:
         return
@@ -2695,6 +2696,8 @@ def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
         # Committed before the embedding calls so the job row is not left locked while they run;
         # otherwise every heartbeat times out and a slow embed looks like a dead worker.
         db.commit()
+        if reindex_only and not EmbeddingClient().enabled:
+            raise RuntimeError("EMBEDDING_NOT_CONFIGURED")  # a reindex exists only for the vectors: never complete it empty
         embed_document_chunks(db, doc.id)
         db.commit()
         # A document deleted meanwhile is never sent to the retrieval engine.

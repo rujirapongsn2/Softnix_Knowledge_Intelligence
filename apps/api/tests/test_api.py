@@ -756,7 +756,11 @@ def test_database_chunk_retrieval_is_scoped_to_knowledge_base():
     assert all("primary" in source["excerpt"] for source in result["sources"])
 
 
-def test_embedding_reindex_queues_completed_documents_without_full_reprocessing():
+def test_embedding_reindex_queues_completed_documents_without_full_reprocessing(monkeypatch):
+    from app.embeddings import EmbeddingClient
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://embed.local:8090/v1")
+    get_settings.cache_clear()
+    monkeypatch.setattr(EmbeddingClient, "embed_texts", lambda _self, texts, _purpose: [[0.25] * get_settings().embedding_dimension for _ in texts])
     test_client = next(client())
     kb = test_client.post("/api/v1/knowledge-bases", json={"name": "Reindex", "code": "reindex-kb"}).json()
     uploaded = test_client.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", files={"file": ("notes.txt", b"Reindex this document.", "text/plain")}).json()
@@ -774,6 +778,10 @@ def test_embedding_reindex_queues_completed_documents_without_full_reprocessing(
     jobs = test_client.get(f"/api/v1/documents/{uploaded['document_id']}/jobs").json()
     assert jobs[0]["status"] == "completed"
     assert jobs[0]["stage"] == "completed"
+    with SessionLocal() as db:
+        chunks = db.query(DocumentChunk).filter_by(document_id=uploaded["document_id"]).all()
+        assert chunks and all(chunk.embedding for chunk in chunks)
+    get_settings.cache_clear()
 
 
 def test_metrics_and_audit_log_are_exposed():

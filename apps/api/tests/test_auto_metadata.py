@@ -9,7 +9,7 @@ from sqlalchemy import inspect
 from test_api import client
 from app.db import SessionLocal
 from app.job_queue import claim_next_job
-from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, process_metadata_job, queue_metadata_extraction
+from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, pending_review_keys, process_metadata_job, queue_metadata_extraction
 from app.metadata_search import MetadataPredicate, apply_typed_predicates, describe_schema
 from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
 from app.openrouter import OpenRouterClient
@@ -173,6 +173,22 @@ def test_job_and_review_publish_only_verified_graph(monkeypatch):
         assert db.query(Relationship).filter_by(knowledge_base_id=kb["id"], review_status="verified").count() == 1
         assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id, value_text="Land Department").count() == 1
         assert not queue_metadata_extraction(db, db.get(Document, doc_id))
+
+
+def test_an_optional_field_not_found_in_a_fully_read_document_leaves_nothing_to_review(monkeypatch):
+    api = next(client())
+    _, _, doc_id = setup_document(api, [field(required=False)])
+    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {"issuer": []})
+    queue_and_run(doc_id)
+    preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
+    assert preview["metadata_observations"]["issuer"]["status"] == "not_found"
+    assert preview["metadata_status"] == "complete" and preview["document_metadata"] == {}
+
+
+@pytest.mark.parametrize("required, coverage", [(False, "partial"), (True, "full")])
+def test_a_field_not_found_still_waits_for_a_person_when_the_read_was_partial_or_the_field_is_required(required, coverage):
+    observations = {"issuer": {"status": "not_found", "origin": "document_extraction", "coverage": coverage, "locked": False}}
+    assert pending_review_keys([field(required=required)], {}, observations) == ["issuer"]
 
 
 def test_failure_keeps_document_searchable(monkeypatch):

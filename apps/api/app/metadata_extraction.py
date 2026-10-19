@@ -33,6 +33,10 @@ def pending_review_keys(fields, values, observations):
             if f.get("fill_mode") == "extract"
             and not observations.get(f["key"], {}).get("locked")
             and observations.get(f["key"], {}).get("status") != "not_found_confirmed"
+            # An optional field the whole document was read for, without finding it, has nothing for a person to check.
+            and not (f["key"] not in values and not f.get("required")
+                     and observations.get(f["key"], {}).get("status") == "not_found"
+                     and observations.get(f["key"], {}).get("coverage") == "full")
             and (f["key"] not in values
                  or (observations.get(f["key"], {}).get("origin") == "document_extraction"
                      and observations.get(f["key"], {}).get("status") != "auto_accepted"))]

@@ -21,6 +21,8 @@ export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFi
     // value stays visible while a changed source is re-extracted, but a new
     // suggestion/conflict still needs review before it replaces that value.
     if (values[field.key] !== undefined && observation.origin !== "document_extraction") return false;
+    // Mirrors pending_review_keys: an optional field not found in a fully read document is not review work.
+    if (values[field.key] === undefined && !field.required && observation.status === "not_found" && observation.coverage === "full") return false;
     return values[field.key] === undefined || observation.status !== "auto_accepted";
   };
   const reviewFields = fields.filter(needsReview);

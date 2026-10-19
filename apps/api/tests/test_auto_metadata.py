@@ -532,6 +532,19 @@ def test_a_date_is_accepted_only_when_its_quote_writes_that_date_and_the_fields_
     assert extract_date(key, quote, (value, quote))["status"] == status
 
 
+SIGNED_THEN_GAZETTE = "ให้ไว้ ณ วันที่ ๕ มกราคม พ.ศ. ๒๕๖๗ เป็นปีที่ ๗๙ ในรัชกาลปัจจุบัน ประกาศในราชกิจจานุเบกษา ๑๐ มกราคม ๒๕๖๗"
+
+
+@pytest.mark.parametrize("key, value, status", [
+    ("signed_date", "2024-01-10", "suggested"),
+    ("signed_date", "2024-01-05", "auto_accepted"),
+    ("issued_date", "2024-01-10", "auto_accepted"),
+    ("issued_date", "2024-01-05", "suggested"),
+])
+def test_a_date_passes_only_when_its_own_anchor_introduces_it(key, value, status):
+    assert extract_date(key, SIGNED_THEN_GAZETTE, (value, SIGNED_THEN_GAZETTE))["status"] == status
+
+
 def test_conflicting_dates_resolve_to_the_one_the_quote_writes_with_its_anchor():
     text = SIGNED + "\n" + GAZETTE
     result = extract_date("signed_date", text, ("2015-01-16", SIGNED), ("2015-01-22", GAZETTE))

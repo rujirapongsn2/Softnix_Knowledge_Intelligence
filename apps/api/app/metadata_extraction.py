@@ -179,6 +179,8 @@ _THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 # A date field that names one particular date in a legal text: its quote must carry the phrase that introduces that date,
 # otherwise another date in the same sentence (the gazette date, say) could stand in for it.
 DATE_ANCHORS = {"signed_date": "ให้ไว้", "issued_date": "ราชกิจจานุเบกษา"}
+# The anchor introduces the date it ends at most this many (normalized) characters before, as in "ให้ไว้ ณ วันที่ ๕ มกราคม".
+ANCHOR_REACH = 40
 
 
 def _normalize_thai(text):
@@ -186,20 +188,40 @@ def _normalize_thai(text):
     return text.replace("\u0e4d\u0e32", "\u0e33").translate(_THAI_DIGITS)
 
 
-def thai_dates_in(quote):
-    """ISO (Gregorian) dates written as "<day> <Thai month> [พ.ศ.] <year>" in the quote. A year above 2400 is Buddhist Era."""
-    dates = set()
-    for day, month, era, year in _THAI_DATE.findall(_normalize_thai(quote)):
+def _thai_date_matches(text):
+    """(ISO date, start, end) for each date written as "<day> <Thai month> [พ.ศ.] <year>" in already normalized text.
+    A year above 2400 is Buddhist Era."""
+    matches = []
+    for match in _THAI_DATE.finditer(text):
+        day, month, era, year = match.groups()
         year = int(year)
         if year > 2400:
             year -= 543
         elif era:
             continue
         try:
-            dates.add(date(year, _THAI_MONTHS[month], int(day)).isoformat())
+            matches.append((date(year, _THAI_MONTHS[month], int(day)).isoformat(), match.start(), match.end()))
         except ValueError:
             continue
-    return dates
+    return matches
+
+
+def thai_dates_in(quote):
+    """ISO (Gregorian) dates the quote writes."""
+    return {iso for iso, _, _ in _thai_date_matches(_normalize_thai(quote))}
+
+
+def _anchored_date_in(value, quote, anchor):
+    """Whether the quote writes this date right after the field's anchor phrase, with no other date in between."""
+    text = _normalize_thai(quote)
+    matches = _thai_date_matches(text)
+    for iso, start, _ in matches:
+        if iso != value:
+            continue
+        found = text.rfind(anchor, max(0, start - ANCHOR_REACH - len(anchor)), start)
+        if found != -1 and not any(found + len(anchor) <= other < start for _, other, _ in matches):
+            return True
+    return False
 
 
 def _auto_acceptable(field, candidate):
@@ -214,7 +236,8 @@ def _auto_acceptable(field, candidate):
         return all(item in evidence["quote"] for item, evidence in zip(value, candidate["item_evidence"]))
     if kind == "date":
         quote = candidate["evidence"]["quote"]
-        return value in thai_dates_in(quote) and DATE_ANCHORS.get(field["key"], "") in _normalize_thai(quote)
+        anchor = DATE_ANCHORS.get(field["key"])
+        return _anchored_date_in(value, quote, anchor) if anchor else value in thai_dates_in(quote)
     return False
 
 

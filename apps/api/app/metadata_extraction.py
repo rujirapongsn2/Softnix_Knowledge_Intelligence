@@ -28,24 +28,55 @@ def extraction_fields(document):
                      and observations.get(f["key"], {}).get("content_version") != digest))]
 
 
-def pending_review_keys(fields, values, observations):
-    """Keys of AI-extracted fields that still wait for a person: empty, or filled by extraction without auto-acceptance."""
-    return [f["key"] for f in fields or []
-            if f.get("fill_mode") == "extract"
-            and not observations.get(f["key"], {}).get("locked")
-            and observations.get(f["key"], {}).get("status") != "not_found_confirmed"
-            # An optional field the whole document was read for, without finding it, has nothing for a person to check.
-            and not (f["key"] not in values and not f.get("required")
-                     and observations.get(f["key"], {}).get("status") == "not_found"
-                     and observations.get(f["key"], {}).get("coverage") == "full")
-            and (f["key"] not in values
-                 or (observations.get(f["key"], {}).get("origin") == "document_extraction"
-                     and observations.get(f["key"], {}).get("status") != "auto_accepted"))]
+# Observation status -> (extraction publishes its single candidate, trust of a published value). A value with no
+# observation was typed or imported by a person. "not_found" only carries a value kept from an earlier source version.
+PUBLICATION = {
+    "human_verified": (True, "verified"),
+    "legacy_manual": (True, "verified"),
+    "auto_accepted": (True, "auto_verified"),
+    "suggested": (True, "unverified"),
+    "partial": (True, "unverified"),
+    "conflict": (False, "blocked"),
+    "invalid_evidence": (False, "blocked"),
+    "not_found": (False, "unverified"),
+    "not_found_confirmed": (False, None),
+}
+# Field review state -> what it asks of the document: nothing, a check when someone has time, or a person now.
+FIELD_STATES = {"verified": "complete", "auto_verified": "complete", "not_found": "complete",
+                "unverified": "unverified", "unchecked": "unverified", "blocked": "needs_attention", "missing": "needs_attention"}
+REVIEW_STATUSES = ("complete", "unverified", "needs_attention")
+
+
+def trust_of(observation):
+    return PUBLICATION.get((observation or {}).get("status", "legacy_manual"), (False, "unverified"))[1]
+
+
+def published_candidate(observation):
+    """The candidate an extraction result puts into use, or None. Every candidate's quote was found in the source."""
+    candidates = observation.get("candidates") or []
+    return candidates[0] if PUBLICATION.get(observation.get("status"), (False,))[0] and len(candidates) == 1 else None
+
+
+def field_state(field, values, observation):
+    if trust_of(observation) == "blocked":
+        return "blocked"
+    if field["key"] in values:
+        return trust_of(observation)
+    status = observation.get("status")
+    # An optional field the whole document was read for, without finding it, has nothing for a person to check.
+    if status == "not_found_confirmed" or (status == "not_found" and not field.get("required") and observation.get("coverage") == "full"):
+        return "not_found"
+    return "missing" if field.get("required") else "unchecked"
+
+
+def field_review_states(fields, values, observations):
+    """Review state of every AI-extracted field, keyed by field key. The web shows these; it does not derive its own."""
+    return {f["key"]: field_state(f, values or {}, (observations or {}).get(f["key"], {})) for f in fields or [] if f.get("fill_mode") == "extract"}
 
 
 def update_status(document):
-    pending = pending_review_keys(document.metadata_template_fields, document.document_metadata or {}, document.metadata_observations or {})
-    document.metadata_status = "needs_review" if pending else "complete"
+    needs = {FIELD_STATES[state] for state in field_review_states(document.metadata_template_fields, document.document_metadata, document.metadata_observations).values()}
+    document.metadata_status = next((status for status in reversed(REVIEW_STATUSES) if status in needs), "complete")
 
 
 def queue_metadata_extraction(db, document):
@@ -232,38 +263,42 @@ def extract_candidates(fields, text, client):
 
 
 def reevaluate_observations(db, document):
-    """Apply the current date rules to stored date candidates without asking the provider again, and refresh the
-    review status. Other field types' rules are unchanged, so their stored status already says what they would now.
-    The caller holds the KB graph lock and the document row lock. Returns the number of fields published."""
+    """Apply the current date rules and the publication table to stored candidates without asking the provider again,
+    and refresh the review status. The caller holds the KB graph lock and the document row lock. Returns the number of
+    fields whose published value or status changed."""
     from .services import sync_document_metadata_graph, sync_document_metadata_values
 
     digest = hashlib.sha256((document.extracted_text or "").encode()).hexdigest()
     values = dict(document.document_metadata or {})
     observations = dict(document.metadata_observations or {})
-    accepted = 0
+    changed = 0
     for field in document.metadata_template_fields or []:
         observation = observations.get(field["key"], {})
-        if (field.get("fill_mode") != "extract" or field.get("field_type") != "date" or observation.get("locked")
-                or observation.get("origin") != "document_extraction" or observation.get("status") not in {"suggested", "conflict"}
-                or observation.get("coverage") != "full" or observation.get("content_version") != digest
+        if (field.get("fill_mode") != "extract" or observation.get("locked") or observation.get("origin") != "document_extraction"
+                or observation.get("content_version") != digest
                 or observation.get("template_version", document.metadata_template_version) != document.metadata_template_version):
             continue
-        candidate = _accepted_candidate(field, observation.get("candidates") or [])
-        if candidate:
+        promoted = False
+        if field.get("field_type") == "date" and observation.get("status") in {"suggested", "conflict"} and observation.get("coverage") == "full":
+            if accepted := _accepted_candidate(field, observation.get("candidates") or []):
+                observation = observations[field["key"]] = {**observation, "status": "auto_accepted", "candidates": [accepted]}
+                promoted = True
+        candidate = published_candidate(observation)
+        republish = bool(candidate) and values.get(field["key"]) != candidate["value"]
+        if republish:
             values[field["key"]] = candidate["value"]
-            observations[field["key"]] = {**observation, "status": "auto_accepted", "candidates": [candidate]}
-            accepted += 1
-    if accepted:
+        changed += promoted or republish
+    if changed:
         document.document_metadata = values
         document.metadata_observations = observations
         document.metadata_revision += 1
         document.metadata_search_text = metadata_search_text(document.metadata_template_fields, values)
         sync_document_metadata_values(db, document)
         sync_document_metadata_graph(db, document)
-    # A queued, running or failed extraction owns the status until it finishes.
-    if accepted or document.metadata_status in {"needs_review", "complete"}:
+    # A queued, running or failed extraction owns the status until it finishes. needs_review predates the review states.
+    if changed or document.metadata_status in {"needs_review", *REVIEW_STATUSES}:
         update_status(document)
-    return accepted
+    return changed
 
 
 def process_metadata_job(db, job):
@@ -310,8 +345,8 @@ def process_metadata_job(db, job):
         values = dict(document.document_metadata or {})
         for key, observation in observations.items():
             observation["template_version"] = template_version
-            if observation["status"] == "auto_accepted":
-                values[key] = observation["candidates"][0]["value"]
+            if candidate := published_candidate(observation):
+                values[key] = candidate["value"]
         document.document_metadata = values
         document.metadata_observations = {**(document.metadata_observations or {}), **observations}
         document.metadata_revision += 1

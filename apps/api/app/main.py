@@ -27,7 +27,7 @@ from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, cu
 from .data_quality import build_document_quality_report, build_knowledge_base_quality_report
 from .metadata_search import describe_schema
 from .legal_edits import with_manual_edits
-from .metadata_extraction import queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status
+from .metadata_extraction import field_review_states, queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status
 from .observability import metrics, now
 from .embeddings import EmbeddingClient
 from .openrouter import OpenRouterClient
@@ -973,6 +973,10 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
             "total": len(results), "queued_count": queued_count, "failed_count": failed_count, "results": results}
 
 
+# A failed extraction left fields for a person, so both review filters list it.
+METADATA_STATUS_FILTERS = {"needs_review": ["unverified", "needs_attention", "failed"], "needs_attention": ["needs_attention", "failed"]}
+
+
 @app.get("/api/v1/knowledge-bases/{kb_id}/documents/page", response_model=DocumentPageOut)
 def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, offset: int = 0,
                    search: str | None = None, status: str | None = None, document_type: str | None = None,
@@ -1008,7 +1012,7 @@ def page_documents(kb_id: str, include_deleted: bool = False, limit: int = 50, o
                 raise HTTPException(400, {"code": "DOCUMENT_TEMPLATE_INVALID", "message": "Document type is invalid.", "retryable": False})
             rows = rows.filter(Document.metadata_template_id == template_id)
     if metadata_status:
-        rows = rows.filter(Document.metadata_status.in_(["needs_review", "failed"]) if metadata_status == "needs_review" else Document.metadata_status == metadata_status)
+        rows = rows.filter(Document.metadata_status.in_(METADATA_STATUS_FILTERS.get(metadata_status, [metadata_status])))
     total = rows.count()
     documents = rows.order_by(Document.created_at.desc()).offset(offset).limit(limit).all()
     has_legal_documents = db.query(Document.id).filter(
@@ -1106,7 +1110,8 @@ def document_text(document_id: str, user: User = Depends(current_admin), db: Ses
     return {"document_id": doc.id, "status": doc.status, "document_type": doc.document_type, "metadata_template_id": doc.metadata_template_id,
             "metadata_template_name": doc.metadata_template_name, "metadata_template_version": doc.metadata_template_version,
             "metadata_template_fields": doc.metadata_template_fields or [],
-            "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text, "error_code": doc.error_code, "error_message": doc.error_message, "legal_metadata": doc.legal_metadata,
+            "document_metadata": doc.document_metadata or {}, "metadata_observations": doc.metadata_observations or {}, "metadata_status": doc.metadata_status, "metadata_revision": doc.metadata_revision, "text": doc.extracted_text,
+            "metadata_field_states": field_review_states(doc.metadata_template_fields, doc.document_metadata, doc.metadata_observations), "error_code": doc.error_code, "error_message": doc.error_message, "legal_metadata": doc.legal_metadata,
             "quality": build_document_quality_report(db, doc),
             "reference_file": reference_file_view(doc), "reference_pdf": reference_pdf_view(doc)}
 
@@ -2630,7 +2635,7 @@ def list_mcp_activity(limit: int = 50, _: User = Depends(current_admin), db: Ses
 
 MCP_TOOLS = [
     {"name": "describe_knowledge_schema", "description": "Discover authorized metadata templates, typed filter operators, and paginated coverage. Unknown metadata does not mean no matching documents.", "inputSchema": {"type": "object", "additionalProperties": False, "properties": {"offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}}},
-    {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning. Returns ski.answer.v1 structuredContent with answer, claims, references, and backward-compatible sources. Each reference includes ski.quality.v1; never use not_queryable evidence and disclose warnings for needs_review evidence.", "inputSchema": QueryRequest.model_json_schema()},
+    {"name": "search_knowledge", "description": "Search knowledge bases with automatic retrieval planning. Returns ski.answer.v1 structuredContent with answer, claims, references, and backward-compatible sources. Each reference includes ski.quality.v1; never use not_queryable evidence and disclose warnings for needs_review evidence. Each source's metadata_provenance gives every metadata value a trust: use verified and auto_verified values freely, say so when an answer rests on an unverified value, and never rely on a blocked one.", "inputSchema": QueryRequest.model_json_schema()},
     {"name": "document_inventory_summary", "description": "Count and group non-deleted documents from the scoped document and legal registries", "inputSchema": DocumentInventoryRequest.model_json_schema()},
     {"name": "find_entities", "description": "Find entities by name or alias", "inputSchema": {"type": "object", "properties": {"search_text": {"type": "string"}}, "required": ["search_text"]}},
     {"name": "analyze_relationships", "description": "Analyze entity relationships", "inputSchema": {"type": "object", "properties": {"subjects": {"type": "array"}, "question": {"type": "string"}}, "required": ["subjects", "question"]}},

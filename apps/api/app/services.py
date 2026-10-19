@@ -29,7 +29,7 @@ from .legal_corpus import parse_legal_corpus_metadata
 from .document_templates import LIST_FIELD_TYPES, metadata_search_text, normalize_field_definitions
 from .metadata_search import apply_typed_predicates, decorate_sources, metadata_coverage, predicate_coverage
 from .legal_edits import keep_manual_edits
-from .metadata_extraction import process_metadata_job, queue_metadata_extraction
+from .metadata_extraction import process_metadata_job, queue_metadata_extraction, trust_of
 from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, JobType, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .data_quality import build_document_quality_reports
 from .embeddings import EmbeddingClient, EmbeddingPurpose
@@ -180,8 +180,7 @@ def sync_document_metadata_graph(db: Session, document: Document) -> dict[str, i
     fields = normalize_field_definitions(document.metadata_template_fields)
     mapped = [field for field in fields if field.get("graph_relationship") and field.get("graph_entity_type")
               and document.document_metadata.get(field.get("key")) not in (None, "")
-              and (document.metadata_observations or {}).get(field.get("key"), {}).get("status", "legacy_manual")
-              in {"human_verified", "legacy_manual"}]
+              and trust_of((document.metadata_observations or {}).get(field.get("key"))) == "verified"]
     if not mapped:
         return {"entities": 0, "relationships": 0}
     anchor_key = f"metadata:document:{document.id}"

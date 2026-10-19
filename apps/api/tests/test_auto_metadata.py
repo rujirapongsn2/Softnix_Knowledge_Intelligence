@@ -9,7 +9,7 @@ from sqlalchemy import inspect
 from test_api import client
 from app.db import SessionLocal
 from app.job_queue import claim_next_job
-from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, pending_review_keys, process_metadata_job, queue_metadata_extraction
+from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, field_review_states, process_metadata_job, queue_metadata_extraction
 from app.metadata_search import MetadataPredicate, apply_typed_predicates, describe_schema
 from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
 from app.openrouter import OpenRouterClient
@@ -156,14 +156,14 @@ def queue_and_run(doc_id):
         process_metadata_job(db, claim(db, job.id))
 
 
-def test_job_and_review_publish_only_verified_graph(monkeypatch):
+def test_an_unverified_graph_field_is_in_use_but_reaches_the_graph_only_once_a_person_confirms_it(monkeypatch):
     api = next(client())
     kb, template, doc_id = setup_document(api, [field(graph_entity_type="Organization", graph_relationship="ISSUED_BY")])
     monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {"issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}]})
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
-    assert preview["status"] == "completed" and preview["metadata_status"] == "needs_review"
-    assert preview["document_metadata"] == {}
+    assert preview["status"] == "completed" and preview["metadata_status"] == "unverified"
+    assert preview["document_metadata"] == {"issuer": "Land Department"} and preview["metadata_field_states"] == {"issuer": "unverified"}
     with SessionLocal() as db:
         assert db.query(Relationship).filter_by(knowledge_base_id=kb["id"]).count() == 0
     review = {"revision": preview["metadata_revision"], "field_key": "issuer", "action": "confirm"}
@@ -185,10 +185,10 @@ def test_an_optional_field_not_found_in_a_fully_read_document_leaves_nothing_to_
     assert preview["metadata_status"] == "complete" and preview["document_metadata"] == {}
 
 
-@pytest.mark.parametrize("required, coverage", [(False, "partial"), (True, "full")])
-def test_a_field_not_found_still_waits_for_a_person_when_the_read_was_partial_or_the_field_is_required(required, coverage):
+@pytest.mark.parametrize("required, coverage, state", [(False, "partial", "unchecked"), (True, "full", "missing")])
+def test_a_field_not_found_still_waits_for_a_person_when_the_read_was_partial_or_the_field_is_required(required, coverage, state):
     observations = {"issuer": {"status": "not_found", "origin": "document_extraction", "coverage": coverage, "locked": False}}
-    assert pending_review_keys([field(required=required)], {}, observations) == ["issuer"]
+    assert field_review_states([field(required=required)], {}, observations) == {"issuer": state}
 
 
 def test_failure_keeps_document_searchable(monkeypatch):
@@ -562,14 +562,16 @@ def test_reevaluation_publishes_stored_dates_that_now_pass_and_is_idempotent():
         revision = document.metadata_revision
         db.commit()
     response = api.post(f"/api/v1/knowledge-bases/{kb['id']}/metadata-reevaluate")
-    assert response.status_code == 200 and response.json() == {"documents": 1, "fields": 1}
+    assert response.status_code == 200 and response.json() == {"documents": 1, "fields": 2}
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
-    assert preview["document_metadata"] == {"signed_date": "2015-01-16"}
+    assert preview["document_metadata"] == {"signed_date": "2015-01-16", "effective_date": "2008-06-05"}
     assert preview["metadata_observations"]["signed_date"]["status"] == "auto_accepted"
     assert preview["metadata_observations"]["effective_date"]["status"] == "suggested"
-    assert preview["metadata_status"] == "needs_review" and preview["metadata_revision"] == revision + 1
+    assert preview["metadata_field_states"] == {"signed_date": "auto_verified", "effective_date": "unverified", "issuer": "not_found"}
+    assert preview["metadata_status"] == "unverified" and preview["metadata_revision"] == revision + 1
     with SessionLocal() as db:
         assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id, field_key="signed_date").count() == 1
+        assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id, field_key="effective_date").one().value_date.isoformat() == "2008-06-05"
     assert api.post(f"/api/v1/knowledge-bases/{kb['id']}/metadata-reevaluate").json() == {"documents": 0, "fields": 0}
 
 

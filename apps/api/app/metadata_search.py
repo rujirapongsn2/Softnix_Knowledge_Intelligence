@@ -7,6 +7,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import load_only
 
 from .document_templates import list_templates
+from .metadata_extraction import trust_of
 from .models import Document, DocumentMetadataValue
 
 
@@ -121,6 +122,7 @@ def decorate_sources(db, sources, kb_ids, requested_keys=()):
             evidence = [c["evidence"] for c in observation.get("candidates", []) if c["value"] == values[key]][:1]
             source["metadata_provenance"][key] = {
                 "status": observation.get("status", "legacy_manual"), "origin": observation.get("origin", "legacy_manual"),
+                "trust": trust_of(observation),
                 "content_version": observation.get("content_version"),
                 "evidence": [{**e, "quote": e["quote"][:1000], "quote_truncated": len(e["quote"]) > 1000} for e in evidence],
             }

@@ -30,7 +30,11 @@ class Settings(BaseSettings):
     lightrag_base_url: str = ""
     lightrag_api_key: str = ""
     lightrag_timeout_seconds: int = 120
-    lightrag_processing_timeout_seconds: int = 300
+    lightrag_processing_timeout_seconds: int = 900
+    # Queue health: a running job refreshes updated_at every job_heartbeat_seconds; one not refreshed for
+    # job_stale_after_seconds lost its worker and is re-queued by the stale-job sweep.
+    job_heartbeat_seconds: int = 30
+    job_stale_after_seconds: int = 900
     lightrag_workspace_prefix: str = "skip-"
     neo4j_http_url: str = ""
     neo4j_username: str = "neo4j"

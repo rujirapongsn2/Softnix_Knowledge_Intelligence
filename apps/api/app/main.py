@@ -36,6 +36,7 @@ from .retention import prune_observability
 from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
+from .job_queue import WORKER_LOST, disown, is_stale, lock_knowledge_base_graph
 from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, apply_answer_reference_contract, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, enrich_sources_with_file_links, entity_graph, process_next_job, public_document_base_url, queue_embedding_reindex, reference_file_available, reference_pdf_available, refresh_saved_answer_citations, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
@@ -1249,6 +1250,9 @@ def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, 
     if doc: assert_kb_access(db, user, doc.knowledge_base_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
+    if payload.values is not None:
+        # Graph writes below: KB graph lock first, before any document row is written.
+        lock_knowledge_base_graph(db, doc.knowledge_base_id)
     if "published_at" in payload.model_fields_set:
         doc.published_at = payload.published_at
     if payload.values is not None:
@@ -1314,6 +1318,9 @@ def extract_custom_metadata(document_id: str, payload: MetadataExtractionRequest
 
 @app.post("/api/v1/documents/{document_id}/metadata-review")
 def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    # Lock order Knowledge Base -> document: take the KB graph lock before the row lock.
+    kb_id = db.query(Document.knowledge_base_id).filter_by(id=document_id).scalar()
+    lock_knowledge_base_graph(db, kb_id)
     doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
@@ -1390,6 +1397,12 @@ def reprocess_document(document_id: str, user: User = Depends(current_admin), db
         ProcessingJob.document_id == doc.id,
         ProcessingJob.status.in_(["queued", "running"]),
     ).order_by(ProcessingJob.created_at.desc()).first()
+    if active and is_stale(active):
+        # The worker running it is gone (crash, restart): give up on that job and start over.
+        disown(active)  # the old worker's late commits are refused (claim token)
+        active.status, active.current_stage = "failed", "failed"
+        active.error_code, active.error_message = WORKER_LOST, "Superseded by a reprocess after the worker stopped."
+        active = None
     if active:
         raise HTTPException(409, {
             "code": "DOCUMENT_PROCESSING_IN_PROGRESS",
@@ -1408,9 +1421,17 @@ def soft_delete_document(db: Session, doc: Document) -> ProcessingJob:
     """Hide a document and asynchronously remove its remote retrieval source."""
     doc.deleted_at, doc.status = datetime.utcnow(), "deleted"
     db.query(ProcessingJob).filter(
-        ProcessingJob.document_id == doc.id,
-        ProcessingJob.status.in_(["queued", "running"]),
-    ).update({"status": "cancelled"}, synchronize_session=False)
+        ProcessingJob.document_id == doc.id, ProcessingJob.status == "queued",
+    ).update({"status": "cancelled", "current_stage": "cancelled", "error_code": "DOCUMENT_DELETED"}, synchronize_session=False)
+    # A running job is left to its worker: it notices the deletion, lets the
+    # retrieval engine finish the ingest in flight and then stops.  The purge
+    # below cannot start before that (one running job per document), so it
+    # removes the finished record instead of racing the ingest.  A running job
+    # whose worker is gone is released right away.
+    for running in db.query(ProcessingJob).filter(ProcessingJob.document_id == doc.id, ProcessingJob.status == "running").all():
+        if is_stale(running):
+            disown(running)
+            running.status, running.current_stage, running.error_code = "cancelled", "cancelled", "DOCUMENT_DELETED"
     # Keep the retrieval index in sync. A failed purge remains retryable as a
     # normal processing job, so a deleted source cannot silently block re-ingest.
     purge = ProcessingJob(document_id=doc.id, knowledge_base_id=doc.knowledge_base_id, job_type=JobType.PURGE_REMOTE_INDEX)
@@ -1772,6 +1793,7 @@ def review_legal_relationship(relationship_id: str, payload: LegalRelationshipRe
         raise HTTPException(404, "Suggested legal relationship not found")
     if relationship.review_status != "suggested":
         raise HTTPException(409, {"code": "LEGAL_RELATIONSHIP_ALREADY_REVIEWED", "message": "This legal suggestion has already been reviewed.", "retryable": False})
+    lock_knowledge_base_graph(db, relationship.knowledge_base_id)
     relationship.review_status = payload.status
     relationship.attributes = {**(relationship.attributes or {}), "review_note": payload.note, "reviewed_by": user.username, "reviewed_at": datetime.utcnow().isoformat()}
     db.add(GraphProjectionEvent(event_type="relationship", relationship_id=relationship.id))
@@ -1901,6 +1923,7 @@ def resolve_legal_registry(kb_id: str, user: User = Depends(current_admin), db: 
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
     assert_kb_access(db, user, kb_id)
+    lock_knowledge_base_graph(db, kb_id)
     result = resolve_instrument_statuses(db, kb_id)
     record_audit(db, "legal_registry.resolve", user.id, "knowledge_base", kb_id, result)
     db.commit()
@@ -1915,10 +1938,13 @@ def sync_knowledge_base_graph(kb_id: str, user: User = Depends(current_admin), d
     totals = {"entities": 0, "relationships": 0}
     documents = db.query(Document).filter_by(knowledge_base_id=kb_id, status="completed").filter(Document.live()).all()
     for document in documents:
+        # Takes the KB graph lock itself after its remote reads, and commits.
         result = sync_lightrag_document_graph(db, document)
         totals["entities"] += result["entities"]
         totals["relationships"] += result["relationships"]
+        lock_knowledge_base_graph(db, kb_id)
         result = sync_legal_document_graph(db, document)
+        db.commit()  # one document at a time, so the lock is not held across the next document's remote reads
         totals["entities"] += result["entities"]
         totals["relationships"] += result["relationships"]
     record_audit(db, "graph.sync", user.id, "knowledge_base", kb_id, {**totals, "documents": len(documents)})

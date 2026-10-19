@@ -23,7 +23,7 @@ def db():
     session.close()
 
 
-def _seed_kb_doc(db, kb_code="kb-x", title="t"):
+def _seed_kb_doc(db, kb_code="kb-x", title="t", deleted=False):
     kb = KnowledgeBase(id="kb-1", name="KB", code=kb_code)
     db.add(kb)
     db.commit()
@@ -31,6 +31,8 @@ def _seed_kb_doc(db, kb_code="kb-x", title="t"):
         id="doc-1", knowledge_base_id="kb-1", original_filename="a.txt",
         stored_filename="a.txt", storage_path="/tmp/a.txt", mime_type="text/plain",
         file_size=1, checksum_sha256="c" * 64, title=title,
+        # A purge job only exists for a soft-deleted document.
+        deleted_at=datetime.utcnow() if deleted else None,
     )
     db.add(doc)
     db.commit()
@@ -39,7 +41,7 @@ def _seed_kb_doc(db, kb_code="kb-x", title="t"):
 
 class TestPurgeRemoteIndexJob:
     def test_purge_job_deletes_remote_source(self, db, monkeypatch):
-        kb, doc = _seed_kb_doc(db)
+        kb, doc = _seed_kb_doc(db, deleted=True)
         calls = []
 
         class FakeEngine:
@@ -63,7 +65,7 @@ class TestPurgeRemoteIndexJob:
         assert ("delete", "doc-remote-1") in calls
 
     def test_purge_job_no_remote_source_completes(self, db, monkeypatch):
-        kb, doc = _seed_kb_doc(db)
+        kb, doc = _seed_kb_doc(db, deleted=True)
 
         class FakeEngine:
             enabled = True
@@ -82,7 +84,7 @@ class TestPurgeRemoteIndexJob:
         assert job.status == "completed"
 
     def test_purge_job_disabled_engine_completes(self, db, monkeypatch):
-        kb, doc = _seed_kb_doc(db)
+        kb, doc = _seed_kb_doc(db, deleted=True)
 
         class FakeEngine:
             enabled = False
@@ -95,7 +97,7 @@ class TestPurgeRemoteIndexJob:
 
     def test_purge_job_transient_busy_schedules_retry(self, db, monkeypatch):
         """Review info fix: BUSY is transient — the job requeues, not fails."""
-        kb, doc = _seed_kb_doc(db)
+        kb, doc = _seed_kb_doc(db, deleted=True)
 
         class FakeEngine:
             enabled = True
@@ -116,7 +118,7 @@ class TestPurgeRemoteIndexJob:
         assert job.next_attempt_at is not None
 
     def test_purge_job_non_transient_failure_is_terminal(self, db, monkeypatch):
-        kb, doc = _seed_kb_doc(db)
+        kb, doc = _seed_kb_doc(db, deleted=True)
 
         class FakeEngine:
             enabled = True
@@ -134,6 +136,23 @@ class TestPurgeRemoteIndexJob:
         job = db.query(ProcessingJob).filter_by(job_type="PURGE_REMOTE_INDEX").one()
         assert job.status == "failed"
         assert job.error_code == "REMOTE_INDEX_PURGE_FAILED"
+
+
+    def test_purge_job_skips_restored_document(self, db, monkeypatch):
+        """A document restored before its purge ran owns the remote record again."""
+        kb, doc = _seed_kb_doc(db, deleted=False)
+
+        class FakeEngine:
+            enabled = True
+
+            def find_document(self, *a, **k):
+                raise AssertionError("a live document must not be purged")
+
+        monkeypatch.setattr(services, "LightRAGRetrievalEngine", lambda: FakeEngine())
+        db.add(ProcessingJob(document_id=doc.id, knowledge_base_id="kb-1", job_type="PURGE_REMOTE_INDEX"))
+        db.commit()
+        assert services.process_next_job(db) is True
+        assert db.query(ProcessingJob).filter_by(job_type="PURGE_REMOTE_INDEX").one().status == "completed"
 
 
 class TestF8PartialUnique:

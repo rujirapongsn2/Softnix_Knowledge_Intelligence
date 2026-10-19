@@ -337,6 +337,12 @@ class ProcessingJob(Timestamped, Base):
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set by each claim; a worker may only commit while the row still carries its token.
+    claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # Times the job's worker disappeared (stale sweep); separate from attempt_count.
+    lost_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Times the job was postponed because a dependency was busy; not a failed attempt.
+    deferral_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class Entity(Timestamped, Base):

@@ -2,7 +2,6 @@
 import hashlib
 import json
 import re
-from datetime import datetime, timedelta
 
 from .document_templates import TEXT_LIST_MAX_ITEMS, metadata_search_text, validate_metadata_values
 from .models import Document, JobType, ProcessingJob
@@ -182,14 +181,21 @@ def extract_candidates(fields, text, client):
     return observations
 
 
-def process_metadata_job(db, job):
-    """Independent retry and compare-and-set publication after slow provider work."""
+def process_metadata_job(db, job, claimed: bool = False):
+    """Independent retry and compare-and-set publication after slow provider work.
+
+    ``claimed`` is True when the queue already moved the job to running
+    (job_queue.claim_next_job); otherwise the job is claimed here.
+    """
+    from .job_queue import ClaimLost, lock_knowledge_base_graph
+    from .retry_policy import PROCESSING_RETRY_POLICIES, schedule_retry
     from .services import sync_document_metadata_graph, sync_document_metadata_values
 
-    claimed = db.query(ProcessingJob).filter_by(id=job.id, status="queued").update({"status": "running"}, synchronize_session=False)
     if not claimed:
-        db.rollback()
-        return
+        updated = db.query(ProcessingJob).filter_by(id=job.id, status="queued").update({"status": "running"}, synchronize_session=False)
+        if not updated:
+            db.rollback()
+            return
     db.refresh(job)
     document = db.query(Document).filter_by(id=job.document_id).with_for_update().one()
     if not document.is_live:
@@ -208,6 +214,9 @@ def process_metadata_job(db, job):
         if not text:
             raise RuntimeError("METADATA_TEXT_NOT_READY")
         observations = extract_candidates(fields, text, OpenRouterClient()) if fields else {}
+        # Lock order Knowledge Base -> document (same as the graph-writing jobs):
+        # the KB graph lock is taken before this transaction locks the document row.
+        lock_knowledge_base_graph(db, job.knowledge_base_id or document.knowledge_base_id)
         document = db.query(Document).filter_by(id=job.document_id).populate_existing().with_for_update().one()
         if not document.is_live:
             job.status = "cancelled"
@@ -234,17 +243,19 @@ def process_metadata_job(db, job):
         job.status, job.current_stage, job.progress_percent = "completed", "completed", 100
         job.error_code, job.error_message = None, None
         db.commit()
+    except ClaimLost:
+        raise
     except Exception as exc:
         db.rollback()
         document = db.query(Document).filter_by(id=job.document_id).populate_existing().with_for_update().one()
         if not document.is_live:
             job.status = "cancelled"
         else:
-            retry = str(exc) == "OPENROUTER_UNAVAILABLE" and job.attempt_count < 3
+            # Provider outages and rate limits get the long, non-blocking provider schedule.
+            retry = schedule_retry(job, PROCESSING_RETRY_POLICIES.get(str(exc))) if str(exc) in {"OPENROUTER_UNAVAILABLE", "OPENROUTER_CREDITS_EXHAUSTED"} else False
             job.status = "queued" if retry else "failed"
             job.current_stage = "retry_wait" if retry else "failed"
-            job.next_attempt_at = datetime.utcnow() + timedelta(seconds=2 ** job.attempt_count)
-            job.error_code = str(exc) if str(exc) in {"OPENROUTER_UNAVAILABLE", "OPENROUTER_API_KEY_NOT_CONFIGURED", "METADATA_TEXT_NOT_READY", "METADATA_EXTRACTION_INVALID_RESPONSE"} else "METADATA_EXTRACTION_FAILED"
+            job.error_code = str(exc) if str(exc) in {"OPENROUTER_UNAVAILABLE", "OPENROUTER_AUTH_FAILED", "OPENROUTER_CREDITS_EXHAUSTED", "OPENROUTER_REQUEST_REJECTED", "OPENROUTER_API_KEY_NOT_CONFIGURED", "METADATA_TEXT_NOT_READY", "METADATA_EXTRACTION_INVALID_RESPONSE"} else "METADATA_EXTRACTION_FAILED"
             job.error_message = "Metadata extraction did not complete; document search remains available."
             if document.metadata_revision != revision:
                 update_status(document)

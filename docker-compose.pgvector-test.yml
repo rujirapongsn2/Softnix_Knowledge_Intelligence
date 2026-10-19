@@ -19,4 +19,4 @@ services:
     depends_on:
       postgres-test:
         condition: service_healthy
-    command: pytest -q tests/test_pgvector_integration.py
+    command: pytest -q tests/test_pgvector_integration.py tests/test_job_queue_postgres.py

@@ -12,6 +12,62 @@ from .config import get_settings
 from .content_safety import protect_document_text, protect_query_text
 from .request_budget import remaining_timeout
 
+# OpenAI-family embedding models reject a request above 300k input tokens in
+# total, so long documents are sent in batches.  Tokens are estimated as one
+# per character: Thai text measures about 0.94 tokens/char, so this stays
+# conservative for Thai and generous for Latin text.
+EMBEDDING_MAX_INPUTS_PER_REQUEST = 128
+EMBEDDING_MAX_ESTIMATED_TOKENS_PER_REQUEST = 250_000
+
+# 401 and 402 are account problems with their own codes (key rejected, credits
+# exhausted).  408 and 429 mean the provider is not usable right now.  Every
+# other 4xx means the provider refused this particular request, which retrying
+# cannot fix.
+_PROVIDER_UNAVAILABLE_4XX = frozenset({408, 429})
+_TOO_LARGE_MARKERS = ("maximum request size", "maximum context length", "too many tokens", "too large",
+                      "context_length_exceeded", "max_tokens_per_request")
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, len(text))
+
+
+def embedding_batches(texts: list[str], max_inputs: int = EMBEDDING_MAX_INPUTS_PER_REQUEST,
+                      max_tokens: int = EMBEDDING_MAX_ESTIMATED_TOKENS_PER_REQUEST) -> list[list[str]]:
+    """Split texts into ordered batches that stay under both request limits."""
+    batches: list[list[str]] = []
+    current: list[str] = []
+    tokens = 0
+    for text in texts:
+        cost = estimate_tokens(text)
+        if current and (len(current) >= max_inputs or tokens + cost > max_tokens):
+            batches.append(current)
+            current, tokens = [], 0
+        current.append(text)
+        tokens += cost
+    if current:
+        batches.append(current)
+    return batches
+
+
+def provider_error_code(exc: Exception, embedding: bool = False) -> str:
+    """Name an OpenRouter HTTP failure without blaming the key for a rejected request."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 401:
+            return "OPENROUTER_AUTH_FAILED"
+        if status == 402:
+            return "OPENROUTER_CREDITS_EXHAUSTED"
+        if 400 <= status < 500 and status not in _PROVIDER_UNAVAILABLE_4XX:
+            try:
+                body = exc.response.text.casefold()
+            except Exception:  # pragma: no cover - unreadable streamed body
+                body = ""
+            if embedding and (status == 413 or any(marker in body for marker in _TOO_LARGE_MARKERS)):
+                return "OPENROUTER_EMBEDDING_REQUEST_TOO_LARGE"
+            return "OPENROUTER_REQUEST_REJECTED"
+    return "OPENROUTER_UNAVAILABLE"
+
 
 class OpenRouterClient:
     def __init__(self, client: httpx.Client | None = None):
@@ -36,25 +92,31 @@ class OpenRouterClient:
             return []
         client = self._client or httpx.Client(timeout=remaining_timeout(30))
         try:
-            response = client.post(
-                f"{self.settings.openrouter_base_url.rstrip('/')}/embeddings",
-                headers=self._headers(),
-                json={"model": self.settings.openrouter_embedding_model, "input": texts,
-                      "dimensions": self.settings.openrouter_embedding_dimension, "encoding_format": "float"},
-            )
-            response.raise_for_status()
-            data = sorted(response.json().get("data", []), key=lambda item: item.get("index", 0))
-            vectors = [item.get("embedding") for item in data]
-            if len(vectors) != len(texts) or any(not isinstance(vector, list) for vector in vectors):
-                raise RuntimeError("OPENROUTER_EMBEDDING_INVALID_RESPONSE")
-            if any(len(vector) != self.settings.openrouter_embedding_dimension for vector in vectors):
-                raise RuntimeError("OPENROUTER_EMBEDDING_DIMENSION_MISMATCH")
+            vectors: list[list[float]] = []
+            for batch in embedding_batches(texts):
+                vectors.extend(self._embed_batch(client, batch))
             return vectors
         except httpx.HTTPError as exc:
-            raise RuntimeError("OPENROUTER_UNAVAILABLE") from exc
+            raise RuntimeError(provider_error_code(exc, embedding=True)) from exc
         finally:
             if self._client is None:
                 client.close()
+
+    def _embed_batch(self, client: httpx.Client, texts: list[str]) -> list[list[float]]:
+        response = client.post(
+            f"{self.settings.openrouter_base_url.rstrip('/')}/embeddings",
+            headers=self._headers(),
+            json={"model": self.settings.openrouter_embedding_model, "input": texts,
+                  "dimensions": self.settings.openrouter_embedding_dimension, "encoding_format": "float"},
+        )
+        response.raise_for_status()
+        data = sorted(response.json().get("data", []), key=lambda item: item.get("index", 0))
+        vectors = [item.get("embedding") for item in data]
+        if len(vectors) != len(texts) or any(not isinstance(vector, list) for vector in vectors):
+            raise RuntimeError("OPENROUTER_EMBEDDING_INVALID_RESPONSE")
+        if any(len(vector) != self.settings.openrouter_embedding_dimension for vector in vectors):
+            raise RuntimeError("OPENROUTER_EMBEDDING_DIMENSION_MISMATCH")
+        return vectors
 
     def answer_from_sources(self, query: str, sources: list[dict[str, Any]]) -> str:
         if not self.embeddings_enabled:
@@ -94,7 +156,7 @@ class OpenRouterClient:
                 raise RuntimeError("OPENROUTER_LLM_INVALID_RESPONSE")
             return content.strip()
         except httpx.HTTPError as exc:
-            raise RuntimeError("OPENROUTER_UNAVAILABLE") from exc
+            raise RuntimeError(provider_error_code(exc)) from exc
         finally:
             if self._client is None:
                 client.close()
@@ -178,7 +240,7 @@ class OpenRouterClient:
                 raise ValueError("invalid extraction response")
             return value["fields"]
         except httpx.HTTPError as exc:
-            raise RuntimeError("OPENROUTER_UNAVAILABLE") from exc
+            raise RuntimeError(provider_error_code(exc)) from exc
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("METADATA_EXTRACTION_INVALID_RESPONSE") from exc
         finally:
@@ -243,7 +305,7 @@ class OpenRouterClient:
                 } for item in result["articles"] if isinstance(item, dict)]
             return result
         except (httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise RuntimeError("OPENROUTER_LLM_INVALID_RESPONSE" if isinstance(exc, (json.JSONDecodeError, TypeError, ValueError)) else "OPENROUTER_UNAVAILABLE") from exc
+            raise RuntimeError("OPENROUTER_LLM_INVALID_RESPONSE" if isinstance(exc, (json.JSONDecodeError, TypeError, ValueError)) else provider_error_code(exc)) from exc
         finally:
             if self._client is None:
                 client.close()
@@ -326,7 +388,7 @@ class OpenRouterClient:
                 "embedding_model_available": self.settings.openrouter_embedding_model in embedding_models,
             }
         except httpx.HTTPError as exc:
-            raise RuntimeError("OPENROUTER_UNAVAILABLE") from exc
+            raise RuntimeError(provider_error_code(exc)) from exc
         finally:
             if self._client is None:
                 client.close()

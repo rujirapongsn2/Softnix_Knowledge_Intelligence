@@ -1,5 +1,4 @@
 """Optional real pgvector coverage, run by docker-compose.pgvector-test.yml."""
-import os
 from datetime import datetime
 
 import pytest
@@ -7,12 +6,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
+from postgres_safety import postgres_test_url
 from app.models import Document, DocumentChunk, KnowledgeBase
 from app.openrouter import OpenRouterClient
 from app.services import query_database_vectors
 
 
-TEST_DATABASE_URL = os.getenv("TEST_POSTGRES_DATABASE_URL")
+TEST_DATABASE_URL = postgres_test_url()  # refuses any database not named *_test
 pytestmark = pytest.mark.skipif(not TEST_DATABASE_URL, reason="requires TEST_POSTGRES_DATABASE_URL")
 
 

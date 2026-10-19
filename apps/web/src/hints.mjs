@@ -1,4 +1,5 @@
 // What a hover hint says. Each builder returns {meaning, pending?, action?, detail?} or null.
+import {waitingFields} from "./metadata-states.mjs";
 
 export const ERROR_CODES = [
   "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED",
@@ -28,14 +29,14 @@ export const statusTip = (t, document) => {
 };
 
 export const metadataReviewTip = (t, document) => {
-  const labels = new Map((document.metadata_template_fields || []).map(field => [field.key, field.label || field.key]));
-  const pending = (document.metadata_pending_fields || []).map(key => labels.get(key) || key);
-  return {meaning: t("hint.metadata.needs_review"), pending: pending.length ? t("hint.metadata.pending", {fields: pending.join(", ")}) : null, action: t("hint.metadata.needs_review.action")};
+  const pending = waitingFields(document.metadata_template_fields || [], document.metadata_field_states).map(field => field.label || field.key);
+  return {meaning: t(document.metadata_status === "needs_attention" ? "hint.metadata.needs_attention" : "hint.metadata.unverified"),
+    pending: pending.length ? t("hint.metadata.pending", {fields: pending.join(", ")}) : null, action: t("hint.metadata.review.action")};
 };
 
 export const statusFilterTip = (t, value) => {
   if (value === "all") return {meaning: t("hint.filter.all")};
-  if (value === "metadata_review") return {meaning: t("hint.filter.metadata_review"), action: t("hint.metadata.needs_review.action")};
+  if (value === "metadata_review" || value === "metadata_attention") return {meaning: t(`hint.filter.${value}`), action: t("hint.metadata.review.action")};
   if (value === "deleted") return {meaning: t("hint.filter.deleted")};
   return STATUSES_WITH_HELP.includes(value) ? {meaning: t(`status.${value}.help`)} : null;
 };

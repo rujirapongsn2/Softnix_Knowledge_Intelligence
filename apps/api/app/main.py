@@ -1456,6 +1456,9 @@ def reprocess_document(document_id: str, user: User = Depends(current_admin), db
         if active.status == "queued":
             active.status, active.current_stage = "failed", "failed"
             active.error_message = "Superseded by a reprocess after the worker stopped."
+            if active.job_type == JobType.EXTRACT_DOCUMENT_METADATA:
+                # No extraction is queued now (the reprocess queues one once the text is ready): the values on hand decide.
+                update_metadata_status(doc)
         active = None
     if active:
         raise HTTPException(409, {

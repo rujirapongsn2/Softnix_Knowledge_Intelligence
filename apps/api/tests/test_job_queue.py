@@ -168,13 +168,18 @@ def test_stale_sweep_requeues_lost_jobs_and_leaves_live_ones():
 
 
 def test_reprocess_hands_a_stale_job_over_the_way_the_sweep_does():
-    """A reprocess must not disagree with the sweep: the loss is counted and the metadata status reset."""
+    """A reprocess must not disagree with the sweep: the loss is counted. The superseded metadata job leaves no
+    "queued" status without a job behind; the document's review state comes from the values it holds."""
     with TestClient(app) as client:
         assert client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-horse-battery-staple"}).status_code == 200
         with SessionLocal() as db:
             kb = _kb(db)
             metadata_doc, worn_doc = _doc(db, kb, "completed"), _doc(db, kb, "indexing")
             metadata_doc.metadata_status = "running"
+            metadata_doc.metadata_template_fields = [{"key": "issuer", "label": "Issuer", "field_type": "text", "fill_mode": "extract"}]
+            metadata_doc.document_metadata = {"issuer": "Land Dept"}
+            metadata_doc.metadata_observations = {"issuer": {"status": "suggested", "origin": "document_extraction",
+                                                             "candidates": [{"value": "Land Dept", "evidence": {"quote": "Land Dept"}}]}}
             metadata = ProcessingJob(document_id=metadata_doc.id, knowledge_base_id=kb.id, job_type=JobType.EXTRACT_DOCUMENT_METADATA,
                                      status="running", claim_token="dead-worker")
             worn = ProcessingJob(document_id=worn_doc.id, knowledge_base_id=kb.id, job_type=JobType.PROCESS_DOCUMENT,
@@ -190,7 +195,8 @@ def test_reprocess_hands_a_stale_job_over_the_way_the_sweep_does():
             old = db.get(ProcessingJob, ids[2])
             assert (old.status, old.error_code, old.lost_count, old.claim_token) == ("failed", WORKER_LOST, 1, None)
             assert old.error_message == "Superseded by a reprocess after the worker stopped."
-            assert db.get(Document, ids[0]).metadata_status == "queued"
+            assert db.get(Document, ids[0]).metadata_status == "unverified"
+            assert not db.query(ProcessingJob).filter_by(document_id=ids[0], job_type=JobType.EXTRACT_DOCUMENT_METADATA, status="queued").count()
             worn = db.get(ProcessingJob, ids[3])
             assert (worn.status, worn.lost_count) == ("failed", STALE_MAX_LOSSES)
             assert db.get(Document, ids[1]).status == "queued", "the reprocess itself is queued"

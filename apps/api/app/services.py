@@ -32,6 +32,7 @@ from .legal_edits import keep_manual_edits
 from .metadata_extraction import process_metadata_job, queue_metadata_extraction
 from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, JobType, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .data_quality import build_document_quality_reports
+from .embeddings import EmbeddingClient, EmbeddingPurpose
 from .openrouter import OpenRouterClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
@@ -2461,10 +2462,10 @@ def embed_document_chunks(db: Session, document_id: str) -> None:
     chunks = db.query(DocumentChunk).filter_by(document_id=document_id).order_by(DocumentChunk.chunk_index).all()
     if not chunks:
         return
-    client = OpenRouterClient()
-    if not client.embeddings_enabled:
+    client = EmbeddingClient()
+    if not client.enabled:
         return
-    vectors = client.embed_texts([chunk.content for chunk in chunks])
+    vectors = client.embed_texts([chunk.content for chunk in chunks], EmbeddingPurpose.DOCUMENT)
     for chunk, vector in zip(chunks, vectors, strict=True):
         chunk.embedding = vector
     db.flush()
@@ -2739,7 +2740,7 @@ def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
         # The session may be unusable (failed flush, deadlock victim): start clean
         # before recording the failure.
         db.rollback()
-        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_AUTH_FAILED", "OPENROUTER_CREDITS_EXHAUSTED", "OPENROUTER_REQUEST_REJECTED", "OPENROUTER_EMBEDDING_REQUEST_TOO_LARGE", "OPENROUTER_EMBEDDING_INVALID_RESPONSE", "OPENROUTER_EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
+        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_AUTH_FAILED", "OPENROUTER_CREDITS_EXHAUSTED", "OPENROUTER_REQUEST_REJECTED", "EMBEDDING_NOT_CONFIGURED", "EMBEDDING_UNAVAILABLE", "EMBEDDING_AUTH_FAILED", "EMBEDDING_CREDITS_EXHAUSTED", "EMBEDDING_REQUEST_TOO_LARGE", "EMBEDDING_REQUEST_REJECTED", "EMBEDDING_INVALID_RESPONSE", "EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
         logger.exception("document processing failed", extra={"document_id": doc.id, "job_id": job.id, "error_code": code})
         if _abandon_if_deleted(db, job, doc):
             return True
@@ -3255,15 +3256,15 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
         _append_retrieval_trace(trace, channel="semantic_vector", system="PostgreSQL + pgvector", status="skipped",
                                 started_at=started_at, detail="PostgreSQL is not the active database")
         return RetrievalEvidence([], [], [], [])
-    client = OpenRouterClient()
-    if not client.embeddings_enabled:
+    client = EmbeddingClient()
+    if not client.enabled:
         _append_retrieval_trace(trace, channel="semantic_vector", system="PostgreSQL + pgvector", status="skipped",
                                 started_at=started_at, detail="embedding provider is not configured")
         return RetrievalEvidence([], [], [], [])
     try:
-        query_vector = client.embed_texts([query])[0]
+        query_vector = client.embed_texts([query], EmbeddingPurpose.QUERY)[0]
     except RuntimeError as exc:
-        _append_retrieval_trace(trace, channel="semantic_vector", system="OpenRouter embeddings → PostgreSQL + pgvector",
+        _append_retrieval_trace(trace, channel="semantic_vector", system="Embedding server → PostgreSQL + pgvector",
                                 status="unavailable", started_at=started_at, detail=str(exc))
         return RetrievalEvidence([], [], [], [])
     distance = DocumentChunk.embedding.cosine_distance(query_vector)
@@ -3281,7 +3282,7 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
                 "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": max(0.0, 1.0 - float(item_distance)),
                 "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}
                for i, (chunk, document, item_distance) in enumerate(records, 1)]
-    _append_retrieval_trace(trace, channel="semantic_vector", system="OpenRouter embeddings → PostgreSQL + pgvector",
+    _append_retrieval_trace(trace, channel="semantic_vector", system="Embedding server → PostgreSQL + pgvector",
                             status="used", started_at=started_at, result_count=len(sources), detail="cosine similarity")
     return RetrievalEvidence(sources, [], [], [])
 

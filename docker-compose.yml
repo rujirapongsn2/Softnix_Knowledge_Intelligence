@@ -113,14 +113,18 @@ services:
       LLM_BINDING: openai
       LLM_BINDING_HOST: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       LLM_BINDING_API_KEY: ${OPENROUTER_API_KEY}
-      LLM_MODEL: ${OPENROUTER_LLM_MODEL:-openai/gpt-4o-mini}
-      KEYWORD_LLM_MODEL: ${OPENROUTER_LLM_MODEL:-openai/gpt-4o-mini}
-      QUERY_LLM_MODEL: ${OPENROUTER_LLM_MODEL:-openai/gpt-4o-mini}
+      # LIGHTRAG_LLM_MODEL lets graph extraction run on a cheaper model than the answer LLM.
+      LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${OPENROUTER_LLM_MODEL:-anthropic/claude-sonnet-5.5}}
+      KEYWORD_LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${OPENROUTER_LLM_MODEL:-anthropic/claude-sonnet-5.5}}
+      QUERY_LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${OPENROUTER_LLM_MODEL:-anthropic/claude-sonnet-5.5}}
+      # LightRAG cannot add the EMBEDDING_*_PREFIX task prompts the api uses, so its vectors are
+      # unprefixed (measured: unprefixed embeddinggemma is about as good as the old OpenAI model).
       EMBEDDING_BINDING: openai
-      EMBEDDING_BINDING_HOST: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
-      EMBEDDING_BINDING_API_KEY: ${OPENROUTER_API_KEY}
-      EMBEDDING_MODEL: ${OPENROUTER_EMBEDDING_MODEL:-openai/text-embedding-3-small}
-      EMBEDDING_DIM: ${OPENROUTER_EMBEDDING_DIMENSION:-1536}
+      EMBEDDING_BINDING_HOST: ${EMBEDDING_BASE_URL}
+      # The openai client refuses an empty key; llama-server without --api-key ignores it.
+      EMBEDDING_BINDING_API_KEY: ${EMBEDDING_API_KEY:-none}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embeddinggemma-2}
+      EMBEDDING_DIM: ${EMBEDDING_DIMENSION:-768}
       ENTITY_EXTRACTION_USE_JSON: "true"
       # Cap LightRAG's internal fan-out so one large document cannot exhaust
       # the upstream LLM provider's in-flight request budget (402 observed

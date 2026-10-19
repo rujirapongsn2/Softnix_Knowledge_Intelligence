@@ -43,9 +43,16 @@ class Settings(BaseSettings):
     neo4j_timeout_seconds: int = 5
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: str = ""
-    openrouter_llm_model: str = "openai/gpt-4o-mini"
-    openrouter_embedding_model: str = "openai/text-embedding-3-small"
-    openrouter_embedding_dimension: int = 1536
+    openrouter_llm_model: str = "anthropic/claude-sonnet-5.5"
+    # Any OpenAI-compatible POST {base}/embeddings server; empty disables embeddings.
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""
+    embedding_model: str = "embeddinggemma-2"
+    # Also sizes the pgvector column; see migration 0039 for changing it on an existing database.
+    embedding_dimension: int = 768
+    # embeddinggemma's task prompts; the query and document sides must use matching ones.
+    embedding_query_prefix: str = "task: search result | query: "
+    embedding_document_prefix: str = "title: none | text: "
     openrouter_rerank_model: str = ""
     rerank_candidate_limit: int = 20
     openrouter_app_url: str = ""

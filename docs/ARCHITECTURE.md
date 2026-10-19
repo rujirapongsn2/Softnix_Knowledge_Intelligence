@@ -12,7 +12,8 @@
 | PostgreSQL + pgvector | metadata, chunks, vector, FTS, provenance, legal registry, trace/audit | แหล่งข้อมูลหลักและแหล่ง citation |
 | Neo4j | entity/relationship projection และ bounded traversal | accelerator; PostgreSQL ยังเป็น authority |
 | LightRAG | semantic/graph retrieval เสริม | adapter เท่านั้น ไม่ใช่ source of truth |
-| OpenRouter | embedding, LLM fallback/answer และ optional rerank | external dependency; รับเฉพาะ evidence ที่กรองแล้ว |
+| OpenRouter | LLM answer/planning/extraction และ optional rerank | external dependency; รับเฉพาะ evidence ที่กรองแล้ว |
+| Embedding server | embedding ของ chunk และ query (`EMBEDDING_BASE_URL`, OpenAI-compatible; ค่าเริ่มต้น llama.cpp + embeddinggemma) | แยกจาก LLM provider; error ใช้รหัส `EMBEDDING_*` |
 
 ไฟล์ต้นฉบับเก็บใน volume `files` นอก web root และไม่ส่งให้ query client โดยตรง
 
@@ -29,7 +30,7 @@ Document Type คือ metadata contract ของผู้ดูแล ส่�
 `RetrievalPlan` ถูกสร้างด้วย rule-first planner และเก็บ intent, channels, graph scope/depth, entity/document identifiers, publication date range และ `rerank_enabled` ไว้ใน response, audit และ trace
 
 - Exact: ค้นชื่อเอกสาร, original filename และเลขเอกสารใน chunk
-- Vector: pgvector cosine similarity จาก embedding 1536 มิติ
+- Vector: pgvector cosine similarity จาก embedding `EMBEDDING_DIMENSION` มิติ (ค่าเริ่มต้น 768) query และ chunk ใส่ task prefix ของ embeddinggemma คนละแบบ
 - Full-text: PostgreSQL FTS และ fallback แบบ case-insensitive สำหรับข้อความไทย
 - Graph: local จาก entity/alias ที่ resolve ได้ หรือ global ที่สรุปหลักฐานจากหลาย connected components
 - Metadata filter: กรองจาก field snapshot แบบ exact match ก่อนส่งเข้า vector, full-text, exact และ graph evidence

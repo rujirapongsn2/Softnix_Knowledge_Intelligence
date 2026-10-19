@@ -38,7 +38,8 @@ flowchart LR
   Executor --> PG
   Executor --> Neo4j
   Executor --> RAG
-  Executor --> LLM[OpenRouter: embeddings / answer / optional rerank]
+  Executor --> LLM[OpenRouter: answer / optional rerank]
+  Executor --> EMB[Embedding server: chunk + query vectors]
   LLM --> API
 ```
 

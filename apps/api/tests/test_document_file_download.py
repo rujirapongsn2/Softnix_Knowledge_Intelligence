@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
 
+from app.config import get_settings
 from app.db import SessionLocal
 from app.data_quality import _has_value
 from app.main import app
@@ -69,7 +70,7 @@ def test_document_file_download_missing_disk_file_returns_404():
             char_start=0,
             char_end=len(indexed_text),
             token_count=10,
-            embedding=[0.0] * 1536,
+            embedding=[0.0] * get_settings().embedding_dimension,
         ))
         db.commit()
     quality = test_client.get(f"/api/v1/documents/{doc_id}/text").json()["quality"]

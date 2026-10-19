@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 from pgvector.sqlalchemy import Vector
 
+from .config import get_settings
 from .db import Base
 
 
@@ -236,7 +237,7 @@ class DocumentChunk(Timestamped, Base):
     char_start: Mapped[int] = mapped_column(Integer)
     char_end: Mapped[int] = mapped_column(Integer)
     token_count: Mapped[int] = mapped_column(Integer)
-    embedding: Mapped[list[float] | None] = mapped_column(Vector(1536).with_variant(JSON, "sqlite"), nullable=True)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(get_settings().embedding_dimension).with_variant(JSON, "sqlite"), nullable=True)
     # Populated only for legal documents by the section-aware splitter; None for
     # fixed-size chunks of general documents.
     section_kind: Mapped[str | None] = mapped_column(String(30), nullable=True)

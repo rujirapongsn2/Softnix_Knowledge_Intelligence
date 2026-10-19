@@ -29,6 +29,7 @@ from .metadata_search import describe_schema
 from .legal_edits import with_manual_edits
 from .metadata_extraction import queue_metadata_extraction, update_status as update_metadata_status
 from .observability import metrics, now
+from .embeddings import EmbeddingClient
 from .openrouter import OpenRouterClient
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
@@ -2399,9 +2400,10 @@ def query_feedback(result_id: str, payload: QueryFeedbackCreate, user: User = De
 @app.post("/api/v1/system/test-openrouter")
 def test_openrouter(_: User = Depends(current_admin)):
     try:
-        return OpenRouterClient().check()
+        llm = OpenRouterClient().check()
     except RuntimeError as exc:
         raise HTTPException(503, {"code": str(exc), "message": "OpenRouter configuration check failed", "retryable": True})
+    return {**llm, **EmbeddingClient().check()}
 
 
 @app.get("/api/v1/system/graph-projection")

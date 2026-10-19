@@ -27,7 +27,7 @@ DEFAULT_RETRY = RetryPolicy(3, exponential_delay(2, 60))
 # The shared provider account frees in-flight quota over minutes, so budget exhaustion earns more attempts and a longer wait.
 BUDGET_RETRY = RetryPolicy(6, exponential_delay(2, 60, floor=60))
 
-# OpenRouter outages, rate limits (429) and credit/key problems are not fixed within seconds either:
+# Provider outages (OpenRouter or the embedding server), rate limits (429) and credit/key problems are not fixed within seconds either:
 # wait at least a minute, doubling to 15 minutes, six attempts (about half an hour in all).  The job is
 # re-queued with a later next_attempt_at, so the worker keeps serving other jobs meanwhile.
 PROVIDER_RETRY = RetryPolicy(6, exponential_delay(60, 900, floor=60))
@@ -45,8 +45,8 @@ PROCESSING_RETRY_POLICIES: dict[str, RetryPolicy] = {
         "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT",
         "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_TIMEOUT", "OCR_CHAIN_FAILED",
     ), DEFAULT_RETRY),
-    "OPENROUTER_UNAVAILABLE": PROVIDER_RETRY,
-    "OPENROUTER_CREDITS_EXHAUSTED": CREDITS_RETRY,
+    **dict.fromkeys(("OPENROUTER_UNAVAILABLE", "EMBEDDING_UNAVAILABLE"), PROVIDER_RETRY),
+    **dict.fromkeys(("OPENROUTER_CREDITS_EXHAUSTED", "EMBEDDING_CREDITS_EXHAUSTED"), CREDITS_RETRY),
     "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED": BUDGET_RETRY,
     "RETRIEVAL_ENGINE_UNAVAILABLE": ENGINE_DOWN_RETRY,
 }

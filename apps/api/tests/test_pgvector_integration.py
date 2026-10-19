@@ -5,10 +5,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.config import get_settings
 from app.db import Base
+from app.embeddings import EmbeddingClient
 from postgres_safety import postgres_test_url
 from app.models import Document, DocumentChunk, KnowledgeBase
-from app.openrouter import OpenRouterClient
 from app.services import query_database_vectors
 
 
@@ -18,7 +19,7 @@ pytestmark = pytest.mark.skipif(not TEST_DATABASE_URL, reason="requires TEST_POS
 
 def test_pgvector_retrieval_uses_a_real_vector_index(monkeypatch):
     engine = create_engine(TEST_DATABASE_URL)
-    vector = [1.0] + [0.0] * 1535
+    vector = [1.0] + [0.0] * (get_settings().embedding_dimension - 1)
     try:
         with engine.begin() as connection:
             connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
@@ -37,8 +38,8 @@ def test_pgvector_retrieval_uses_a_real_vector_index(monkeypatch):
                                  content="Semantic vector evidence", content_sha256="2" * 64, char_start=0, char_end=24,
                                  token_count=3, embedding=vector))
             db.commit()
-            monkeypatch.setattr(OpenRouterClient, "embeddings_enabled", property(lambda _: True))
-            monkeypatch.setattr(OpenRouterClient, "embed_texts", lambda _self, _texts: [vector])
+            monkeypatch.setattr(EmbeddingClient, "enabled", property(lambda _: True))
+            monkeypatch.setattr(EmbeddingClient, "embed_texts", lambda _self, _texts, _purpose: [vector])
             trace = []
             result = query_database_vectors(db, "semantic evidence", [kb.id], 5, trace)
             assert len(result.sources) == 1

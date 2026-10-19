@@ -7,7 +7,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import load_only
 
 from .document_templates import list_templates
-from .metadata_extraction import trust_of
+from .metadata_extraction import trust_of, usable_values
 from .models import Document, DocumentMetadataValue
 
 
@@ -112,7 +112,7 @@ def decorate_sources(db, sources, kb_ids, requested_keys=()):
         if not doc:
             continue
         visible = {f["key"] for f in doc.metadata_template_fields or [] if f.get("searchable", True)}
-        values = {k: v for k, v in (doc.document_metadata or {}).items() if k in visible}
+        values = {k: v for k, v in usable_values(doc).items() if k in visible}
         ordered = list(dict.fromkeys([k for k in requested_keys if k in values] + list(values)))[:8]
         source["document_metadata"] = {k: values[k][:1000] if isinstance(values[k], str) else values[k] for k in ordered}
         source["metadata_projection_truncated"] = len(ordered) < len(values) or any(isinstance(values[k], str) and len(values[k]) > 1000 for k in ordered)

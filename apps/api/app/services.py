@@ -29,7 +29,7 @@ from .legal_corpus import parse_legal_corpus_metadata
 from .document_templates import LIST_FIELD_TYPES, metadata_search_text, normalize_field_definitions
 from .metadata_search import apply_typed_predicates, decorate_sources, metadata_coverage, predicate_coverage
 from .legal_edits import keep_manual_edits
-from .metadata_extraction import process_metadata_job, queue_metadata_extraction, trust_of
+from .metadata_extraction import process_metadata_job, queue_metadata_extraction, trust_of, usable_values
 from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, JobType, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .data_quality import build_document_quality_reports
 from .embeddings import EmbeddingClient, EmbeddingPurpose
@@ -148,7 +148,7 @@ def sync_document_metadata_values(db: Session, document: Document) -> None:
     """Maintain the indexed projection used by exact metadata filters."""
     db.query(DocumentMetadataValue).filter(DocumentMetadataValue.document_id == document.id).delete(synchronize_session=False)
     fields = normalize_field_definitions(document.metadata_template_fields)
-    values = document.document_metadata or {}
+    values = usable_values(document)
     for field in fields:
         key = field.get("key")
         value = values.get(key) if key else None

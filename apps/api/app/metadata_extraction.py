@@ -51,6 +51,13 @@ def trust_of(observation):
     return PUBLICATION.get((observation or {}).get("status", "legacy_manual"), (False, "unverified"))[1]
 
 
+def usable_values(document):
+    """Values that filters, search and answers may use. A blocked value (kept from an earlier source version while the
+    new extraction conflicts) stays in document_metadata so a person sees it, but nothing else relies on it."""
+    observations = document.metadata_observations or {}
+    return {k: v for k, v in (document.document_metadata or {}).items() if trust_of(observations.get(k)) != "blocked"}
+
+
 def published_candidate(observation):
     """The candidate an extraction result puts into use, or None. Every candidate's quote was found in the source."""
     candidates = observation.get("candidates") or []
@@ -325,7 +332,7 @@ def reevaluate_observations(db, document):
         document.document_metadata = values
         document.metadata_observations = observations
         document.metadata_revision += 1
-        document.metadata_search_text = metadata_search_text(document.metadata_template_fields, values)
+        document.metadata_search_text = metadata_search_text(document.metadata_template_fields, usable_values(document))
         sync_document_metadata_values(db, document)
         sync_document_metadata_graph(db, document)
     # A queued, running or failed extraction owns the status until it finishes. needs_review predates the review states.
@@ -383,7 +390,7 @@ def process_metadata_job(db, job):
         document.document_metadata = values
         document.metadata_observations = {**(document.metadata_observations or {}), **observations}
         document.metadata_revision += 1
-        document.metadata_search_text = metadata_search_text(document.metadata_template_fields, values)
+        document.metadata_search_text = metadata_search_text(document.metadata_template_fields, usable_values(document))
         update_status(document)
         sync_document_metadata_values(db, document)
         sync_document_metadata_graph(db, document)

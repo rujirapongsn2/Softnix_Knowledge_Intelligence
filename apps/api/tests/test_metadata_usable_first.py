@@ -62,6 +62,27 @@ def test_conflicting_or_unbacked_values_are_not_used_and_the_document_needs_atte
     assert doc_id in page(api, kb, "needs_review") and doc_id in page(api, kb, "needs_attention")
 
 
+def test_a_value_kept_from_an_older_source_is_shown_but_not_used_once_the_new_extraction_conflicts(monkeypatch):
+    api = next(client())
+    kb, _, doc_id = setup_document(api)
+    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", answer(("Land Dept", "Issuer: Land Department.")))
+    queue_and_run(doc_id)
+    with SessionLocal() as db:
+        db.get(Document, doc_id).extracted_text = "Issuer: Land Department. Issuer: Land Office."
+        db.commit()
+    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", answer(("Land Department", "Issuer: Land Department."),
+                                                                              ("Land Office", "Issuer: Land Office.")))
+    queue_and_run(doc_id)
+    preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
+    assert preview["document_metadata"] == {"issuer": "Land Dept"} and preview["metadata_field_states"] == {"issuer": "blocked"}
+    with SessionLocal() as db:
+        assert db.query(DocumentMetadataValue).filter_by(document_id=doc_id).count() == 0
+        assert "Land Dept" not in db.get(Document, doc_id).metadata_search_text
+        sources = [{"document_id": doc_id}]
+        decorate_sources(db, sources, [kb["id"]])
+    assert sources[0]["document_metadata"] == {} and sources[0]["metadata_provenance"] == {}
+
+
 def test_a_document_is_complete_once_every_extracted_value_is_verified_or_auto_verified(monkeypatch):
     api = next(client())
     _, _, doc_id = setup_document(api, [field("issuer"), field("office")])

@@ -27,7 +27,7 @@ from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, cu
 from .data_quality import build_document_quality_report, build_knowledge_base_quality_report
 from .metadata_search import describe_schema
 from .legal_edits import with_manual_edits
-from .metadata_extraction import field_review_states, queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status, with_review_outcome
+from .metadata_extraction import field_review_states, queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status, usable_values, with_review_outcome
 from .metadata_quality import metadata_quality_report
 from .observability import metrics, now
 from .embeddings import EmbeddingClient
@@ -1291,7 +1291,7 @@ def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, 
             doc.metadata_observations = observations
             doc.metadata_revision += 1
             update_metadata_status(doc)
-            doc.metadata_search_text = metadata_search_text(fields, doc.document_metadata)
+            doc.metadata_search_text = metadata_search_text(fields, usable_values(doc))
             sync_document_metadata_values(db, doc)
             sync_document_metadata_graph(db, doc)
         except ValueError as exc:
@@ -1401,7 +1401,7 @@ def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, use
     observations[payload.field_key] = observation
     doc.document_metadata, doc.metadata_observations = values, observations
     doc.metadata_revision += 1
-    doc.metadata_search_text = metadata_search_text(doc.metadata_template_fields, values)
+    doc.metadata_search_text = metadata_search_text(doc.metadata_template_fields, usable_values(doc))
     update_metadata_status(doc)
     sync_document_metadata_values(db, doc)
     sync_document_metadata_graph(db, doc)

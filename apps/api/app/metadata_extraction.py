@@ -15,9 +15,14 @@ WINDOW_OVERLAP = 1000
 MAX_WINDOWS = 20
 
 
+def content_digest(text):
+    """The source version an observation was extracted from."""
+    return hashlib.sha256((text or "").encode()).hexdigest()
+
+
 def extraction_fields(document):
     observations = document.metadata_observations or {}
-    digest = hashlib.sha256((document.extracted_text or "").encode()).hexdigest()
+    digest = content_digest(document.extracted_text)
     return [f for f in (document.metadata_template_fields or [])
             if f.get("fill_mode") == "extract"
             and not observations.get(f["key"], {}).get("locked")
@@ -279,7 +284,7 @@ def extract_candidates(fields, text, client):
                     else:
                         invalid.add(key)
     observations = {}
-    digest = hashlib.sha256(text.encode()).hexdigest()
+    digest = content_digest(text)
     for field in fields:
         key = field["key"]
         candidates = collected[key]
@@ -310,7 +315,7 @@ def reevaluate_observations(db, document):
     fields whose published value or status changed."""
     from .services import sync_document_metadata_graph, sync_document_metadata_values
 
-    digest = hashlib.sha256((document.extracted_text or "").encode()).hexdigest()
+    digest = content_digest(document.extracted_text)
     values = dict(document.document_metadata or {})
     observations = dict(document.metadata_observations or {})
     changed = 0

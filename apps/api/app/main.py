@@ -27,7 +27,7 @@ from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, cu
 from .data_quality import build_document_quality_report, build_knowledge_base_quality_report
 from .metadata_search import describe_schema
 from .legal_edits import with_manual_edits
-from .metadata_extraction import field_review_states, queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status, usable_values, with_review_outcome
+from .metadata_extraction import content_digest, field_review_states, queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status, usable_values, with_review_outcome
 from .metadata_quality import metadata_quality_report
 from .observability import metrics, now
 from .embeddings import EmbeddingClient
@@ -1393,7 +1393,7 @@ def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, use
             candidates = observation.get("candidates", [])
             if payload.candidate_index >= len(candidates):
                 raise HTTPException(400, "Candidate not found")
-            if observation.get("content_version") != hashlib.sha256((doc.extracted_text or "").encode()).hexdigest():
+            if observation.get("content_version") != content_digest(doc.extracted_text):
                 raise HTTPException(409, "Source changed. Extract metadata again.")
             value = candidates[payload.candidate_index]["value"]
         try:

@@ -1,7 +1,8 @@
-import React, {useCallback, useEffect, useState} from "react";
+import React, {useCallback, useEffect, useRef, useState} from "react";
 import {Button, EmptyState} from "./ui.jsx";
 import {useLanguage} from "./language.jsx";
 import {fieldReview} from "./metadata-states.mjs";
+import {latestRequest} from "./latest-request.mjs";
 
 const COUNTS = ["verified", "auto_verified", "unverified", "blocked", "missing"];
 const display = value => value === undefined || value === null ? null : Array.isArray(value) ? value.join(", ") : String(value);
@@ -12,22 +13,26 @@ export function MetadataQualityTab({knowledgeBaseId, api, refreshKey, onOpenDocu
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const requests = useRef(latestRequest()).current;
   const load = useCallback(async () => {
+    const isCurrent = requests.begin();
     setLoading(true); setError("");
-    try { setReport(await api(`/v1/knowledge-bases/${knowledgeBaseId}/metadata-quality`)); }
-    catch (err) { setError(err.message); }
-    finally { setLoading(false); }
-  }, [api, knowledgeBaseId]);
+    try { const next = await api(`/v1/knowledge-bases/${knowledgeBaseId}/metadata-quality`); if (isCurrent()) setReport(next); }
+    catch (err) { if (isCurrent()) setError(err.message); }
+    finally { if (isCurrent()) setLoading(false); }
+  }, [api, knowledgeBaseId, requests]);
   useEffect(() => { setReport(null); setNotice(""); }, [knowledgeBaseId]);
   // A review in the document preview changes the numbers; reload when it saves or closes.
   useEffect(() => { load(); }, [load, refreshKey]);
   const reevaluate = async () => {
+    const isCurrent = requests.begin();
     setLoading(true); setError(""); setNotice("");
     try {
       const result = await api(`/v1/knowledge-bases/${knowledgeBaseId}/metadata-reevaluate`, {method: "POST"});
+      if (!isCurrent()) return;
       setNotice(t("metadataQuality.reevaluated", result));
       await load();
-    } catch (err) { setError(err.message); setLoading(false); }
+    } catch (err) { if (isCurrent()) { setError(err.message); setLoading(false); } }
   };
   const accuracy = row => row.ai_accuracy === null ? t("metadataQuality.accuracyNone") : `${Math.round(row.ai_accuracy * 100)}%`;
   return <section className="content-section metadata-quality">

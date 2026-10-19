@@ -27,7 +27,8 @@ from .document_templates import SYSTEM_TEMPLATE_CODES, SYSTEM_TEMPLATE_NAMES, cu
 from .data_quality import build_document_quality_report, build_knowledge_base_quality_report
 from .metadata_search import describe_schema
 from .legal_edits import with_manual_edits
-from .metadata_extraction import field_review_states, queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status
+from .metadata_extraction import field_review_states, queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status, with_review_outcome
+from .metadata_quality import metadata_quality_report
 from .observability import metrics, now
 from .embeddings import EmbeddingClient
 from .openrouter import OpenRouterClient
@@ -1282,7 +1283,10 @@ def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, 
             observations = dict(doc.metadata_observations or {})
             for field in fields:
                 key = field["key"]
-                observations[key] = {**observations.get(key, {}), "status": "human_verified" if key in doc.document_metadata else "not_found_confirmed",
+                observation = observations.get(key, {})
+                if observation.get("status") not in {"human_verified", "not_found_confirmed"}:
+                    observation = with_review_outcome(observation, doc.document_metadata.get(key))
+                observations[key] = {**observation, "status": "human_verified" if key in doc.document_metadata else "not_found_confirmed",
                                      "origin": "manual", "locked": True, "reviewed_by": user.id, "reviewed_at": datetime.utcnow().isoformat()}
             doc.metadata_observations = observations
             doc.metadata_revision += 1
@@ -1348,6 +1352,15 @@ def reevaluate_custom_metadata(kb_id: str, user: User = Depends(current_admin), 
     return {"documents": changed_documents, "fields": changed_fields}
 
 
+@app.get("/api/v1/knowledge-bases/{kb_id}/metadata-quality")
+def custom_metadata_quality(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
+    return metadata_quality_report(db, kb_id)
+
+
 @app.post("/api/v1/documents/{document_id}/metadata-review")
 def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     # Lock order Knowledge Base -> document: take the KB graph lock before the row lock.
@@ -1380,6 +1393,7 @@ def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, use
             values[payload.field_key] = validate_metadata_values([{**field, "required": True}], {payload.field_key: value})[payload.field_key]
         except (ValueError, KeyError):
             raise HTTPException(400, "Invalid metadata value")
+    observation = with_review_outcome(observation, values.get(payload.field_key), confirmed=payload.action == "confirm")
     observation.update(status="not_found_confirmed" if payload.action == "not_found" else "human_verified",
                        locked=True, reviewed_by=user.id, reviewed_at=datetime.utcnow().isoformat())
     if payload.action == "set":

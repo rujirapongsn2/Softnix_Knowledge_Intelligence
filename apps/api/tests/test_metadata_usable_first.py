@@ -8,7 +8,7 @@ from test_auto_metadata import field, queue_and_run, setup_document
 from app.db import SessionLocal
 from app.metadata_extraction import trust_of
 from app.metadata_search import decorate_sources
-from app.models import Document, DocumentMetadataValue
+from app.models import Document, DocumentMetadataValue, ProcessingJob
 from app.openrouter import OpenRouterClient
 
 
@@ -115,4 +115,68 @@ def test_the_review_state_migration_keeps_every_waiting_document_in_front_of_a_p
         assert dict(connection.execute(text("SELECT id, metadata_status FROM documents")).all()) == {"a": "needs_attention", "b": "complete", "c": "failed"}
         migration.downgrade()
         assert connection.execute(text("SELECT metadata_status FROM documents WHERE id = 'a'")).scalar() == "needs_review"
+
+
+def add_document(api, kb, template, title):
+    response = api.post(f"/api/v1/knowledge-bases/{kb['id']}/documents", data={"template_id": template["id"], "title": title},
+                        files={"file": (f"{title}.txt", f"Issuer: Land Department. {title} {kb['id']}".encode(), "text/plain")})
+    assert response.status_code == 200, response.text
+    doc_id = response.json()["document_id"]
+    with SessionLocal() as db:
+        document = db.get(Document, doc_id)
+        document.extracted_text, document.status, document.title = "Issuer: Land Department.", "completed", title
+        db.query(ProcessingJob).filter_by(document_id=doc_id).update({"status": "completed"})
+        db.commit()
+    return doc_id
+
+
+def extract(monkeypatch, doc_id, **answers):
+    quote = "Issuer: Land Department."
+    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata",
+                        lambda self, fields, text: {key: [{"value": value, "evidence_quote": quote} for value in values] for key, values in answers.items()})
+    queue_and_run(doc_id)
+
+
+def review(api, doc_id, field_key, action, **extra):
+    revision = api.get(f"/api/v1/documents/{doc_id}/text").json()["metadata_revision"]
+    response = api.post(f"/api/v1/documents/{doc_id}/metadata-review", json={"revision": revision, "field_key": field_key, "action": action, **extra})
+    assert response.status_code == 200, response.text
+    return api.get(f"/api/v1/documents/{doc_id}/text").json()["metadata_observations"][field_key]
+
+
+def test_reviews_record_whether_the_ai_was_right_and_the_quality_view_ranks_what_to_fix(monkeypatch):
+    api = next(client())
+    kb, template, first = setup_document(api, [field("issuer"), field("office")])
+    second, third, fourth = (add_document(api, kb, template, title) for title in ("b-second", "c-third", "d-fourth"))
+    extract(monkeypatch, first, issuer=["Land Dept"], office=["A", "B"])
+    extract(monkeypatch, second, issuer=["Land Dept"], office=["X"])
+    extract(monkeypatch, third, issuer=["Land Dept", "Land Office"], office=["Y"])
+    extract(monkeypatch, fourth, issuer=["Land Dept", "Land Office"], office=["Z"])
+    corrected = review(api, first, "issuer", "set", value="Land Department")
+    assert (corrected["review_outcome"], corrected["ai_value"]) == ("corrected", "Land Dept")
+    assert review(api, second, "issuer", "confirm")["review_outcome"] == "confirmed"
+    assert review(api, second, "office", "not_found")["review_outcome"] == "rejected"
+
+    report = api.get(f"/api/v1/knowledge-bases/{kb['id']}/metadata-quality").json()
+    # The field the AI gets wrong most often comes first, even though the other has more blocked values.
+    office, issuer = report["fields"]
+    assert (office["field_key"], office["ai_accuracy"], office["outcomes"]) == ("office", 0.0, {"confirmed": 0, "corrected": 0, "rejected": 1})
+    assert {k: v for k, v in office["counts"].items() if v} == {"blocked": 1, "not_found": 1, "unverified": 2}
+    assert (issuer["field_key"], issuer["ai_accuracy"]) == ("issuer", 0.5)
+    assert {k: v for k, v in issuer["counts"].items() if v} == {"verified": 2, "blocked": 2}
+    assert [(a["document_id"], a["field_key"], a["state"], a["value"]) for a in report["next_actions"]] == [
+        (first, "office", "blocked", "A"), (third, "issuer", "blocked", "Land Dept"), (fourth, "issuer", "blocked", "Land Dept"),
+        (third, "office", "unverified", "Y"), (fourth, "office", "unverified", "Z")]
+
+
+def test_saving_the_whole_form_records_an_outcome_only_for_fields_not_reviewed_before(monkeypatch):
+    api = next(client())
+    _, _, doc_id = setup_document(api, [field("issuer"), field("office")])
+    extract(monkeypatch, doc_id, issuer=["Land Dept"], office=["X"])
+    review(api, doc_id, "office", "confirm")
+    # A person changing their own earlier answer says nothing new about the AI.
+    assert api.patch(f"/api/v1/documents/{doc_id}/metadata", json={"values": {"issuer": "Land Department", "office": "Z"}}).status_code == 200
+    observations = api.get(f"/api/v1/documents/{doc_id}/text").json()["metadata_observations"]
+    assert (observations["issuer"]["review_outcome"], observations["issuer"]["ai_value"]) == ("corrected", "Land Dept")
+    assert observations["office"]["review_outcome"] == "confirmed"
 

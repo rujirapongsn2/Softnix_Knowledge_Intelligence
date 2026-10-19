@@ -79,6 +79,15 @@ def update_status(document):
     document.metadata_status = next((status for status in reversed(REVIEW_STATUSES) if status in needs), "complete")
 
 
+def with_review_outcome(observation, value, *, confirmed=False):
+    """Record how a person's review answered the AI's top candidate. value is None when the field is not in the document."""
+    if "candidates" not in observation:
+        return observation
+    ai_value = (observation["candidates"] or [{}])[0].get("value")
+    outcome = "confirmed" if confirmed or value == ai_value else "rejected" if value is None else "corrected"
+    return {**observation, "review_outcome": outcome, "ai_value": ai_value}
+
+
 def queue_metadata_extraction(db, document):
     # Callers hold a document row lock (or own an uncommitted new document).
     # Do not delete the last evidence-backed value just because the source has

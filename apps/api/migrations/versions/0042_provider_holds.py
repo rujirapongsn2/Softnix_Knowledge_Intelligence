@@ -22,6 +22,7 @@ def upgrade() -> None:
         sa.Column("next_probe_at", sa.DateTime(), nullable=False),
         sa.Column("probe_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("last_probe_error", sa.String(100), nullable=True),
+        sa.Column("lifted_at", sa.DateTime(), nullable=True),
     )
 
 

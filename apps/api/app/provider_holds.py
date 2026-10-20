@@ -16,6 +16,7 @@ from typing import Callable
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .config import get_settings
 from .embeddings import EmbeddingClient
 from .llm import LLMClient
 from .models import JobType, ProcessingJob, ProviderHold
@@ -37,10 +38,20 @@ JOB_PROVIDERS: dict[str, frozenset[str]] = {
 }
 FIRST_PROBE_SECONDS = 60
 MAX_PROBE_SECONDS = 600
+# A failure this soon after a lift came from a request sent before it; it waits alone instead of holding everyone.
+LIFT_GRACE_SECONDS = 120
+# A job that keeps hitting the provider failure on its own (one oversized request, say) while the probes pass
+# would otherwise wait and hold the queue forever; after this many waits it fails like any other job.
+MAX_PROVIDER_WAITS = 20
 
 
 def _probe_llm() -> str | None:
-    return LLMClient().probe()
+    settings, client = get_settings(), LLMClient()
+    # LightRAG may extract with its own model on the same account; both must answer before jobs resume.
+    for model in dict.fromkeys(filter(None, (settings.llm_model, settings.lightrag_llm_model))):
+        if error := client.probe(model):
+            return error
+    return None
 
 
 def _probe_embedding() -> str | None:
@@ -56,45 +67,68 @@ def provider_of(code: str | None) -> str | None:
     return HOLD_CODES.get(code or "")
 
 
-def place_hold(db: Session, provider: str, code: str) -> None:
-    """Record the hold in its own savepoint; a hold another worker placed first is kept as it is."""
-    if db.get(ProviderHold, provider) is not None:
+def place_hold(db: Session, provider: str, code: str, now: datetime | None = None) -> None:
+    """Hold the provider in its own savepoint. A hold already in place is kept as it is, and a failure within
+    LIFT_GRACE_SECONDS of a lift does not hold again."""
+    now = now or datetime.utcnow()
+    hold = db.get(ProviderHold, provider)
+    if hold is not None and (hold.lifted_at is None or now - hold.lifted_at < timedelta(seconds=LIFT_GRACE_SECONDS)):
         return
-    now = datetime.utcnow()
     try:
         with db.begin_nested():
-            db.add(ProviderHold(provider=provider, reason_code=code, held_since=now,
-                                next_probe_at=now + timedelta(seconds=FIRST_PROBE_SECONDS)))
+            if hold is None:
+                hold = ProviderHold(provider=provider)
+                db.add(hold)
+            hold.reason_code, hold.held_since, hold.lifted_at = code, now, None
+            hold.next_probe_at, hold.probe_count, hold.last_probe_error = now + timedelta(seconds=FIRST_PROBE_SECONDS), 0, None
         logger.warning("provider hold placed", extra={"provider": provider, "error_code": code})
     except IntegrityError:
         pass
 
 
-def wait_for_provider(db: Session, job: ProcessingJob, code: str) -> None:
-    """Hold the job's provider and put the job back in the queue without spending the attempt it just made."""
+def wait_for_provider(db: Session, job: ProcessingJob, code: str) -> bool:
+    """Hold the job's provider and put the job back in the queue without spending the attempt it just made.
+
+    Returns False, leaving job and provider alone, once the job has waited MAX_PROVIDER_WAITS times; the caller
+    then fails it as usual.
+    """
+    if job.deferral_count >= MAX_PROVIDER_WAITS:
+        return False
     place_hold(db, provider_of(code), code)
+    job.deferral_count += 1
     job.status, job.current_stage = "queued", "waiting_for_provider"
     job.attempt_count = max(0, job.attempt_count - 1)
-    job.next_attempt_at = datetime.utcnow()
+    # Claims skip the job while the hold lasts; inside the lift grace, when no hold was placed, it waits a probe interval.
+    job.next_attempt_at = datetime.utcnow() + timedelta(seconds=FIRST_PROBE_SECONDS)
     job.error_code = code
     job.error_message = "Waiting for the AI provider (credits or API key); the job continues on its own once it answers again."
+    return True
 
 
 def held_job_types(db: Session) -> list[str]:
-    held = {hold.provider for hold in db.query(ProviderHold).all()}
+    held = {provider for (provider,) in db.query(ProviderHold.provider).filter(ProviderHold.lifted_at.is_(None))}
     return [job_type for job_type, providers in JOB_PROVIDERS.items() if providers & held] if held else []
 
 
 def probe_holds(db: Session, now: datetime | None = None) -> list[str]:
-    """Probe every hold that is due; lift the ones whose provider answers and return their providers."""
+    """Probe every hold that is due; lift the ones whose provider answers and return their providers.
+
+    The transaction is closed before the provider calls, so a slow provider holds no locks or snapshot.
+    """
     now = now or datetime.utcnow()
+    due = [provider for (provider,) in db.query(ProviderHold.provider).filter(
+        ProviderHold.lifted_at.is_(None), ProviderHold.next_probe_at <= now)]
+    db.rollback()
+    results = {provider: PROBES[provider]() for provider in due}
     lifted = []
-    for hold in db.query(ProviderHold).filter(ProviderHold.next_probe_at <= now).all():
-        error = PROBES[hold.provider]()
+    for provider, error in results.items():
+        hold = db.get(ProviderHold, provider)
+        if hold is None or hold.lifted_at is not None:
+            continue
         if error is None:
-            db.delete(hold)
-            lifted.append(hold.provider)
-            logger.warning("provider hold lifted", extra={"provider": hold.provider, "held_since": hold.held_since.isoformat()})
+            hold.lifted_at = datetime.utcnow()
+            lifted.append(provider)
+            logger.warning("provider hold lifted", extra={"provider": provider, "held_since": hold.held_since.isoformat()})
         else:
             hold.probe_count += 1
             hold.last_probe_error = error
@@ -106,4 +140,4 @@ def probe_holds(db: Session, now: datetime | None = None) -> list[str]:
 def hold_view(db: Session) -> list[dict]:
     return [{"provider": hold.provider, "reason_code": hold.reason_code, "held_since": hold.held_since,
              "next_probe_at": hold.next_probe_at, "probe_count": hold.probe_count, "last_probe_error": hold.last_probe_error}
-            for hold in db.query(ProviderHold).order_by(ProviderHold.held_since).all()]
+            for hold in db.query(ProviderHold).filter(ProviderHold.lifted_at.is_(None)).order_by(ProviderHold.held_since)]

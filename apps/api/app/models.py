@@ -355,6 +355,8 @@ class ProviderHold(Base):
     next_probe_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     probe_count: Mapped[int] = mapped_column(Integer, default=0)
     last_probe_error: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Set when a probe lifts the hold; the row stays so a late failure from before the lift cannot re-place it.
+    lifted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class Entity(Timestamped, Base):

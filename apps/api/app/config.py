@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     job_heartbeat_seconds: int = 30
     job_stale_after_seconds: int = 900
     lightrag_workspace_prefix: str = "skip-"
+    # The model LightRAG extracts the graph with (compose passes it to LightRAG); empty means llm_model.
+    lightrag_llm_model: str = ""
     neo4j_http_url: str = ""
     neo4j_username: str = "neo4j"
     neo4j_password: str = ""

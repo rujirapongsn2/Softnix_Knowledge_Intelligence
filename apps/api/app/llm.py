@@ -104,10 +104,10 @@ class LLMClient:
     def dialect(self) -> Dialect:
         return DIALECTS[dialect_name(self.settings)]
 
-    def _llm(self, max_tokens: int | None = None) -> dict[str, Any]:
+    def _llm(self, max_tokens: int | None = None, model: str | None = None) -> dict[str, Any]:
         effort = self.settings.llm_reasoning_effort.strip()
         temperature = self.settings.llm_temperature
-        return {"model": self.settings.llm_model,
+        return {"model": model or self.settings.llm_model,
                 **({"temperature": temperature} if temperature is not None else {}),
                 **(self.dialect.reasoning(effort) if effort else {}),
                 **({self.dialect.max_tokens_field: max_tokens} if max_tokens else {})}
@@ -385,18 +385,17 @@ class LLMClient:
             if self._client is None:
                 client.close()
 
-    def probe(self) -> str | None:
+    def probe(self, model: str | None = None) -> str | None:
         """Ask for a few tokens: None when the provider serves the model again, else the failure code.
 
         A request the provider rejects for its own content still shows that credits and key work.
         """
         if not self.llm_enabled:
             return "LLM_API_KEY_NOT_CONFIGURED"
-        client = self._client or httpx.Client(timeout=30)
+        client = self._client or httpx.Client(timeout=10)
         try:
             response = client.post(f"{self.settings.llm_base_url.rstrip('/')}/chat/completions", headers=self._headers(),
-                                   json={"model": self.settings.llm_model, "messages": [{"role": "user", "content": "ping"}],
-                                         self.dialect.max_tokens_field: 16})
+                                   json={**self._llm(max_tokens=16, model=model), "messages": [{"role": "user", "content": "ping"}]})
             response.raise_for_status()
             return None
         except httpx.HTTPError as exc:

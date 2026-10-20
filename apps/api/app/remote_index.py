@@ -22,7 +22,7 @@ from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, duplicate_
 logger = logging.getLogger(__name__)
 
 # Records still being worked on by LightRAG are never touched by repairs.
-_IN_FLIGHT_STATUSES = {"pending", "parsing", "analyzing", "processing", "preprocessed"}
+IN_FLIGHT_STATUSES = {"pending", "parsing", "analyzing", "processing", "preprocessed"}
 
 
 def _is_orphan(document: Document | None) -> bool:
@@ -117,7 +117,7 @@ def find_orphan_remote_documents(db: Session, engine: LightRAGRetrievalEngine) -
     orphans: list[OrphanRecord] = []
     for row in engine.list_remote_documents():
         document_id = row.get("document_id")
-        if not document_id or row.get("status") in _IN_FLIGHT_STATUSES or row.get("knowledge_base_id") not in known_knowledge_bases:
+        if not document_id or row.get("status") in IN_FLIGHT_STATUSES or row.get("knowledge_base_id") not in known_knowledge_bases:
             continue
         document = db.get(Document, document_id)
         if _is_orphan(document):

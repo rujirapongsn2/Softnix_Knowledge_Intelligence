@@ -443,8 +443,7 @@ def process_metadata_job(db, job):
         document = db.query(Document).filter_by(id=job.document_id).populate_existing().with_for_update().one()
         if not document.is_live:
             job.status = "cancelled"
-        elif provider_of(str(exc)):
-            wait_for_provider(db, job, str(exc))
+        elif provider_of(str(exc)) and wait_for_provider(db, job, str(exc)):
             document.metadata_status = "queued"
         else:
             # Provider outages and rate limits get the long, non-blocking provider schedule.

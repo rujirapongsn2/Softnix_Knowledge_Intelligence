@@ -91,7 +91,7 @@ def test_topping_up_lifts_the_hold_on_the_next_due_probe_and_the_jobs_run_again(
         assert claim_next_job(db) is None
 
         assert provider_holds.probe_holds(db, now=hold.next_probe_at) == ["llm"]
-        assert db.get(ProviderHold, "llm") is None
+        assert provider_holds.held_job_types(db) == [] and provider_holds.hold_view(db) == []
         assert claim_next_job(db).id == job.id
 
 
@@ -145,45 +145,90 @@ def test_an_ordinary_outage_still_uses_the_retry_schedule_and_places_no_hold(mon
 
 
 class _LeftoverEngine:
-    """LightRAG still holding this document from the attempt that stopped on 402."""
-    def __init__(self, statuses):
-        self.statuses, self.ingests, self.deleted = list(statuses), 0, []
-
-    def ingest(self, document_id, knowledge_base_id, text, title):
-        self.ingests += 1
-        if self.ingests == 1:
-            raise services.RetrievalEngineError("RETRIEVAL_ENGINE_BUSY", "HTTP 409 on POST /documents/text: Document storage already "
-                                                "contains 'softnix-kb=k__doc=d__t' (Status: processing). Delete the existing record before re-inserting.")
-        return "track-new"
+    """LightRAG still processing this document from the attempt that stopped on 402, as engine.ingest sees it."""
+    def __init__(self, statuses, finished_track="track-existing"):
+        self.statuses, self.finished_track, self.ingests = list(statuses), finished_track, 0
 
     def find_document(self, document_id, knowledge_base_id):
+        # Each look at the record lets LightRAG move on to its next status.
         status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
         return None if status is None else {"id": "doc-remote", "status": status}
 
-    def delete_remote_document(self, remote_id):
-        self.deleted.append(remote_id)
+    def ingest(self, document_id, knowledge_base_id, text, title):
+        self.ingests += 1
+        if self.statuses[0] in ("pending", "processing"):
+            raise services.RetrievalEngineError("RETRIEVAL_ENGINE_BUSY", "HTTP 409: Document storage already contains it")
+        # engine.ingest reuses a processed record's track and replaces a failed one.
+        return self.finished_track
 
-    def get_remote_document(self, remote_id):
-        return None
 
-
-@pytest.mark.parametrize("statuses, ingests, deleted, track", [
-    (["processing", "processed"], 1, [], None),
-    (["processing", "failed", "failed"], 2, ["doc-remote"], "track-new"),
-    ([None], 2, [], "track-new"),
-])
-def test_a_resumed_document_settles_the_record_its_stopped_attempt_left_behind(monkeypatch, statuses, ingests, deleted, track):
+def test_a_resumed_document_waits_for_its_stopped_attempt_and_keeps_the_track(monkeypatch):
     monkeypatch.setattr(services.time, "sleep", lambda _seconds: None)
-    engine = _LeftoverEngine(statuses)
+    engine = _LeftoverEngine(["processing", "processing", "processed"])
     with SessionLocal() as db:
-        doc = _doc(db)
-        assert services._ingest_over_own_leftover(engine, doc, "body", "t", deadline=float("inf")) == track
-    assert (engine.ingests, engine.deleted) == (ingests, deleted)
+        assert services._ingest_after_own_attempt(engine, _doc(db), "body", "t") == "track-existing"
+    assert engine.ingests == 3
 
 
-def test_a_real_busy_engine_is_still_reported_as_busy():
-    class Busy(_LeftoverEngine):
-        def ingest(self, *args):
-            raise services.RetrievalEngineError("RETRIEVAL_ENGINE_BUSY", "HTTP 409 on POST /documents/text: pipeline is busy")
+def test_a_busy_engine_without_a_record_of_this_document_is_still_busy():
     with SessionLocal() as db, pytest.raises(services.RetrievalEngineError, match="RETRIEVAL_ENGINE_BUSY"):
-        services._ingest_over_own_leftover(Busy([None]), _doc(db), "body", "t", deadline=float("inf"))
+        engine = _LeftoverEngine(["processing"])
+        engine.find_document = lambda *_args: None
+        services._ingest_after_own_attempt(engine, _doc(db), "body", "t")
+
+
+def test_waiting_for_a_stuck_attempt_ends_in_a_timeout(monkeypatch):
+    clock = iter(range(0, 10_000, 500))
+    monkeypatch.setattr(services.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(services.time, "sleep", lambda _seconds: None)
+    with SessionLocal() as db, pytest.raises(services.RetrievalEngineError, match="RETRIEVAL_ENGINE_TIMEOUT"):
+        services._ingest_after_own_attempt(_LeftoverEngine(["processing"]), _doc(db), "body", "t")
+
+
+def test_a_job_that_keeps_failing_alone_stops_waiting_and_fails(monkeypatch):
+    _fail_embedding_with(monkeypatch, "LLM_CREDITS_EXHAUSTED")
+    with SessionLocal() as db:
+        job = _job(db, _doc(db))
+        job.deferral_count = provider_holds.MAX_PROVIDER_WAITS
+        db.commit()
+        services.process_next_job(db)
+        db.expire_all()
+        job = db.get(ProcessingJob, job.id)
+        assert (job.status, job.error_code) == ("failed", "LLM_CREDITS_EXHAUSTED")
+        assert db.query(ProviderHold).count() == 0, "a job past its waits does not hold the queue again"
+
+
+def test_a_late_failure_right_after_a_lift_waits_alone_without_holding_the_queue(monkeypatch):
+    _fail_embedding_with(monkeypatch, "LLM_CREDITS_EXHAUSTED")
+    with SessionLocal() as db:
+        provider_holds.place_hold(db, "llm", "LLM_CREDITS_EXHAUSTED"); db.commit()
+        monkeypatch.setitem(provider_holds.PROBES, "llm", lambda: None)
+        assert provider_holds.probe_holds(db, now=datetime.utcnow() + timedelta(minutes=2)) == ["llm"]
+        late = _job(db, _doc(db))
+        services.process_next_job(db)
+        other = _job(db, _doc(db), JobType.EXTRACT_DOCUMENT_METADATA)
+        db.expire_all()
+        assert db.get(ProcessingJob, late.id).current_stage == "waiting_for_provider"
+        assert provider_holds.held_job_types(db) == []
+        assert claim_next_job(db).id == other.id
+        # After the grace period the same failure holds the queue again.
+        provider_holds.place_hold(db, "llm", "LLM_CREDITS_EXHAUSTED",
+                                  now=datetime.utcnow() + timedelta(seconds=provider_holds.LIFT_GRACE_SECONDS + 1))
+        db.commit()
+        assert JobType.PROCESS_DOCUMENT in provider_holds.held_job_types(db)
+
+
+def test_the_llm_probe_also_asks_the_model_lightrag_extracts_with(monkeypatch):
+    asked = []
+
+    class Client:
+        def probe(self, model=None):
+            asked.append(model)
+            return "LLM_CREDITS_EXHAUSTED" if model == "openai/gpt-4o-mini" else None
+    monkeypatch.setattr(provider_holds, "LLMClient", Client)
+    monkeypatch.setenv("LLM_MODEL", "anthropic/claude-sonnet-5.5")
+    monkeypatch.setenv("LIGHTRAG_LLM_MODEL", "openai/gpt-4o-mini")
+    provider_holds.get_settings.cache_clear()
+    assert provider_holds._probe_llm() == "LLM_CREDITS_EXHAUSTED"
+    assert asked == ["anthropic/claude-sonnet-5.5", "openai/gpt-4o-mini"]
+    provider_holds.get_settings.cache_clear()

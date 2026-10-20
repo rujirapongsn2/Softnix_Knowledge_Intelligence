@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.softnix.reranker-server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/llama-server</string>
+    <string>-hf</string><string>gpustack/bge-reranker-v2-m3-GGUF:Q8_0</string>
+    <string>--reranking</string>
+    <string>--host</string><string>127.0.0.1</string><string>--port</string><string>8091</string>
+    <string>-ngl</string><string>99</string><string>-dev</string><string>MTL0</string>
+    <string>-c</string><string>16384</string><string>-b</string><string>4096</string><string>-ub</string><string>4096</string>
+    <string>--parallel</string><string>4</string>
+  </array>
+  <key>EnvironmentVariables</key><dict><key>HOME</key><string>/Users/REPLACE_WITH_USER</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/REPLACE_WITH_USER/Library/Logs/softnix-reranker-server.log</string>
+  <key>StandardErrorPath</key><string>/Users/REPLACE_WITH_USER/Library/Logs/softnix-reranker-server.log</string>
+</dict>
+</plist>

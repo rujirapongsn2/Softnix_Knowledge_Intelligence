@@ -24,17 +24,13 @@ def exponential_delay(first: int, cap: int, floor: int = 0) -> Callable[[int], i
 
 DEFAULT_RETRY = RetryPolicy(3, exponential_delay(2, 60))
 
-# The shared provider account frees in-flight quota over minutes, so budget exhaustion earns more attempts and a longer wait.
-BUDGET_RETRY = RetryPolicy(6, exponential_delay(2, 60, floor=60))
-
-# Provider outages (OpenRouter or the embedding server), rate limits (429) and credit/key problems are not fixed within seconds either:
+# Provider outages (the LLM or the embedding server) and rate limits (429) are not fixed within seconds either:
 # wait at least a minute, doubling to 15 minutes, six attempts (about half an hour in all).  The job is
 # re-queued with a later next_attempt_at, so the worker keeps serving other jobs meanwhile.
 PROVIDER_RETRY = RetryPolicy(6, exponential_delay(60, 900, floor=60))
 
-# 402: the account has run out of credits.  Retried once a few minutes later (credits may be topped up
-# meanwhile), then failed so a person looks at it.  401 (OPENROUTER_AUTH_FAILED) is not retried at all.
-CREDITS_RETRY = RetryPolicy(2, exponential_delay(300, 300))
+# Credit, key and in-flight budget failures (402, 401) are not retried here: provider_holds.py pauses every job
+# that needs the provider and resumes them once it answers again.
 
 # An unreachable engine (restart, crash, deploy) is not fixed within seconds: 30s up to 5 minutes, about 27 minutes in all.
 # The recovery sweep re-queues what is still failed after that.
@@ -45,9 +41,7 @@ PROCESSING_RETRY_POLICIES: dict[str, RetryPolicy] = {
         "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT",
         "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_TIMEOUT", "OCR_CHAIN_FAILED",
     ), DEFAULT_RETRY),
-    **dict.fromkeys(("OPENROUTER_UNAVAILABLE", "EMBEDDING_UNAVAILABLE"), PROVIDER_RETRY),
-    **dict.fromkeys(("OPENROUTER_CREDITS_EXHAUSTED", "EMBEDDING_CREDITS_EXHAUSTED"), CREDITS_RETRY),
-    "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED": BUDGET_RETRY,
+    **dict.fromkeys(("LLM_UNAVAILABLE", "EMBEDDING_UNAVAILABLE"), PROVIDER_RETRY),
     "RETRIEVAL_ENGINE_UNAVAILABLE": ENGINE_DOWN_RETRY,
 }
 

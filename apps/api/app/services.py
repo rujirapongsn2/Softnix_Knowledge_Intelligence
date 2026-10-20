@@ -33,12 +33,13 @@ from .metadata_extraction import process_metadata_job, queue_metadata_extraction
 from .models import Document, DocumentChunk, DocumentMetadataValue, Entity, EntitySource, GraphProjectionEvent, JobType, KnowledgeBase, LegalFamily, LegalInstrument, LegalInstrumentRelation, ProcessingJob, QueryResult, Relationship, RelationshipSource
 from .data_quality import build_document_quality_reports
 from .embeddings import EmbeddingClient, EmbeddingPurpose
-from .openrouter import OpenRouterClient
+from .llm import LLMClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
 from .graph_retirement import drop_document_evidence
 from .job_queue import ClaimLost, claim_next_graph_event, claim_next_job, job_heartbeat, lock_knowledge_base_graph, own_job
-from .remote_index import HealOutcome, purge_remote_record, resolve_remote_duplicate
+from .provider_holds import provider_of, wait_for_provider
+from .remote_index import IN_FLIGHT_STATUSES, HealOutcome, purge_remote_record, resolve_remote_duplicate
 from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, RetrievalEvidence, classify_track_failure, describe_engine_failure
 from .retry_policy import PROCESSING_RETRY_POLICIES, PURGE_RETRYABLE_CODES, PURGE_RETRY, purge_busy_delay, PURGE_MAX_BUSY_DEFERRALS, schedule_retry
 
@@ -73,7 +74,7 @@ DEFAULT_RETRIEVAL_CONFIG = {
 }
 # Cap on how many documents one worker may push into the remote indexing
 # pipeline at the same time.  LightRAG fans every insert out into upstream LLM
-# calls; 13 parallel ingests exhausted the shared OpenRouter in-flight budget
+# calls; 13 parallel ingests exhausted the shared LLM provider in-flight budget
 # (402) and failed the whole batch (F1).
 INDEXING_CONCURRENCY_LIMIT = 2
 _indexing_semaphore = BoundedSemaphore(INDEXING_CONCURRENCY_LIMIT)
@@ -783,7 +784,7 @@ def build_legal_cross_document_suggestions(db: Session, knowledge_base_id: str, 
                     "title": _legal_value(candidate_instrument, "official_title") or candidate.title or candidate.original_filename,
                     "official_number": str(candidate_instrument.get("official_number") or ""),
                 })
-            references = OpenRouterClient().suggest_legal_relationships(document.title or document.original_filename, document.extracted_text, candidates)
+            references = LLMClient().suggest_legal_relationships(document.title or document.original_filename, document.extracted_text, candidates)
             if references:
                 metadata["references"] = references
                 document.legal_metadata = metadata
@@ -2560,8 +2561,12 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
     extracted = {}
     if deterministic.get("instrument", {}).get("version_role") == "unknown":
         try:
-            extracted = OpenRouterClient().extract_legal_metadata(doc.title or doc.original_filename, text)
-        except Exception:
+            extracted = LLMClient().extract_legal_metadata(doc.title or doc.original_filename, text)
+        except Exception as exc:
+            # A provider that cannot serve the account (credits, key) is waited for, so the
+            # extraction runs once it is back instead of being skipped for good.
+            if provider_of(str(exc)):
+                raise
             # Header/change clauses are sufficient to preserve a traceable
             # legal instrument even when the optional LLM is unavailable.
             extracted = {}
@@ -2593,6 +2598,29 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
     db.commit()
 
 
+def _ingest_after_own_attempt(engine: LightRAGRetrievalEngine, doc: Document, text: str, title: str) -> str | None:
+    """Ingest, waiting while an earlier attempt of this same document is still in flight in LightRAG.
+
+    An attempt that stopped while the provider was out of credits can leave LightRAG still processing the
+    document, and LightRAG answers the next insert with 409. engine.ingest already reuses a finished record
+    and replaces a failed one; a pending or processing one is waited for here, then ingest is asked again.
+    """
+    deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
+    while True:
+        try:
+            return engine.ingest(doc.id, doc.knowledge_base_id, text, title)
+        except RetrievalEngineError as exc:
+            if str(exc) != "RETRIEVAL_ENGINE_BUSY":
+                raise
+            record = engine.find_document(doc.id, doc.knowledge_base_id)
+            status = str((record or {}).get("status") or "")
+            if status not in IN_FLIGHT_STATUSES:
+                raise
+            if time.monotonic() >= deadline:
+                raise RetrievalEngineError("RETRIEVAL_ENGINE_TIMEOUT", f"An earlier attempt of this document is still {status} in the retrieval engine.") from exc
+            time.sleep(5)
+
+
 def index_in_engine(db: Session, engine: LightRAGRetrievalEngine, doc: Document, text: str, job: ProcessingJob) -> None:
     """Send the document to the retrieval engine and wait until it has indexed it.
 
@@ -2603,7 +2631,7 @@ def index_in_engine(db: Session, engine: LightRAGRetrievalEngine, doc: Document,
     # Bounded parallelism into the remote pipeline (F1): without this cap a bulk upload fans out
     # into enough concurrent upstream LLM calls to exhaust the shared provider budget.
     with _indexing_semaphore:
-        track_id = doc.external_engine_id = engine.ingest(doc.id, doc.knowledge_base_id, text, title)
+        track_id = doc.external_engine_id = _ingest_after_own_attempt(engine, doc, text, title)
         deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
         healed = False
         while track_id:
@@ -2748,7 +2776,7 @@ def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
         # The session may be unusable (failed flush, deadlock victim): start clean
         # before recording the failure.
         db.rollback()
-        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "OPENROUTER_UNAVAILABLE", "OPENROUTER_AUTH_FAILED", "OPENROUTER_CREDITS_EXHAUSTED", "OPENROUTER_REQUEST_REJECTED", "EMBEDDING_NOT_CONFIGURED", "EMBEDDING_UNAVAILABLE", "EMBEDDING_AUTH_FAILED", "EMBEDDING_CREDITS_EXHAUSTED", "EMBEDDING_REQUEST_TOO_LARGE", "EMBEDDING_REQUEST_REJECTED", "EMBEDDING_INVALID_RESPONSE", "EMBEDDING_DIMENSION_MISMATCH", "OPENROUTER_LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
+        code = (str(exc).partition(":")[0] if str(exc).startswith("OCR_CHAIN_FAILED") else str(exc)) if (str(exc).startswith("OCR_CHAIN_FAILED") or str(exc) in {"OCR_REQUIRED", "OCR_CHAIN_FAILED", "TEXT_EXTRACTION_EMPTY", "FILE_TYPE_NOT_SUPPORTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT", "LLM_UNAVAILABLE", "LLM_AUTH_FAILED", "LLM_CREDITS_EXHAUSTED", "LLM_REQUEST_REJECTED", "EMBEDDING_NOT_CONFIGURED", "EMBEDDING_UNAVAILABLE", "EMBEDDING_AUTH_FAILED", "EMBEDDING_CREDITS_EXHAUSTED", "EMBEDDING_REQUEST_TOO_LARGE", "EMBEDDING_REQUEST_REJECTED", "EMBEDDING_INVALID_RESPONSE", "EMBEDDING_DIMENSION_MISMATCH", "LLM_INVALID_RESPONSE", "EXTERNAL_OCR_NOT_CONFIGURED", "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_REJECTED", "EXTERNAL_OCR_TIMEOUT", "EXTERNAL_OCR_EMPTY_RESULT", "EXTERNAL_OCR_INVALID_RESPONSE"}) else "TEXT_EXTRACTION_FAILED"
         logger.exception("document processing failed", extra={"document_id": doc.id, "job_id": job.id, "error_code": code})
         if _abandon_if_deleted(db, job, doc):
             return True
@@ -2763,7 +2791,10 @@ def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
         # Follow-up jobs work on a document that is already searchable; their failure or retry must
         # not move it out of "completed", which every retrieval channel filters on.
         follow_up = legal_only or reindex_only
-        if schedule_retry(job, PROCESSING_RETRY_POLICIES.get(code)):
+        if provider_of(code) and wait_for_provider(db, job, code):
+            if not follow_up:
+                doc.status, doc.error_code, doc.error_message = "queued", code, job.error_message
+        elif schedule_retry(job, PROCESSING_RETRY_POLICIES.get(code)):
             job.status, job.current_stage = "queued", "retry_wait"
             if not follow_up:
                 doc.status, doc.error_code, doc.error_message = "queued", code, "Temporary dependency failure; retry scheduled."
@@ -2865,7 +2896,7 @@ def build_retrieval_plan(db: Session, query: str, kb_ids: list[str], max_sources
                 (RetrievalChannel.GRAPH, policy.enable_graph),
                 (RetrievalChannel.LIGHTRAG, policy.enable_lightrag),
             ) if enabled]
-            value = OpenRouterClient().plan_retrieval(query, available, decision.plan.max_sources, policy.maximum_graph_depth)
+            value = LLMClient().plan_retrieval(query, available, decision.plan.max_sources, policy.maximum_graph_depth)
             decision = apply_llm_plan(decision, value, policy, max_sources, query=query)
         except (RuntimeError, ValueError, TypeError) as exc:
             decision.plan = decision.plan.model_copy(update={"planner_source": "rules_fallback", "fallback_reason": str(exc)})
@@ -3044,12 +3075,12 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
         decorate_sources(db, evidence.sources, kb_ids, [p["field_key"] for p in plan.metadata_predicates] + list(plan.metadata_filters))
         started_at = time.monotonic()
         try:
-            evidence.answer = OpenRouterClient().answer_from_sources(query, evidence.sources)
-            _append_retrieval_trace(trace, channel="answer_generation", system="OpenRouter LLM", status="used",
+            evidence.answer = LLMClient().answer_from_sources(query, evidence.sources)
+            _append_retrieval_trace(trace, channel="answer_generation", system="LLM", status="used",
                                     started_at=started_at, result_count=len(evidence.sources), detail="cited answer")
         except RuntimeError as exc:
             evidence.answer = None
-            _append_retrieval_trace(trace, channel="answer_generation", system="OpenRouter LLM", status="unavailable",
+            _append_retrieval_trace(trace, channel="answer_generation", system="LLM", status="unavailable",
                                     started_at=started_at, detail=str(exc))
         _validate_answer_citations(evidence, warnings)
     return evidence
@@ -3578,9 +3609,9 @@ def fuse_evidence(*channels: RetrievalEvidence, limit: int, legal_meta: dict[str
 def rerank_evidence(query: str, evidence: RetrievalEvidence, limit: int,
                     trace: list[dict] | None = None, enabled: bool = True) -> RetrievalEvidence:
     """Optionally apply a cross-encoder reranker after deterministic fusion."""
-    client = OpenRouterClient()
+    client = LLMClient()
     if not enabled or not client.reranker_enabled or not evidence.sources:
-        _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="skipped", started_at=time.monotonic(),
+        _append_retrieval_trace(trace, channel="rerank", system="Reranker", status="skipped", started_at=time.monotonic(),
                                 detail="disabled by retrieval policy" if not enabled else ("not configured" if not client.reranker_enabled else "no candidates"))
         return evidence
     started_at = time.monotonic()
@@ -3588,7 +3619,7 @@ def rerank_evidence(query: str, evidence: RetrievalEvidence, limit: int,
     try:
         ranked = client.rerank(query, [item["excerpt"] for item in candidates], limit)
     except RuntimeError as exc:
-        _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="unavailable",
+        _append_retrieval_trace(trace, channel="rerank", system="Reranker", status="unavailable",
                                 started_at=started_at, detail=str(exc))
         return evidence
     ordered = []
@@ -3600,13 +3631,13 @@ def rerank_evidence(query: str, evidence: RetrievalEvidence, limit: int,
             ordered.append({**candidates[index], "relevance": relevance})
             seen.add(index)
     if not ordered:
-        _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="used",
+        _append_retrieval_trace(trace, channel="rerank", system="Reranker", status="used",
                                 started_at=started_at, detail="no ranked candidates returned")
         return evidence
     # A partial provider response must not silently discard useful evidence.
     ordered.extend(source for index, source in enumerate(candidates) if index not in seen)
     sources = [{**source, "citation_id": f"S{index}"} for index, source in enumerate(ordered[:limit], 1)]
-    _append_retrieval_trace(trace, channel="rerank", system="OpenRouter reranker", status="used",
+    _append_retrieval_trace(trace, channel="rerank", system="Reranker", status="used",
                             started_at=started_at, result_count=len(sources), detail="cross-encoder rerank")
     return RetrievalEvidence(sources, evidence.entities, evidence.relationships, evidence.paths, evidence.answer)
 
@@ -3970,9 +4001,9 @@ def _citation_reference_url(source: dict) -> str | None:
 def public_document_base_url() -> str | None:
     """Public origin for absolute MCP citation / download links."""
     settings = get_settings()
-    # Prefer dedicated public URL; OPENROUTER_APP_URL is already set to the
+    # Prefer dedicated public URL; LLM_APP_URL is already set to the
     # customer-facing host in production (.env → knowledge.softnix.ai).
-    base = (getattr(settings, "public_app_url", None) or settings.openrouter_app_url or "").strip()
+    base = (getattr(settings, "public_app_url", None) or settings.llm_app_url or "").strip()
     return base.rstrip("/") or None
 
 

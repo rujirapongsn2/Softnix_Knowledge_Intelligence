@@ -93,7 +93,7 @@ def test_claim_skips_jobs_not_yet_due():
 
 
 def test_provider_failures_use_long_non_blocking_retry_schedule():
-    policy = PROCESSING_RETRY_POLICIES["OPENROUTER_UNAVAILABLE"]
+    policy = PROCESSING_RETRY_POLICIES["LLM_UNAVAILABLE"]
     assert policy is PROVIDER_RETRY and policy.max_attempts == 6
     assert [policy.delay(attempt) for attempt in range(1, 6)] == [60, 120, 240, 480, 900]
 
@@ -109,7 +109,7 @@ def test_provider_failures_use_long_non_blocking_retry_schedule():
     assert schedule_retry(job, policy) is False
 
 
-def test_openrouter_outage_requeues_document_job_for_later(monkeypatch):
+def test_llm_outage_requeues_document_job_for_later(monkeypatch):
     with SessionLocal() as db:
         _isolate_queue(db)
         kb = _kb(db)
@@ -119,14 +119,14 @@ def test_openrouter_outage_requeues_document_job_for_later(monkeypatch):
         monkeypatch.setattr(services, "extract_text", lambda _doc: "body text")
 
         def outage(_db, _document_id):
-            raise RuntimeError("OPENROUTER_UNAVAILABLE")
+            raise RuntimeError("LLM_UNAVAILABLE")
 
         monkeypatch.setattr(services, "embed_document_chunks", outage)
         started = datetime.utcnow()
         assert services.process_next_job(db) is True
         db.expire_all()
         job, doc = db.get(ProcessingJob, job.id), db.get(Document, doc.id)
-        assert job.status == "queued" and job.current_stage == "retry_wait" and job.error_code == "OPENROUTER_UNAVAILABLE"
+        assert job.status == "queued" and job.current_stage == "retry_wait" and job.error_code == "LLM_UNAVAILABLE"
         assert job.next_attempt_at >= started + timedelta(seconds=60)
         assert doc.status == "queued"
         # Not due yet, so the worker moves on instead of hammering the provider.

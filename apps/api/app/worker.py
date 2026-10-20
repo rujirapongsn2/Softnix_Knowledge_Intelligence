@@ -4,6 +4,7 @@ import time
 from .db import SessionLocal
 from .document_recovery import recover_unavailable_documents
 from .job_queue import sweep_stale_jobs, try_singleton
+from .provider_holds import probe_holds
 from .retention import prune_observability
 from .retrieval import LightRAGRetrievalEngine
 from .services import process_next_graph_projection, process_next_job
@@ -35,6 +36,17 @@ def run_once(state: dict[str, float]) -> bool:
             except Exception:
                 db.rollback()
                 logger.exception("observability retention failed")
+        if now - state["provider_probe"] >= 30:
+            state["provider_probe"] = now
+            try:
+                if try_singleton(db, "provider-hold-probe"):
+                    lifted = probe_holds(db)
+                    if lifted:
+                        logger.warning("provider hold lifted for %s; held jobs resume", ", ".join(lifted))
+                db.rollback()
+            except Exception:  # a failed probe must never stop document processing
+                db.rollback()
+                logger.exception("provider hold probe failed")
         if now - state["recovery"] >= 300:
             state["recovery"] = now
             try:
@@ -50,7 +62,7 @@ def run_once(state: dict[str, float]) -> bool:
 # Several worker replicas may run this loop: job claims are atomic
 # (job_queue.claim_next_job) and each periodic sweep runs in one process at a time.
 if __name__ == "__main__":
-    state = {"retention": 0.0, "recovery": 0.0, "stale_sweep": 0.0}
+    state = {"retention": 0.0, "recovery": 0.0, "stale_sweep": 0.0, "provider_probe": 0.0}
     while True:
         try:
             processed = run_once(state)

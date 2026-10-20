@@ -6,7 +6,8 @@ from datetime import date
 
 from .document_templates import TEXT_LIST_MAX_ITEMS, metadata_search_text, validate_metadata_values
 from .models import Document, JobType, ProcessingJob
-from .openrouter import OpenRouterClient
+from .llm import LLMClient
+from .provider_holds import provider_of, wait_for_provider
 
 EXTRACTOR_VERSION = "2"
 WINDOW = 12000
@@ -405,7 +406,7 @@ def process_metadata_job(db, job):
     try:
         if not text:
             raise RuntimeError("METADATA_TEXT_NOT_READY")
-        observations = extract_candidates(fields, text, OpenRouterClient()) if fields else {}
+        observations = extract_candidates(fields, text, LLMClient()) if fields else {}
         # Lock order Knowledge Base -> document (same as the graph-writing jobs):
         # the KB graph lock is taken before this transaction locks the document row.
         lock_knowledge_base_graph(db, job.knowledge_base_id or document.knowledge_base_id)
@@ -442,12 +443,14 @@ def process_metadata_job(db, job):
         document = db.query(Document).filter_by(id=job.document_id).populate_existing().with_for_update().one()
         if not document.is_live:
             job.status = "cancelled"
+        elif provider_of(str(exc)) and wait_for_provider(db, job, str(exc)):
+            document.metadata_status = "queued"
         else:
             # Provider outages and rate limits get the long, non-blocking provider schedule.
-            retry = schedule_retry(job, PROCESSING_RETRY_POLICIES.get(str(exc))) if str(exc) in {"OPENROUTER_UNAVAILABLE", "OPENROUTER_CREDITS_EXHAUSTED"} else False
+            retry = schedule_retry(job, PROCESSING_RETRY_POLICIES.get(str(exc))) if str(exc) == "LLM_UNAVAILABLE" else False
             job.status = "queued" if retry else "failed"
             job.current_stage = "retry_wait" if retry else "failed"
-            job.error_code = str(exc) if str(exc) in {"OPENROUTER_UNAVAILABLE", "OPENROUTER_AUTH_FAILED", "OPENROUTER_CREDITS_EXHAUSTED", "OPENROUTER_REQUEST_REJECTED", "OPENROUTER_API_KEY_NOT_CONFIGURED", "METADATA_TEXT_NOT_READY", "METADATA_EXTRACTION_INVALID_RESPONSE"} else "METADATA_EXTRACTION_FAILED"
+            job.error_code = str(exc) if str(exc) in {"LLM_UNAVAILABLE", "LLM_AUTH_FAILED", "LLM_CREDITS_EXHAUSTED", "LLM_REQUEST_REJECTED", "LLM_API_KEY_NOT_CONFIGURED", "METADATA_TEXT_NOT_READY", "METADATA_EXTRACTION_INVALID_RESPONSE"} else "METADATA_EXTRACTION_FAILED"
             job.error_message = "Metadata extraction did not complete; document search remains available."
             if document.metadata_revision != revision:
                 update_status(document)

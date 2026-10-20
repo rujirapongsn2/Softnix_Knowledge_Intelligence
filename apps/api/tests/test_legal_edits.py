@@ -9,7 +9,7 @@ from sqlalchemy.pool import StaticPool
 from app import services
 from app.legal_edits import keep_manual_edits, with_manual_edits
 from app.models import Base, Document, KnowledgeBase, ProcessingJob
-from app.openrouter import OpenRouterClient
+from app.llm import LLMClient
 
 TEXT = "พระราชบัญญัติตัวอย่าง พ.ศ. ๒๕๖๙\nมาตรา ๑ ให้ใช้บังคับ"
 
@@ -52,7 +52,7 @@ def db():
 
 
 def test_the_extraction_job_keeps_what_a_person_edited(db, monkeypatch):
-    monkeypatch.setattr(OpenRouterClient, "extract_legal_metadata", lambda self, title, text: {})
+    monkeypatch.setattr(LLMClient, "extract_legal_metadata", lambda self, title, text: {})
     edited = with_manual_edits({}, {"instrument": {"number": "99/2569"}, "note": "reviewer note"})
     doc = Document(id=str(uuid.uuid4()), knowledge_base_id="kb-1", original_filename="a.md", stored_filename="a.md", storage_path="/tmp/a.md",
                    mime_type="text/markdown", file_size=1, checksum_sha256="a" * 64, title="a", status="completed",

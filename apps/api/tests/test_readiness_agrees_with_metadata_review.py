@@ -5,7 +5,7 @@ from test_metadata_usable_first import extract, review
 from app import data_quality
 from app.db import SessionLocal
 from app.models import Document
-from app.openrouter import OpenRouterClient
+from app.llm import LLMClient
 
 METADATA_WARNINGS = {"metadata_incomplete", "required_metadata_missing", "metadata_unverified", "metadata_needs_attention",
                      "metadata_evidence_conflict", "metadata_consistency_conflict"}
@@ -39,7 +39,7 @@ def test_a_blocked_value_kept_from_an_older_source_is_not_counted_as_populated(m
     with SessionLocal() as db:
         db.get(Document, doc_id).extracted_text = "Issuer: Land Department. Issuer: Land Office."
         db.commit()
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {"issuer": [
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", lambda self, fields, text: {"issuer": [
         {"value": "Land Department", "evidence_quote": "Issuer: Land Department."}, {"value": "Land Office", "evidence_quote": "Issuer: Land Office."}]})
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()

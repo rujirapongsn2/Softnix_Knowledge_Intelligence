@@ -12,7 +12,7 @@
 | PostgreSQL + pgvector | metadata, chunks, vector, FTS, provenance, legal registry, trace/audit | แหล่งข้อมูลหลักและแหล่ง citation |
 | Neo4j | entity/relationship projection และ bounded traversal | accelerator; PostgreSQL ยังเป็น authority |
 | LightRAG | semantic/graph retrieval เสริม | adapter เท่านั้น ไม่ใช่ source of truth |
-| OpenRouter | LLM answer/planning/extraction และ optional rerank | external dependency; รับเฉพาะ evidence ที่กรองแล้ว |
+| LLM provider (OpenAI-compatible, ค่าเริ่มต้น OpenRouter) | LLM answer/planning/extraction และ optional rerank | external dependency; รับเฉพาะ evidence ที่กรองแล้ว |
 | Embedding server | embedding ของ chunk และ query (`EMBEDDING_BASE_URL`, OpenAI-compatible; ค่าเริ่มต้น llama.cpp + embeddinggemma) | แยกจาก LLM provider; error ใช้รหัส `EMBEDDING_*` |
 
 ไฟล์ต้นฉบับเก็บใน volume `files` นอก web root และไม่ส่งให้ query client โดยตรง

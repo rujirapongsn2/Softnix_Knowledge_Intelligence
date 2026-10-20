@@ -13,7 +13,7 @@ from app.db import SessionLocal
 from app.embeddings import EmbeddingClient, EmbeddingPurpose, embedding_batches
 from app.main import app
 from app.models import Document, DocumentChunk, JobType, KnowledgeBase, ProcessingJob
-from app.openrouter import OpenRouterClient
+from app.llm import LLMClient
 
 
 @pytest.fixture
@@ -165,10 +165,10 @@ def test_check_reports_model_dimension_and_host(embedding_env):
 def test_system_check_reports_unconfigured_embeddings_without_failing_the_llm_check(embedding_env):
     embedding_env.setenv("EMBEDDING_BASE_URL", "")
     get_settings.cache_clear()
-    embedding_env.setattr(OpenRouterClient, "check", lambda _self: {"status": "ready", "llm_model": "m", "llm_model_available": True})
+    embedding_env.setattr(LLMClient, "check", lambda _self: {"status": "ready", "llm_model": "m", "llm_model_available": True})
     with TestClient(app) as client:
         assert client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-horse-battery-staple"}).status_code == 200
-        response = client.post("/api/v1/system/test-openrouter")
+        response = client.post("/api/v1/system/test-llm")
     assert response.status_code == 200
     body = response.json()
     assert body["llm_model_available"] is True
@@ -217,15 +217,15 @@ def test_semantic_query_is_embedded_as_query(embedding_env):
 
 def test_system_check_still_reports_embeddings_when_the_llm_check_fails(embedding_env):
     def failing_llm_check(_self):
-        raise RuntimeError("OPENROUTER_AUTH_FAILED")
-    embedding_env.setattr(OpenRouterClient, "check", failing_llm_check)
+        raise RuntimeError("LLM_AUTH_FAILED")
+    embedding_env.setattr(LLMClient, "check", failing_llm_check)
     embedding_env.setattr(EmbeddingClient, "embed_texts", lambda _self, texts, _purpose: [[0.0] * 3 for _ in texts])
     with TestClient(app) as client:
         assert client.post("/api/v1/auth/login", json={"username": "admin", "password": "correct-horse-battery-staple"}).status_code == 200
-        response = client.post("/api/v1/system/test-openrouter")
+        response = client.post("/api/v1/system/test-llm")
     assert response.status_code == 503
     error = response.json()["error"]
-    assert error["code"] == "OPENROUTER_AUTH_FAILED"
+    assert error["code"] == "LLM_AUTH_FAILED"
     assert error["embedding_model_available"] is True and error["embedding_host"] == "embed.local:8090"
 
 

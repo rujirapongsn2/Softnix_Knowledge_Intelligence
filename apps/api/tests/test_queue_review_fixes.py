@@ -49,8 +49,8 @@ def _login(client):
 
 
 # ------------------------------------------------------------ Finding 5
-@pytest.mark.parametrize("code", ["OPENROUTER_AUTH_FAILED"])
-def test_auth_failure_fails_fast_without_retry(monkeypatch, code):
+@pytest.mark.parametrize("code", ["LLM_REQUEST_REJECTED"])
+def test_a_rejected_request_fails_fast_without_retry(monkeypatch, code):
     assert PROCESSING_RETRY_POLICIES.get(code) is None
     with SessionLocal() as db:
         doc = _doc(db, _kb(db)); job = _job(db, doc)
@@ -67,17 +67,17 @@ def test_auth_failure_fails_fast_without_retry(monkeypatch, code):
         assert doc.status == "failed" and doc.error_code == code
 
 
-def test_exhausted_credits_retry_briefly_then_fail(monkeypatch):
-    policy = PROCESSING_RETRY_POLICIES["OPENROUTER_CREDITS_EXHAUSTED"]
-    assert policy.max_attempts == 2 and policy.delay(1) == 300
+@pytest.mark.parametrize("code", ["LLM_CREDITS_EXHAUSTED", "LLM_AUTH_FAILED"])
+def test_exhausted_credits_or_a_rejected_key_wait_for_the_provider(monkeypatch, code):
+    assert PROCESSING_RETRY_POLICIES.get(code) is None, "provider_holds handles these, not the retry schedule"
     with SessionLocal() as db:
         doc = _doc(db, _kb(db)); job = _job(db, doc)
         monkeypatch.setattr(services, "extract_text", lambda _doc: "body")
-        monkeypatch.setattr(services, "embed_document_chunks", lambda *_: (_ for _ in ()).throw(RuntimeError("OPENROUTER_CREDITS_EXHAUSTED")))
+        monkeypatch.setattr(services, "embed_document_chunks", lambda *_: (_ for _ in ()).throw(RuntimeError(code)))
         assert services.process_next_job(db) is True
         db.expire_all()
         job = db.get(ProcessingJob, job.id)
-        assert job.status == "queued" and job.next_attempt_at > datetime.utcnow() + timedelta(seconds=250)
+        assert (job.status, job.current_stage, job.attempt_count) == ("queued", "waiting_for_provider", 0)
 
 
 # ------------------------------------------------------------ Finding 3
@@ -297,7 +297,7 @@ def test_worker_pass_survives_a_failing_sweep(monkeypatch):
     monkeypatch.setattr(worker, "sweep_stale_jobs", broken)
     monkeypatch.setattr(worker, "process_next_graph_projection", lambda _db: False)
     now = time.monotonic()  # retention and recovery just ran; only the sweep is due
-    state = {"retention": now, "recovery": now, "stale_sweep": 0.0}
+    state = {"retention": now, "recovery": now, "stale_sweep": 0.0, "provider_probe": now}
     assert worker.run_once(state) is False
     assert state["stale_sweep"] > 0
 

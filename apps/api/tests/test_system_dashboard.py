@@ -16,7 +16,7 @@ os.environ["FILE_STORAGE_PATH"] = f"{_TEST_ROOT}/files"
 os.environ["INITIAL_ADMIN_PASSWORD"] = "correct-horse-battery-staple"
 os.environ["LIGHTRAG_BASE_URL"] = ""
 os.environ["REDIS_URL"] = ""
-os.environ["OPENROUTER_API_KEY"] = ""
+os.environ["LLM_API_KEY"] = ""
 os.environ["EXT_OCR_KEY"] = ""
 os.environ["APP_ENV"] = "test"
 

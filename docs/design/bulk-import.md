@@ -160,7 +160,7 @@ Rules
   a short budget, else the job is re-queued with `next_attempt_at` (non-blocking).
 - On `429/503`: AIMD — halve the bucket rate for 5 min, recover +10 %/min.
 - LightRAG's own LLM calls are bounded by LightRAG `MAX_ASYNC`; SKI bounds them indirectly
-  through the DOC_GRAPH cap. `OPENROUTER_CREDITS_EXHAUSTED` pauses **all bulk lanes**
+  through the DOC_GRAPH cap. `LLM_CREDITS_EXHAUSTED` pauses **all bulk lanes**
   automatically (one alert, no 50k failed jobs).
 
 ### 5.3 Ingest back-pressure
@@ -226,20 +226,16 @@ All strings via `translations.js` (en/th parity test already enforced).
 
 ## 9. Production configuration notes (LightRAG & infra)
 
-- **Storage** (required for 50k; current JSON/NetworkX files ≈ 80 MB per 1M chars, all in memory):
-  `LIGHTRAG_KV_STORAGE=PGKVStorage`, `LIGHTRAG_VECTOR_STORAGE=PGVectorStorage`,
-  `LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage`, `LIGHTRAG_GRAPH_STORAGE=Neo4JStorage`
-  (+ `POSTGRES_*`, `NEO4J_*` for LightRAG; separate database/workspace from SKI tables).
-  Move = new empty LightRAG store + **DOC_GRAPH backfill** of existing documents (maintenance lane).
-- **Correct env names** (LightRAG 1.5.4 ignores the ones in our compose today):
-  `MAX_ASYNC` (was `LLM_MODEL_MAX_ASYNC`), `MAX_PARALLEL_INSERT` (was `LIGHTRAG_MAX_PARALLEL_INSERT`),
-  `EMBEDDING_FUNC_MAX_ASYNC`. Prod starting point: `MAX_ASYNC=16`, `MAX_PARALLEL_INSERT=6`,
+- **Storage** (done): LightRAG runs on `PGKVStorage`, `PGVectorStorage`, `PGDocStatusStorage`
+  (tables `lightrag_*`, workspace `lightrag`, in the SKI database) and `Neo4JStorage` (label `lightrag`).
+  The move and its re-ingest are in `deploy/lightrag-storage/`.
+- **Env names** (done): compose sets `MAX_ASYNC` and `MAX_PARALLEL_INSERT`, the names LightRAG 1.5.4 reads,
+  and pins the image. Prod starting point: `MAX_ASYNC=16`, `MAX_PARALLEL_INSERT=6`,
   then raise with measured 429 rate.
 - Cost/speed levers (A/B on Thai quality first): `MAX_GLEANING=0` (−1 extract call/chunk),
   `FORCE_LLM_SUMMARY_ON_MERGE=16`, cheaper extraction model.
 - SKI Postgres: `shared_buffers` 25 % RAM, `maintenance_work_mem` ≥ 1 GB (HNSW), ~15 KB per
   chunk ⇒ ~14 GB for 50k × 10k chars.
-- Retire the dead env names in `docker-compose.yml` in the same change.
 
 ---
 
@@ -327,8 +323,8 @@ guarded), so a crash can never record progress that was not saved.
 ### 11.3 Failure classes
 | Error | Class | Action |
 |---|---|---|
-| `OPENROUTER_CREDITS_EXHAUSTED` (402), `OPENROUTER_AUTH_FAILED` (401) | **provider-blocking** | job → `paused_by_provider` (not failed, attempts not consumed); provider breaker opens (§11.4) |
-| 429 / `OPENROUTER_UNAVAILABLE` / 5xx / timeout | transient | bucket back-off (§5.2) + `PROVIDER_RETRY`; breaker opens after N consecutive failures in a window |
+| `LLM_CREDITS_EXHAUSTED` (402), `LLM_AUTH_FAILED` (401) | **provider-blocking** | job → `paused_by_provider` (not failed, attempts not consumed); provider breaker opens (§11.4) |
+| 429 / `LLM_UNAVAILABLE` / 5xx / timeout | transient | bucket back-off (§5.2) + `PROVIDER_RETRY`; breaker opens after N consecutive failures in a window |
 | `RETRIEVAL_ENGINE_UNAVAILABLE` / `_TIMEOUT` / `_BUSY` | engine-blocking | graph lane `paused_by_engine`; other stages continue (vector search keeps working) |
 | validation / content errors (`TEXT_EXTRACTION_EMPTY`, `REQUEST_REJECTED`, too large) | permanent | stage `failed`; fix data then "Retry failed" |
 

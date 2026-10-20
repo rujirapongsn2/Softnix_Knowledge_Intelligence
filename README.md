@@ -6,7 +6,7 @@
 
 ```bash
 cp .env.example .env
-# แก้ APP_SECRET_KEY, TOKEN_HASH_SECRET, INITIAL_ADMIN_PASSWORD และ OPENROUTER_API_KEY
+# แก้ APP_SECRET_KEY, TOKEN_HASH_SECRET, INITIAL_ADMIN_PASSWORD และ LLM_API_KEY (provider ใดก็ได้ที่รองรับ OpenAI API)
 docker compose up --build
 ```
 
@@ -38,7 +38,7 @@ flowchart LR
   Executor --> PG
   Executor --> Neo4j
   Executor --> RAG
-  Executor --> LLM[OpenRouter: answer / optional rerank]
+  Executor --> LLM[LLM provider: answer / optional rerank]
   Executor --> EMB[Embedding server: chunk + query vectors]
   LLM --> API
 ```

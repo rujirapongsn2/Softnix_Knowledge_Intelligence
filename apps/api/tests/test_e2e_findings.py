@@ -12,7 +12,7 @@ os.environ["FILE_STORAGE_PATH"] = f"{_TEST_ROOT}/files"
 os.environ["INITIAL_ADMIN_PASSWORD"] = "correct-horse-battery-staple"
 os.environ["LIGHTRAG_BASE_URL"] = ""
 os.environ["REDIS_URL"] = ""
-os.environ["OPENROUTER_API_KEY"] = ""
+os.environ["LLM_API_KEY"] = ""
 os.environ["EXT_OCR_KEY"] = ""
 os.environ["APP_ENV"] = "test"
 
@@ -25,7 +25,7 @@ import pytest  # noqa: E402
 import app.services as services  # noqa: E402
 from app.job_queue import FOLLOW_UP_JOB_TYPES  # noqa: E402
 from app.retrieval import LightRAGRetrievalEngine, classify_track_failure  # noqa: E402
-from app.retry_policy import DEFAULT_RETRY, PROCESSING_RETRY_POLICIES  # noqa: E402
+from app.retry_policy import PROCESSING_RETRY_POLICIES  # noqa: E402
 
 ADMIN = {"username": "admin", "password": "correct-horse-battery-staple"}
 
@@ -102,10 +102,10 @@ def test_classify_track_failure_maps_budget_markers():
     assert classify_track_failure(None) == "RETRIEVAL_ENGINE_REJECTED"
 
 
-def test_budget_error_is_transient_with_longer_backoff():
-    policy = PROCESSING_RETRY_POLICIES["RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"]
-    assert policy.max_attempts > DEFAULT_RETRY.max_attempts
-    assert policy.delay(1) >= DEFAULT_RETRY.delay(DEFAULT_RETRY.max_attempts)
+def test_budget_error_waits_for_the_provider_instead_of_a_retry_count():
+    from app.provider_holds import provider_of
+    assert "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED" not in PROCESSING_RETRY_POLICIES
+    assert provider_of("RETRIEVAL_ENGINE_BUDGET_EXHAUSTED") == "llm"
 
 
 def test_indexing_semaphore_limits_concurrency():
@@ -114,11 +114,10 @@ def test_indexing_semaphore_limits_concurrency():
 
 
 def test_worker_requeues_budget_failure_with_next_attempt():
-    """The worker loop retries budget failures instead of failing the job."""
-    from datetime import datetime
+    """A provider budget failure holds the job for the provider instead of failing it."""
 
     from app.db import SessionLocal
-    from app.models import Document, KnowledgeBase, ProcessingJob
+    from app.models import Document, KnowledgeBase, ProcessingJob, ProviderHold
 
     db = SessionLocal()
     try:
@@ -158,10 +157,10 @@ def test_worker_requeues_budget_failure_with_next_attempt():
         doc = db.get(Document, doc_id)
         assert job is not None and doc is not None
         assert job.status == "queued"
-        assert job.current_stage == "retry_wait"
+        assert job.current_stage == "waiting_for_provider"
         assert job.error_code == "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED"
         assert doc.status == "queued"
-        assert job.next_attempt_at > datetime.utcnow()
+        assert db.get(ProviderHold, "llm") is not None
     finally:
         db.close()
 

@@ -12,7 +12,7 @@ from app.job_queue import claim_next_job
 from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, field_review_states, process_metadata_job, queue_metadata_extraction
 from app.metadata_search import MetadataPredicate, apply_typed_predicates, describe_schema
 from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
-from app.openrouter import OpenRouterClient
+from app.llm import LLMClient
 from app.services import process_next_job, sync_document_metadata_values
 
 
@@ -159,7 +159,7 @@ def queue_and_run(doc_id):
 def test_an_unverified_graph_field_is_in_use_but_reaches_the_graph_only_once_a_person_confirms_it(monkeypatch):
     api = next(client())
     kb, template, doc_id = setup_document(api, [field(graph_entity_type="Organization", graph_relationship="ISSUED_BY")])
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {"issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}]})
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", lambda self, fields, text: {"issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}]})
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
     assert preview["status"] == "completed" and preview["metadata_status"] == "unverified"
@@ -178,7 +178,7 @@ def test_an_unverified_graph_field_is_in_use_but_reaches_the_graph_only_once_a_p
 def test_an_optional_field_not_found_in_a_fully_read_document_leaves_nothing_to_review(monkeypatch):
     api = next(client())
     _, _, doc_id = setup_document(api, [field(required=False)])
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {"issuer": []})
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", lambda self, fields, text: {"issuer": []})
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
     assert preview["metadata_observations"]["issuer"]["status"] == "not_found"
@@ -195,8 +195,8 @@ def test_failure_keeps_document_searchable(monkeypatch):
     api = next(client())
     _, _, doc_id = setup_document(api)
     def fail(*args):
-        raise RuntimeError("OPENROUTER_API_KEY_NOT_CONFIGURED")
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", fail)
+        raise RuntimeError("LLM_API_KEY_NOT_CONFIGURED")
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", fail)
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
     assert preview["status"] == "completed" and preview["metadata_status"] == "failed"
@@ -209,7 +209,7 @@ def test_concurrent_edit_discards_old_extraction(monkeypatch):
         response = api.post(f"/api/v1/documents/{doc_id}/metadata-review", json={"revision": 0, "field_key": "issuer", "action": "set", "value": "Human choice"})
         assert response.status_code == 200
         return {"issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}]}
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", edit_while_extracting)
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", edit_while_extracting)
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
     assert preview["document_metadata"]["issuer"] == "Human choice"
@@ -313,7 +313,7 @@ def test_updated_template_does_not_rewrite_an_old_manual_snapshot():
 def test_source_change_keeps_auto_value_until_replacement_is_published(monkeypatch):
     api = next(client())
     _, _, doc_id = setup_document(api)
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {"issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}]})
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", lambda self, fields, text: {"issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}]})
     queue_and_run(doc_id)
     with SessionLocal() as db:
         doc = db.get(Document, doc_id)
@@ -330,7 +330,7 @@ def test_source_change_keeps_auto_value_until_replacement_is_published(monkeypat
 def test_source_change_replaces_auto_value_only_after_success(monkeypatch):
     api = next(client())
     _, _, doc_id = setup_document(api)
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", lambda self, fields, text: {
         "issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}],
     })
     queue_and_run(doc_id)
@@ -340,7 +340,7 @@ def test_source_change_replaces_auto_value_only_after_success(monkeypatch):
         assert queue_metadata_extraction(db, doc)
         db.commit()
         job = db.query(ProcessingJob).filter_by(document_id=doc_id, job_type="EXTRACT_DOCUMENT_METADATA", status="queued").one()
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", lambda self, fields, text: {
         "issuer": [{"value": "Revenue Department", "evidence_quote": "Issuer: Revenue Department."}],
     })
     with SessionLocal() as db:

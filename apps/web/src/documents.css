@@ -446,7 +446,10 @@
 .hint-card .hint-section-effect { padding: .35rem .5rem; border-radius: 6px; background: var(--color-kumo-tint, #f1f4f8); }
 .hint-card .hint-heading { color: var(--text-color-kumo-subtle, #596675); font-size: .7rem; font-weight: 650; letter-spacing: .02em; text-transform: uppercase; }
 .hint-card .hint-section ul, .hint-card .hint-section ol { display: grid; gap: .1rem; margin: 0; padding-left: 1.1rem; }
-.hint-card .hint-section li { overflow-wrap: anywhere; }
+/* The app's CSS reset sets list-style: none on every list; the tooltip's bullets and step numbers are its structure. */
+.hint-card .hint-section ul { list-style: disc outside; }
+.hint-card .hint-section ol { list-style: decimal outside; }
+.hint-card .hint-section li { display: list-item; overflow-wrap: anywhere; }
 .hint-card .hint-action { padding-top: .3rem; border-top: 1px solid var(--color-kumo-line, #d8dde3); }
 .hint-card .hint-detail { overflow-wrap: anywhere; color: var(--text-color-kumo-subtle, #596675); font-size: .7rem; }
 .metadata-review-badge-attention {background:#c83c3c14;color:#b03030}

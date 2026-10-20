@@ -613,3 +613,44 @@ def test_reevaluation_marks_a_document_complete_when_only_unfound_optional_field
         db.commit()
     assert api.post(f"/api/v1/knowledge-bases/{kb['id']}/metadata-reevaluate").json() == {"documents": 1, "fields": 0}
     assert api.get(f"/api/v1/documents/{doc_id}/text").json()["metadata_status"] == "complete"
+
+
+class _FlakyWindows:
+    """Answers per window; a window listed in `broken` replies with unusable JSON that many times."""
+    def __init__(self, text, quote_by_window, broken):
+        self.text, self.quote_by_window, self.broken, self.calls = text, quote_by_window, dict(broken), 0
+
+    def extract_document_metadata(self, fields, window):
+        self.calls += 1
+        index = next(i for i, quote in self.quote_by_window.items() if quote in window)
+        if self.broken.get(index, 0) > 0:
+            self.broken[index] -= 1
+            raise RuntimeError("METADATA_EXTRACTION_INVALID_RESPONSE")
+        return {"issuer": [{"value": self.quote_by_window[index], "evidence_quote": self.quote_by_window[index]}]}
+
+
+def _two_windows():
+    first, second = "ออกโดยกรมที่ดิน", "ลงนามโดยอธิบดี"
+    text = first + "ก" * (WINDOW + WINDOW_OVERLAP) + second + "ข" * 50
+    return text, {0: first, 1: second}
+
+
+def test_an_unusable_reply_is_asked_once_more_and_the_document_reads_in_full():
+    text, quotes = _two_windows()
+    client = _FlakyWindows(text, quotes, {1: 1})
+    result = extract_candidates([field()], text, client)["issuer"]
+    assert result["coverage"] == "full"
+    assert [c["value"] for c in result["candidates"]] == [quotes[0], quotes[1]]
+
+
+def test_a_window_still_unusable_after_its_retry_is_skipped_and_the_rest_is_kept_as_partial():
+    text, quotes = _two_windows()
+    result = extract_candidates([field()], text, _FlakyWindows(text, quotes, {1: 2}))["issuer"]
+    assert (result["status"], result["coverage"]) == ("partial", "partial")
+    assert [c["value"] for c in result["candidates"]] == [quotes[0]]
+
+
+def test_a_document_no_window_of_which_is_readable_still_fails():
+    text, quotes = _two_windows()
+    with pytest.raises(RuntimeError, match="METADATA_EXTRACTION_INVALID_RESPONSE"):
+        extract_candidates([field()], text, _FlakyWindows(text, quotes, {0: 2, 1: 2}))

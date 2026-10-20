@@ -709,3 +709,15 @@ def test_ingest_observability_records_attribution_without_the_secret():
 def test_reference_file_validation_treats_unreadable_file_as_invalid(tmp_path):
     from app.services import _valid_reference_file
     assert _valid_reference_file(tmp_path / "missing.pdf", ".pdf", 10) is False
+
+
+def test_new_tokens_get_the_default_limits_of_their_kind():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, "token-default-limits")
+    ingest = test_client.post("/api/v1/tokens", json={"name": "importer", "allowed_scopes": [INGEST_SCOPE], "allowed_ingest_knowledge_base_id": kb_id}).json()
+    mcp = test_client.post("/api/v1/tokens", json={"name": "agent", "allowed_knowledge_base_ids": [kb_id], "allowed_tools": ["search_knowledge"]}).json()
+    chosen = test_client.post("/api/v1/tokens", json={"name": "slow-importer", "allowed_scopes": [INGEST_SCOPE], "allowed_ingest_knowledge_base_id": kb_id,
+                                                      "requests_per_minute": 30, "max_concurrent_requests": 2}).json()
+    assert (ingest["requests_per_minute"], ingest["max_concurrent_requests"]) == (600, 10)
+    assert (mcp["requests_per_minute"], mcp["max_concurrent_requests"]) == (60, 5)
+    assert (chosen["requests_per_minute"], chosen["max_concurrent_requests"]) == (30, 2), "an explicit limit is kept"

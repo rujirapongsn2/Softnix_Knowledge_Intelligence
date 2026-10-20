@@ -2172,6 +2172,11 @@ def query_impact(payload: ImpactRequest, user: User = Depends(current_admin), db
     return analyze_impact(db, payload.subject, payload.knowledge_base_ids, payload.max_depth, payload.include_indirect, payload.entity_id)
 
 
+# (requests_per_minute, max_concurrent_requests) a new token gets when the request leaves them unset. An upload only
+# queues work, and an import client sent 205 files in 82 seconds; a search runs the LLM, LightRAG and the reranker.
+TOKEN_DEFAULT_LIMITS = {"ingest": (600, 10), "mcp": (60, 5)}
+
+
 @app.post("/api/v1/tokens", response_model=TokenCreated)
 def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     # An unknown name would silently grant nothing now that authorize() requires
@@ -2245,13 +2250,14 @@ def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: 
     requested_kb = set(payload.allowed_knowledge_base_ids) | ({payload.allowed_ingest_knowledge_base_id} if payload.allowed_ingest_knowledge_base_id else set())
     if not requested_kb.issubset(visible):
         raise HTTPException(403, {"code": "TOKEN_SCOPE_EXCEEDS_ROLE", "message": "Token scope may not exceed the Knowledge Bases available to your account.", "retryable": False})
+    default_rpm, default_concurrency = TOKEN_DEFAULT_LIMITS["ingest" if INGEST_SCOPE in payload.allowed_scopes else "mcp"]
     secret = create_token_secret()
     token = TokenKey(name=payload.name, description=payload.description, token_prefix=secret[:16], token_hash=token_digest(secret),
                      allowed_knowledge_base_ids=payload.allowed_knowledge_base_ids, allowed_tools=payload.allowed_tools,
                      allowed_scopes=payload.allowed_scopes, allowed_ingest_knowledge_base_id=payload.allowed_ingest_knowledge_base_id,
-                     expires_at=payload.expires_at, requests_per_minute=payload.requests_per_minute,
-                     max_concurrent_requests=payload.max_concurrent_requests, query_timeout_seconds=payload.query_timeout_seconds,
-                     created_by=user.id)
+                     expires_at=payload.expires_at, requests_per_minute=payload.requests_per_minute or default_rpm,
+                     max_concurrent_requests=payload.max_concurrent_requests or default_concurrency,
+                     query_timeout_seconds=payload.query_timeout_seconds, created_by=user.id)
     db.add(token); db.flush(); record_audit(db, "token.create", user.id, "token", token.id, {"name": token.name}); db.commit(); db.refresh(token)
     return {**TokenOut.model_validate(token).model_dump(), "token": secret}
 

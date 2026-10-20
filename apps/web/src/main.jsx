@@ -2550,8 +2550,8 @@ function IngestTokensView({selectedKb, knowledgeBases, tokens, auditLogs, loadAc
   const [ingestKbId, setIngestKbId] = useState(selectedKb ? selectedKb.id : "");
   const [snippetLanguage, setSnippetLanguage] = useState("curl");
   const [expiresAt, setExpiresAt] = useState("");
-  const [rpm, setRpm] = useState(60);
-  const [concurrency, setConcurrency] = useState(5);
+  const [rpm, setRpm] = useState(600);
+  const [concurrency, setConcurrency] = useState(10);
   const [timeout, setTimeoutValue] = useState(60);
   const secretTimer = useRef(null);
   const ingestApiBase = `${window.location.origin}/api/v1`;

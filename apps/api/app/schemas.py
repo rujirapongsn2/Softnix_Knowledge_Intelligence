@@ -380,8 +380,9 @@ class TokenCreate(BaseModel):
     allowed_scopes: list[str] = Field(default_factory=list, max_length=5)
     allowed_ingest_knowledge_base_id: str | None = None
     expires_at: datetime | None = None
-    requests_per_minute: int = Field(default=60, ge=1, le=10000)
-    max_concurrent_requests: int = Field(default=5, ge=1, le=100)
+    # Unset limits take the defaults of the token's kind (TOKEN_DEFAULT_LIMITS in main.py).
+    requests_per_minute: int | None = Field(default=None, ge=1, le=10000)
+    max_concurrent_requests: int | None = Field(default=None, ge=1, le=100)
     query_timeout_seconds: int = Field(default=60, ge=1, le=300)
 
 

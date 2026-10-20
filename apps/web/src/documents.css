@@ -441,6 +441,7 @@
   pointer-events: none;
 }
 .hint-card p { margin: 0; }
+.hint-card .hint-effect { padding: .35rem .5rem; border-radius: 6px; background: var(--color-kumo-tint, #f1f4f8); }
 .hint-card .hint-pending { color: var(--text-color-kumo-subtle, #596675); }
 .hint-card .hint-action { padding-top: .3rem; border-top: 1px solid var(--color-kumo-line, #d8dde3); }
 .hint-card .hint-detail { overflow-wrap: anywhere; color: var(--text-color-kumo-subtle, #596675); font-size: .7rem; }

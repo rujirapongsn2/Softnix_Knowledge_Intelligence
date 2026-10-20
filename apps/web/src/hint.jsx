@@ -1,7 +1,7 @@
 import React, {useId, useState} from "react";
 import {createPortal} from "react-dom";
 
-const WIDTH = 320;
+const WIDTH = 360;
 const MARGIN = 8;
 
 function placement(rect) {
@@ -12,6 +12,7 @@ function placement(rect) {
 export function HintCard({tip}) {
   return <>
     <p>{tip.meaning}</p>
+    {tip.effect && <p className="hint-effect">{tip.effect}</p>}
     {tip.pending && <p className="hint-pending">{tip.pending}</p>}
     {tip.action && <p className="hint-action">{tip.action}</p>}
     {tip.detail && <code className="hint-detail">{tip.detail}</code>}

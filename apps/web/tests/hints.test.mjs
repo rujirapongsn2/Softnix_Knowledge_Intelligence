@@ -25,10 +25,23 @@ for (const lang of ["en", "th"]) {
   test(`${lang}: the review hint names the waiting fields by label, most urgent first, and says whether something needs fixing`, () => {
     const document = {metadata_status: "needs_attention", metadata_template_fields: [{key: "party", label: "Party"}, {key: "other"}, {key: "done", label: "Done"}],
       metadata_field_states: {party: "unverified", other: "blocked", done: "verified"}};
-    assert.match(metadataReviewTip(t, document).pending, /other, Party$/);
-    assert.equal(metadataReviewTip(t, document).meaning, t("hint.metadata.needs_attention"));
-    assert.equal(metadataReviewTip(t, {...document, metadata_status: "unverified"}).meaning, t("hint.metadata.unverified"));
+    const attention = metadataReviewTip(t, document);
+    assert.equal(attention.pending, `${t("hint.metadata.pending.fix", {fields: "other"})} · ${t("hint.metadata.pending.check", {fields: "Party"})}`);
+    assert.equal(attention.meaning, t("hint.metadata.needs_attention"));
+    const unverified = metadataReviewTip(t, {...document, metadata_status: "unverified", metadata_field_states: {party: "unverified", done: "verified"}});
+    assert.equal(unverified.meaning, t("hint.metadata.unverified"));
+    assert.equal(unverified.pending, t("hint.metadata.pending.check", {fields: "Party"}));
     assert.equal(metadataReviewTip(t, {}).pending, null);
+  });
+
+  test(`${lang}: each metadata badge says what it means, what search through the API and MCP does with it, and what to do`, () => {
+    for (const status of ["needs_attention", "unverified"]) {
+      const tip = metadataReviewTip(t, {metadata_status: status});
+      assert.ok(tip.meaning && tip.effect && tip.action, status);
+      assert.match(tip.effect, /MCP/, `${status} effect names MCP`);
+    }
+    assert.notEqual(metadataReviewTip(t, {metadata_status: "needs_attention"}).effect, metadataReviewTip(t, {metadata_status: "unverified"}).effect);
+    assert.notEqual(metadataReviewTip(t, {metadata_status: "needs_attention"}).action, metadataReviewTip(t, {metadata_status: "unverified"}).action);
   });
 
   test(`${lang}: every status filter option has a hint`, () => {

@@ -6,7 +6,7 @@ Base path คือ `/api/v1` และ endpoint ของผู้ดูแล�
 ## Login และระบบ
 
 - `POST /auth/login`, `POST /auth/logout`, `POST /auth/refresh`, `GET /auth/me`
-- `GET /system/status`, `POST /system/test-openrouter`, `GET /system/graph-projection`
+- `GET /system/status`, `POST /system/test-llm`, `GET /system/graph-projection`
 - `GET /traces`, `GET /traces/{trace_id}`, `GET /mcp/activity`
 - `POST /system/observability/cleanup`
 

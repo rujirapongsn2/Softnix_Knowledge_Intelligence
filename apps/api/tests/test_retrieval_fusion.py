@@ -69,7 +69,7 @@ def test_partial_invalid_rerank_preserves_distinct_evidence(monkeypatch):
         def rerank(self, *args):
             return [(1, 0.9), (1, 0.8), (0, float("nan")), (99, 1.0)]
 
-    monkeypatch.setattr(services, "OpenRouterClient", Reranker)
+    monkeypatch.setattr(services, "LLMClient", Reranker)
     evidence = RetrievalEvidence([source("law"), source("research"), source("sop")], [], [], [])
     result = services.rerank_evidence("requirements", evidence, 3)
     assert [s["document_id"] for s in result.sources] == ["research", "law", "sop"]

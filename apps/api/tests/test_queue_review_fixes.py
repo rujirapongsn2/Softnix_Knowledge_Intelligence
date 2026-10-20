@@ -49,7 +49,7 @@ def _login(client):
 
 
 # ------------------------------------------------------------ Finding 5
-@pytest.mark.parametrize("code", ["OPENROUTER_AUTH_FAILED"])
+@pytest.mark.parametrize("code", ["LLM_AUTH_FAILED"])
 def test_auth_failure_fails_fast_without_retry(monkeypatch, code):
     assert PROCESSING_RETRY_POLICIES.get(code) is None
     with SessionLocal() as db:
@@ -68,12 +68,12 @@ def test_auth_failure_fails_fast_without_retry(monkeypatch, code):
 
 
 def test_exhausted_credits_retry_briefly_then_fail(monkeypatch):
-    policy = PROCESSING_RETRY_POLICIES["OPENROUTER_CREDITS_EXHAUSTED"]
+    policy = PROCESSING_RETRY_POLICIES["LLM_CREDITS_EXHAUSTED"]
     assert policy.max_attempts == 2 and policy.delay(1) == 300
     with SessionLocal() as db:
         doc = _doc(db, _kb(db)); job = _job(db, doc)
         monkeypatch.setattr(services, "extract_text", lambda _doc: "body")
-        monkeypatch.setattr(services, "embed_document_chunks", lambda *_: (_ for _ in ()).throw(RuntimeError("OPENROUTER_CREDITS_EXHAUSTED")))
+        monkeypatch.setattr(services, "embed_document_chunks", lambda *_: (_ for _ in ()).throw(RuntimeError("LLM_CREDITS_EXHAUSTED")))
         assert services.process_next_job(db) is True
         db.expire_all()
         job = db.get(ProcessingJob, job.id)

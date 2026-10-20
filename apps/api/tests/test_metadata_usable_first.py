@@ -10,7 +10,7 @@ from app.metadata_extraction import FIELD_STATES, PUBLICATION, field_state, trus
 from app.metadata_quality import STATES
 from app.metadata_search import decorate_sources
 from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
-from app.openrouter import OpenRouterClient
+from app.llm import LLMClient
 
 
 def answer(*pairs):
@@ -33,7 +33,7 @@ def test_a_single_suggested_value_is_in_use_filterable_and_labelled_unverified_f
     api = next(client())
     kb, _, doc_id = setup_document(api)
     # "Land Dept" is not written verbatim in its quote, so it cannot be auto-accepted.
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", answer(("Land Dept", "Issuer: Land Department.")))
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", answer(("Land Dept", "Issuer: Land Department.")))
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
     assert preview["metadata_observations"]["issuer"]["status"] == "suggested"
@@ -53,7 +53,7 @@ def test_a_single_suggested_value_is_in_use_filterable_and_labelled_unverified_f
 def test_conflicting_or_unbacked_values_are_not_used_and_the_document_needs_attention(monkeypatch, pairs, status):
     api = next(client())
     kb, _, doc_id = setup_document(api)
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", answer(*pairs))
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", answer(*pairs))
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
     assert preview["metadata_observations"]["issuer"]["status"] == status
@@ -67,12 +67,12 @@ def test_conflicting_or_unbacked_values_are_not_used_and_the_document_needs_atte
 def test_a_value_kept_from_an_older_source_is_shown_but_not_used_once_the_new_extraction_conflicts(monkeypatch):
     api = next(client())
     kb, _, doc_id = setup_document(api)
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", answer(("Land Dept", "Issuer: Land Department.")))
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", answer(("Land Dept", "Issuer: Land Department.")))
     queue_and_run(doc_id)
     with SessionLocal() as db:
         db.get(Document, doc_id).extracted_text = "Issuer: Land Department. Issuer: Land Office."
         db.commit()
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", answer(("Land Department", "Issuer: Land Department."),
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", answer(("Land Department", "Issuer: Land Department."),
                                                                               ("Land Office", "Issuer: Land Office.")))
     queue_and_run(doc_id)
     preview = api.get(f"/api/v1/documents/{doc_id}/text").json()
@@ -88,7 +88,7 @@ def test_a_value_kept_from_an_older_source_is_shown_but_not_used_once_the_new_ex
 def test_a_document_is_complete_once_every_extracted_value_is_verified_or_auto_verified(monkeypatch):
     api = next(client())
     _, _, doc_id = setup_document(api, [field("issuer"), field("office")])
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata", lambda self, fields, text: {
+    monkeypatch.setattr(LLMClient, "extract_document_metadata", lambda self, fields, text: {
         "issuer": [{"value": "Land Department", "evidence_quote": "Issuer: Land Department."}],
         "office": [{"value": "Land Office", "evidence_quote": "Issuer: Land Department."}]})
     queue_and_run(doc_id)
@@ -155,7 +155,7 @@ def add_document(api, kb, template, title):
 
 def extract(monkeypatch, doc_id, **answers):
     quote = "Issuer: Land Department."
-    monkeypatch.setattr(OpenRouterClient, "extract_document_metadata",
+    monkeypatch.setattr(LLMClient, "extract_document_metadata",
                         lambda self, fields, text: {key: [{"value": value, "evidence_quote": quote} for value in values] for key, values in answers.items()})
     queue_and_run(doc_id)
 

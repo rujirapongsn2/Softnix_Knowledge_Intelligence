@@ -16,7 +16,7 @@ os.environ["INITIAL_ADMIN_PASSWORD"] = "correct-horse-battery-staple"
 os.environ["APP_ENV"] = "test"
 os.environ["LIGHTRAG_BASE_URL"] = ""
 os.environ["REDIS_URL"] = ""
-os.environ["OPENROUTER_API_KEY"] = ""
+os.environ["LLM_API_KEY"] = ""
 
 from fastapi.testclient import TestClient
 

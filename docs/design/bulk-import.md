@@ -160,7 +160,7 @@ Rules
   a short budget, else the job is re-queued with `next_attempt_at` (non-blocking).
 - On `429/503`: AIMD — halve the bucket rate for 5 min, recover +10 %/min.
 - LightRAG's own LLM calls are bounded by LightRAG `MAX_ASYNC`; SKI bounds them indirectly
-  through the DOC_GRAPH cap. `OPENROUTER_CREDITS_EXHAUSTED` pauses **all bulk lanes**
+  through the DOC_GRAPH cap. `LLM_CREDITS_EXHAUSTED` pauses **all bulk lanes**
   automatically (one alert, no 50k failed jobs).
 
 ### 5.3 Ingest back-pressure
@@ -323,8 +323,8 @@ guarded), so a crash can never record progress that was not saved.
 ### 11.3 Failure classes
 | Error | Class | Action |
 |---|---|---|
-| `OPENROUTER_CREDITS_EXHAUSTED` (402), `OPENROUTER_AUTH_FAILED` (401) | **provider-blocking** | job → `paused_by_provider` (not failed, attempts not consumed); provider breaker opens (§11.4) |
-| 429 / `OPENROUTER_UNAVAILABLE` / 5xx / timeout | transient | bucket back-off (§5.2) + `PROVIDER_RETRY`; breaker opens after N consecutive failures in a window |
+| `LLM_CREDITS_EXHAUSTED` (402), `LLM_AUTH_FAILED` (401) | **provider-blocking** | job → `paused_by_provider` (not failed, attempts not consumed); provider breaker opens (§11.4) |
+| 429 / `LLM_UNAVAILABLE` / 5xx / timeout | transient | bucket back-off (§5.2) + `PROVIDER_RETRY`; breaker opens after N consecutive failures in a window |
 | `RETRIEVAL_ENGINE_UNAVAILABLE` / `_TIMEOUT` / `_BUSY` | engine-blocking | graph lane `paused_by_engine`; other stages continue (vector search keeps working) |
 | validation / content errors (`TEXT_EXTRACTION_EMPTY`, `REQUEST_REJECTED`, too large) | permanent | stage `failed`; fix data then "Retry failed" |
 

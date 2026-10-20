@@ -1,11 +1,13 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
     app_name: str = "Softnix Knowledge Intelligence Platform"
     app_env: str = "development"
     app_secret_key: str = "development-only-change-me"
@@ -41,12 +43,17 @@ class Settings(BaseSettings):
     neo4j_password: str = ""
     neo4j_database: str = "neo4j"
     neo4j_timeout_seconds: int = 5
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_api_key: str = ""
-    openrouter_llm_model: str = "anthropic/claude-sonnet-5.5"
-    # Sent as OpenRouter's reasoning.effort; reasoning tokens count against max_tokens, and Sonnet 5.5 at its default
-    # effort spent 5.7k of a 6k budget on one extraction window and returned cut-off JSON. Empty sends nothing.
-    openrouter_reasoning_effort: str = "low"
+    # Any OpenAI-compatible chat completions server. The OPENROUTER_* names are read when the LLM_* ones are unset.
+    llm_base_url: str = Field("https://openrouter.ai/api/v1", validation_alias=AliasChoices("LLM_BASE_URL", "OPENROUTER_BASE_URL"))
+    llm_api_key: str = Field("", validation_alias=AliasChoices("LLM_API_KEY", "OPENROUTER_API_KEY"))
+    llm_model: str = Field("anthropic/claude-sonnet-5.5", validation_alias=AliasChoices("LLM_MODEL", "OPENROUTER_LLM_MODEL"))
+    # openrouter, openai or compatible (see llm.DIALECTS); empty picks one from llm_base_url.
+    llm_api_dialect: Literal["", "openrouter", "openai", "compatible"] = ""
+    # Empty sends no temperature, for models that accept only their default (OpenAI reasoning models).
+    llm_temperature: float | None = 0
+    # Reasoning tokens count against the output budget, and Sonnet 5.5 at its default effort spent 5.7k of a 6k
+    # budget on one extraction window and returned cut-off JSON. Empty sends nothing.
+    llm_reasoning_effort: str = Field("low", validation_alias=AliasChoices("LLM_REASONING_EFFORT", "OPENROUTER_REASONING_EFFORT"))
     # Any OpenAI-compatible POST {base}/embeddings server; empty disables embeddings.
     embedding_base_url: str = ""
     embedding_api_key: str = ""
@@ -56,12 +63,16 @@ class Settings(BaseSettings):
     # embeddinggemma's task prompts; the query and document sides must use matching ones.
     embedding_query_prefix: str = "task: search result | query: "
     embedding_document_prefix: str = "title: none | text: "
-    openrouter_rerank_model: str = ""
+    # A Cohere-style POST {base}/rerank server; the base URL and key default to the LLM's.
+    rerank_base_url: str = ""
+    rerank_api_key: str = ""
+    rerank_model: str = Field("", validation_alias=AliasChoices("RERANK_MODEL", "OPENROUTER_RERANK_MODEL"))
     rerank_candidate_limit: int = 20
-    openrouter_app_url: str = ""
+    # Sent as OpenRouter's app attribution headers; llm_app_url is also the fallback for public_app_url.
+    llm_app_url: str = Field("", validation_alias=AliasChoices("LLM_APP_URL", "OPENROUTER_APP_URL"))
     # Customer-facing origin for absolute citation/download links in MCP answers.
     public_app_url: str = ""
-    openrouter_app_title: str = "Softnix Knowledge Intelligence Platform"
+    llm_app_title: str = Field("Softnix Knowledge Intelligence Platform", validation_alias=AliasChoices("LLM_APP_TITLE", "OPENROUTER_APP_TITLE"))
     reranker_enabled: bool = False
     retrieval_planner_timeout_seconds: int = 4
     # --- OCR chain (anydoc pipeline) -------------------------------------
@@ -85,6 +96,11 @@ class Settings(BaseSettings):
     mistral_ocr_timeout_seconds: int = 60
     tesseract_timeout_seconds: int = 120
     ocr_chain_engines: str = "softnix,mistral,tesseract"
+
+    @field_validator("llm_temperature", mode="before")
+    @classmethod
+    def _empty_temperature_is_none(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
 
     @property
     def file_root(self) -> Path:

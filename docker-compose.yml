@@ -112,12 +112,12 @@ services:
       PROMPT_DIR: /app/data/prompts
       LIGHTRAG_API_KEY: ${LIGHTRAG_API_KEY}
       LLM_BINDING: openai
-      LLM_BINDING_HOST: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
-      LLM_BINDING_API_KEY: ${OPENROUTER_API_KEY}
+      LLM_BINDING_HOST: ${LLM_BASE_URL:-${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}}
+      LLM_BINDING_API_KEY: ${LLM_API_KEY:-${OPENROUTER_API_KEY}}
       # LIGHTRAG_LLM_MODEL lets graph extraction run on a cheaper model than the answer LLM.
-      LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${OPENROUTER_LLM_MODEL:-anthropic/claude-sonnet-5.5}}
-      KEYWORD_LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${OPENROUTER_LLM_MODEL:-anthropic/claude-sonnet-5.5}}
-      QUERY_LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${OPENROUTER_LLM_MODEL:-anthropic/claude-sonnet-5.5}}
+      LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${LLM_MODEL:-${OPENROUTER_LLM_MODEL:-anthropic/claude-sonnet-5.5}}}
+      KEYWORD_LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${LLM_MODEL:-${OPENROUTER_LLM_MODEL:-anthropic/claude-sonnet-5.5}}}
+      QUERY_LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${LLM_MODEL:-${OPENROUTER_LLM_MODEL:-anthropic/claude-sonnet-5.5}}}
       # LightRAG cannot add the EMBEDDING_*_PREFIX task prompts the api uses, so its vectors are
       # unprefixed (measured: unprefixed embeddinggemma is about as good as the old OpenAI model).
       EMBEDDING_BINDING: openai

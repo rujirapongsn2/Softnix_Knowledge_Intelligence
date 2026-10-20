@@ -15,7 +15,7 @@ flowchart LR
   E -->|PDF ไม่มี text| OCR[External OCR]
   OCR --> E
   E --> PG
-  W --> LLM[OpenRouter<br/>extraction]
+  W --> LLM[LLM provider<br/>extraction]
   LLM --> PG
   W --> EMB[Embedding server<br/>chunk vectors]
   EMB --> PG
@@ -53,5 +53,5 @@ flowchart LR
 | Neo4j | graph projection และ traversal แบบจำกัดขอบเขต |
 | LightRAG | semantic/graph retrieval เสริม |
 | Redis | queue และ runtime coordination |
-| OpenRouter | LLM ภายนอก รับข้อมูลที่ผ่าน authorization และ evidence filtering แล้ว |
+| LLM provider | LLM ภายนอกที่รองรับ OpenAI API รับข้อมูลที่ผ่าน authorization และ evidence filtering แล้ว |
 | Embedding server | OpenAI-compatible `/embeddings` (`EMBEDDING_BASE_URL`) สร้าง vector ของ chunk และ query |

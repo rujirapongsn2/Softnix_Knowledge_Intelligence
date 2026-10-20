@@ -9,7 +9,7 @@ os.environ.update({
     "INITIAL_ADMIN_PASSWORD": "correct-horse-battery-staple",
     "LIGHTRAG_BASE_URL": "",
     "REDIS_URL": "",
-    "OPENROUTER_API_KEY": "",
+    "LLM_API_KEY": "",
     "EMBEDDING_BASE_URL": "",
     "EXT_OCR_KEY": "",
 })

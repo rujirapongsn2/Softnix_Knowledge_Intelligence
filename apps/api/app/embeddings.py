@@ -2,7 +2,7 @@
 
 The endpoint is configured separately from the chat LLM (today a llama.cpp
 ``llama-server`` serving embeddinggemma), so its failures carry provider-neutral
-EMBEDDING_* codes instead of OpenRouter account advice.
+EMBEDDING_* codes instead of LLM provider account advice.
 """
 from enum import StrEnum
 from typing import Any

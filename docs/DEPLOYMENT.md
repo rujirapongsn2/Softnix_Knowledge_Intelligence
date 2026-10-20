@@ -11,7 +11,7 @@ docker compose ps
 ตั้งค่าอย่างน้อย:
 
 - `APP_SECRET_KEY`, `TOKEN_HASH_SECRET`, `INITIAL_ADMIN_PASSWORD` เป็นค่าที่สุ่มใหม่และไม่ commit
-- `OPENROUTER_API_KEY` สำหรับ extraction, answer generation และ LightRAG graph extraction (โมเดลเริ่มต้น `anthropic/claude-sonnet-5.5`)
+- `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` สำหรับ extraction, answer generation และ LightRAG graph extraction ใช้ provider ใดก็ได้ที่รองรับ OpenAI API (ค่าเริ่มต้น OpenRouter กับ `anthropic/claude-sonnet-5.5`) ดู `.env.example` สำหรับ `LLM_API_DIALECT`, `LLM_TEMPERATURE` และ `RERANK_*` ชื่อเดิม `OPENROUTER_*` ยังอ่านได้
 - `EMBEDDING_BASE_URL` (+ `EMBEDDING_API_KEY` ถ้า server ตั้ง key) ชี้ไปที่ embedding server แบบ OpenAI-compatible ดู [deploy/embedding-server](../deploy/embedding-server/README.md)
 - `LIGHTRAG_API_KEY` เป็น credential ภายในของ LightRAG
 - `WEB_PORT` (ค่าเริ่มต้น 8081), `API_PORT` (ค่าเริ่มต้น 8001)

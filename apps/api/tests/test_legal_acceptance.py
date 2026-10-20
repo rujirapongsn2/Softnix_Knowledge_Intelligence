@@ -2,7 +2,7 @@
 relationship-aware retrieval feature, driven by fixtures/legal/*.md through the
 real upload → process → legal-graph pipeline (legal extraction itself is
 stubbed by setting legal_metadata directly, since tests run without an
-OpenRouter key — see docs/ACCEPTANCE.md)."""
+LLM provider key — see docs/ACCEPTANCE.md)."""
 import os
 import tempfile
 from pathlib import Path
@@ -13,7 +13,7 @@ os.environ.setdefault("FILE_STORAGE_PATH", f"{_TEST_ROOT}/files")
 os.environ.setdefault("INITIAL_ADMIN_PASSWORD", "correct-horse-battery-staple")
 os.environ.setdefault("LIGHTRAG_BASE_URL", "")
 os.environ.setdefault("REDIS_URL", "")
-os.environ.setdefault("OPENROUTER_API_KEY", "")
+os.environ.setdefault("LLM_API_KEY", "")
 os.environ.setdefault("EXT_OCR_KEY", "")
 
 from fastapi.testclient import TestClient

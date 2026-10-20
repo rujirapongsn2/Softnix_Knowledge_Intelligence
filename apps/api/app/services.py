@@ -38,6 +38,7 @@ from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
 from .graph_retirement import drop_document_evidence
 from .job_queue import ClaimLost, claim_next_graph_event, claim_next_job, job_heartbeat, lock_knowledge_base_graph, own_job
+from .provider_holds import provider_of, wait_for_provider
 from .remote_index import HealOutcome, purge_remote_record, resolve_remote_duplicate
 from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, RetrievalEvidence, classify_track_failure, describe_engine_failure
 from .retry_policy import PROCESSING_RETRY_POLICIES, PURGE_RETRYABLE_CODES, PURGE_RETRY, purge_busy_delay, PURGE_MAX_BUSY_DEFERRALS, schedule_retry
@@ -2561,7 +2562,11 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
     if deterministic.get("instrument", {}).get("version_role") == "unknown":
         try:
             extracted = LLMClient().extract_legal_metadata(doc.title or doc.original_filename, text)
-        except Exception:
+        except Exception as exc:
+            # A provider that cannot serve the account (credits, key) is waited for, so the
+            # extraction runs once it is back instead of being skipped for good.
+            if provider_of(str(exc)):
+                raise
             # Header/change clauses are sufficient to preserve a traceable
             # legal instrument even when the optional LLM is unavailable.
             extracted = {}
@@ -2593,6 +2598,36 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
     db.commit()
 
 
+_OWN_RECORD_EXISTS = re.compile(r"Document storage already contains", re.IGNORECASE)
+
+
+def _ingest_over_own_leftover(engine: LightRAGRetrievalEngine, doc: Document, text: str, title: str, deadline: float) -> str | None:
+    """Ingest, settling first a record an earlier attempt of this same document left behind.
+
+    An attempt that stopped while the provider was out of credits leaves LightRAG holding the document
+    (often still processing it), and LightRAG answers the next insert with 409. That is not a busy engine:
+    wait for the record, keep it when it finished, replace it when it failed. Returns the new track, or
+    None when the document is already indexed.
+    """
+    try:
+        return engine.ingest(doc.id, doc.knowledge_base_id, text, title)
+    except RetrievalEngineError as exc:
+        if str(exc) != "RETRIEVAL_ENGINE_BUSY" or not _OWN_RECORD_EXISTS.search(exc.detail or ""):
+            raise
+    while True:
+        record = engine.find_document(doc.id, doc.knowledge_base_id)
+        status = (record or {}).get("status")
+        if status == "processed":
+            return None
+        if record is None or status == "failed":
+            if record is not None:
+                purge_remote_record(engine, doc, only_status="failed")
+            return engine.ingest(doc.id, doc.knowledge_base_id, text, title)
+        if time.monotonic() >= deadline:
+            raise RetrievalEngineError("RETRIEVAL_ENGINE_TIMEOUT", f"An earlier attempt of this document is still {status} in the retrieval engine.")
+        time.sleep(5)
+
+
 def index_in_engine(db: Session, engine: LightRAGRetrievalEngine, doc: Document, text: str, job: ProcessingJob) -> None:
     """Send the document to the retrieval engine and wait until it has indexed it.
 
@@ -2603,8 +2638,8 @@ def index_in_engine(db: Session, engine: LightRAGRetrievalEngine, doc: Document,
     # Bounded parallelism into the remote pipeline (F1): without this cap a bulk upload fans out
     # into enough concurrent upstream LLM calls to exhaust the shared provider budget.
     with _indexing_semaphore:
-        track_id = doc.external_engine_id = engine.ingest(doc.id, doc.knowledge_base_id, text, title)
         deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
+        track_id = doc.external_engine_id = _ingest_over_own_leftover(engine, doc, text, title, deadline)
         healed = False
         while track_id:
             if time.monotonic() >= deadline:
@@ -2763,7 +2798,11 @@ def _run_claimed_job(db: Session, job: ProcessingJob) -> bool:
         # Follow-up jobs work on a document that is already searchable; their failure or retry must
         # not move it out of "completed", which every retrieval channel filters on.
         follow_up = legal_only or reindex_only
-        if schedule_retry(job, PROCESSING_RETRY_POLICIES.get(code)):
+        if provider_of(code):
+            wait_for_provider(db, job, code)
+            if not follow_up:
+                doc.status, doc.error_code, doc.error_message = "queued", code, job.error_message
+        elif schedule_retry(job, PROCESSING_RETRY_POLICIES.get(code)):
             job.status, job.current_stage = "queued", "retry_wait"
             if not follow_up:
                 doc.status, doc.error_code, doc.error_message = "queued", code, "Temporary dependency failure; retry scheduled."

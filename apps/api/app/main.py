@@ -32,6 +32,7 @@ from .metadata_quality import metadata_quality_report
 from .observability import metrics, now
 from .embeddings import EmbeddingClient
 from .llm import LLMClient
+from .provider_holds import hold_view
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
@@ -308,6 +309,8 @@ def system_dashboard(user: User = Depends(require_manager), db: Session = Depend
         "services": {
             "dependencies": dependencies,
             "failures": failures,
+            # Providers whose credits or key stopped serving jobs; their jobs wait and resume on their own.
+            "provider_holds": hold_view(db),
         },
         "ingest_metrics": {
             "total_documents": total_docs,

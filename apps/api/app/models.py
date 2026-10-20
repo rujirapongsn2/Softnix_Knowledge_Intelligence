@@ -346,6 +346,17 @@ class ProcessingJob(Timestamped, Base):
     deferral_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
+class ProviderHold(Base):
+    """A provider that cannot serve jobs right now (credits or key); see provider_holds.py."""
+    __tablename__ = "provider_holds"
+    provider: Mapped[str] = mapped_column(String(30), primary_key=True)
+    reason_code: Mapped[str] = mapped_column(String(100))
+    held_since: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    next_probe_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    probe_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_probe_error: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+
 class Entity(Timestamped, Base):
     __tablename__ = "entities"
     __table_args__ = (UniqueConstraint("knowledge_base_id", "identity_key", "entity_type", name="uq_entity_identity"),)

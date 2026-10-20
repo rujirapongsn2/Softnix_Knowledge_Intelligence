@@ -34,6 +34,7 @@ from sqlalchemy.orm import Query, Session, aliased
 
 from .config import get_settings
 from .models import Document, GraphProjectionEvent, JobType, ProcessingJob
+from .provider_holds import held_job_types
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,7 @@ def claim_next_job(db: Session) -> ProcessingJob | None:
     skipped, and a job whose document already has a running job waits.
     """
     postgres = is_postgres(db)
+    held = held_job_types(db)
     running = aliased(ProcessingJob)
     document_busy = exists().where(running.document_id == ProcessingJob.document_id, running.status == "running")
     for tier in _TIERS:
@@ -140,6 +142,8 @@ def claim_next_job(db: Session) -> ProcessingJob | None:
         # bulk of blocked follow-ups cannot fill the scan window (starvation).
         query = tier(db.query(ProcessingJob).filter(
             ProcessingJob.status == "queued", ProcessingJob.next_attempt_at <= datetime.utcnow(), ~document_busy,
+            # A job whose provider is held waits in the queue untouched until the hold is lifted.
+            ProcessingJob.job_type.notin_(held),
         )).order_by(ProcessingJob.created_at).limit(CLAIM_SCAN_LIMIT)
         if postgres:
             query = query.with_for_update(skip_locked=True, of=ProcessingJob)

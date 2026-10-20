@@ -385,6 +385,27 @@ class LLMClient:
             if self._client is None:
                 client.close()
 
+    def probe(self) -> str | None:
+        """Ask for a few tokens: None when the provider serves the model again, else the failure code.
+
+        A request the provider rejects for its own content still shows that credits and key work.
+        """
+        if not self.llm_enabled:
+            return "LLM_API_KEY_NOT_CONFIGURED"
+        client = self._client or httpx.Client(timeout=30)
+        try:
+            response = client.post(f"{self.settings.llm_base_url.rstrip('/')}/chat/completions", headers=self._headers(),
+                                   json={"model": self.settings.llm_model, "messages": [{"role": "user", "content": "ping"}],
+                                         self.dialect.max_tokens_field: 16})
+            response.raise_for_status()
+            return None
+        except httpx.HTTPError as exc:
+            code = provider_error_code(exc)
+            return None if code == "LLM_REQUEST_REJECTED" else code
+        finally:
+            if self._client is None:
+                client.close()
+
     def check(self) -> dict[str, Any]:
         if not self.settings.llm_api_key:
             raise RuntimeError("LLM_API_KEY_NOT_CONFIGURED")

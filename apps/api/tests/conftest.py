@@ -20,3 +20,20 @@ os.environ.update({
     "EMBEDDING_BASE_URL": "",
     "EXT_OCR_KEY": "",
 })
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_provider_hold_survives_a_test():
+    """Tests share one database; a hold placed by one test must not pause the queue of the next."""
+    yield
+    from app.db import SessionLocal
+    from app.models import ProviderHold
+    try:
+        with SessionLocal() as db:
+            db.query(ProviderHold).delete()
+            db.commit()
+    except Exception:
+        pass  # a test module that never created the schema

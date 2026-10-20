@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 from sqlalchemy.orm import Session
 
-from .models import LegalInstrument, LegalInstrumentRelation
+from .models import Document, LegalInstrument, LegalInstrumentRelation
 
 AUTHORITY_LEVELS: dict[str, int] = {
     "constitution": 100,
@@ -254,15 +254,22 @@ def resolve_instrument_statuses(db: Session, knowledge_base_id: str) -> dict[str
             return date(item.enacted_year, 1, 1)
         return date.min
 
+    # A deleted document's instrument stays in the registry for restore, but it is no version of the law in this
+    # Knowledge Base: as "current" it would hide the live copy it duplicates from every search.
+    live_documents = {document_id for (document_id,) in db.query(Document.id).filter(
+        Document.knowledge_base_id == knowledge_base_id, Document.live())}
     families: dict[str, list[LegalInstrument]] = {}
     for row in instruments:
-        if row.family_id:
+        if row.family_id and row.document_id in live_documents:
             families.setdefault(row.family_id, []).append(row)
     for members in families.values():
         # Only instruments without a "(ฉบับที่ N)" version suffix are treated as
         # standalone full re-enactments; amendment acts are handled by the AMENDS
         # edge above and never marked superseded purely by family ordering.
-        full_versions = sorted((item for item in members if not item.version_label), key=_family_sort_key)
+        # A version without any date cannot be placed before or after another one, so it is never superseded or
+        # current by ordering; its status stays what its own dates (none) give it.
+        full_versions = sorted((item for item in members if not item.version_label and _family_sort_key(item) != date.min),
+                               key=_family_sort_key)
         # "current" is the newest full version already in effect. A future-dated
         # re-enactment must not block superseding older versions that are
         # already in force -- it is excluded from consideration, not treated as

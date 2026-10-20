@@ -1,6 +1,6 @@
 import os
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 _TEST_ROOT = tempfile.mkdtemp()
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{_TEST_ROOT}/skip.db")
@@ -395,6 +395,40 @@ def test_resolver_family_ordering_uses_enacted_year_when_effective_from_is_missi
         db.commit(); db.refresh(old_row); db.refresh(new_row)
         assert old_row.status == "superseded"
         assert new_row.status != "superseded"
+
+
+def test_resolver_never_lets_a_deleted_copy_supersede_the_live_document():
+    with SessionLocal() as db:
+        kb = KnowledgeBase(code="resolver-family-deleted", name="Resolver family deleted")
+        db.add(kb); db.flush()
+        family = LegalFamily(knowledge_base_id=kb.id, base_title="Act", normalized_key="act-deleted-copy")
+        db.add(family); db.flush()
+        live_doc = _legal_document(db, kb.id, title="Act", checksum="f1" * 32)
+        deleted_doc = _legal_document(db, kb.id, title="Act", checksum="f2" * 32)
+        deleted_doc.deleted_at = datetime.utcnow()
+        # The deleted copy is the newer one: before the fix it became "current" and hid the live document from search.
+        live_row = _instrument(db, kb.id, live_doc, family_id=family.id, effective_from=date(2000, 1, 1))
+        deleted_row = _instrument(db, kb.id, deleted_doc, family_id=family.id, effective_from=date(2020, 1, 1))
+        db.commit()
+        resolve_instrument_statuses(db, kb.id)
+        db.commit(); db.refresh(live_row); db.refresh(deleted_row)
+        assert live_row.status == "in_force"
+
+
+def test_resolver_does_not_order_full_versions_it_cannot_date():
+    with SessionLocal() as db:
+        kb = KnowledgeBase(code="resolver-family-undated", name="Resolver family undated")
+        db.add(kb); db.flush()
+        family = LegalFamily(knowledge_base_id=kb.id, base_title="Act", normalized_key="act-undated")
+        db.add(family); db.flush()
+        rows = [_instrument(db, kb.id, _legal_document(db, kb.id, title="Act", checksum=c * 32), family_id=family.id)
+                for c in ("f3", "f4")]
+        db.commit()
+        resolve_instrument_statuses(db, kb.id)
+        db.commit()
+        for row in rows:
+            db.refresh(row)
+        assert [row.status for row in rows] == ["unknown", "unknown"]
 
 
 def test_upsert_legal_instrument_preserves_an_explicit_zero_confidence_reference():

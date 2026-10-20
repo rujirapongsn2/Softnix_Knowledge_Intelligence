@@ -473,4 +473,6 @@
 .metadata-quality-next h3 {margin:0 0 .25rem}
 .metadata-next-action.metadata-field-needs_attention,.metadata-next-action.metadata-field-unverified {border-left-width:4px}
 .metadata-next-value {max-width:16rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-secondary);font-size:.85rem}
+.metadata-next-value small {display:block;white-space:normal}
+.metadata-next-value small span {white-space:nowrap}
 @media(max-width:700px){.metadata-quality-head{display:none}.metadata-quality-row{grid-template-columns:repeat(2,minmax(0,1fr))}.metadata-quality-row>span[data-label]::before{content:attr(data-label);color:var(--color-text-secondary);font-size:.72rem}.metadata-next-value{max-width:8rem}}

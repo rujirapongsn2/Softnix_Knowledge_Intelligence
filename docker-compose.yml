@@ -135,7 +135,8 @@ services:
       # Raised with the worker replicas (3): three documents index side by side
       # while MAX_ASYNC still caps in-flight LLM calls at 4 in total.
       MAX_PARALLEL_INSERT: "3"
-      MAX_ASYNC: "4"
+      # In-flight LLM calls of LightRAG, the limit on indexing speed (71 legal documents an hour at 4 in the pilot).
+      MAX_ASYNC: ${LIGHTRAG_MAX_ASYNC:-4}
       EMBEDDING_FUNC_MAX_ASYNC: "4"
       LIGHTRAG_PARSER: "*:native-teP,*:legacy-R"
       VLM_PROCESS_ENABLE: "false"

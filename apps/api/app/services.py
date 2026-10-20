@@ -2929,7 +2929,7 @@ def _append_retrieval_trace(trace: list[dict] | None, *, channel: str, system: s
 
 def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
                     trace: list[dict] | None = None, plan: RetrievalPlan | None = None,
-                    warnings: list[dict] | None = None) -> RetrievalEvidence:
+                    warnings: list[dict] | None = None, generate_answer: bool = True) -> RetrievalEvidence:
     plan = plan or rule_plan(query, policy_from_config(None), limit).plan
     if plan.metadata_filters:
         metadata_document_ids = _metadata_filter_document_ids(db, kb_ids, plan.metadata_filters)
@@ -3074,6 +3074,11 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
     if evidence.sources:
         decorate_sources(db, evidence.sources, kb_ids, [p["field_key"] for p in plan.metadata_predicates] + list(plan.metadata_filters))
         started_at = time.monotonic()
+        if not generate_answer:
+            # response_mode "evidence": the caller writes its own answer, so no LLM answer is paid for.
+            _append_retrieval_trace(trace, channel="answer_generation", system="LLM", status="skipped",
+                                    started_at=started_at, detail="evidence only requested")
+            return evidence
         try:
             evidence.answer = LLMClient().answer_from_sources(query, evidence.sources)
             _append_retrieval_trace(trace, channel="answer_generation", system="LLM", status="used",
@@ -4058,7 +4063,8 @@ def compose_cited_answer(evidence: RetrievalEvidence, warnings: list[dict] | Non
     return f"{prefix}{answer}\n\nรายละเอียดแหล่งอ้างอิง:\n{details}"
 
 
-def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: int, token_id: str | None = None, query_filters=None) -> dict:
+def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: int, token_id: str | None = None, query_filters=None,
+                       generate_answer: bool = True) -> dict:
     current_shortcut_allowed = allows_default_current_direct_path(query, query_filters)
     registry_shortcut_allowed = allows_direct_registry_path(query_filters)
     if is_document_inventory_query(query):
@@ -4085,7 +4091,8 @@ def build_query_result(db: Session, query: str, kb_ids: list[str], max_sources: 
     retrieval_trace: list[dict] = []
     legal_warnings: list[dict] = []
     decision = build_retrieval_plan(db, query, kb_ids, max_sources, query_filters, retrieval_trace)
-    evidence = query_documents(db, query, kb_ids, decision.plan.max_sources, retrieval_trace, decision.plan, legal_warnings)
+    evidence = query_documents(db, query, kb_ids, decision.plan.max_sources, retrieval_trace, decision.plan, legal_warnings,
+                               generate_answer=generate_answer)
     intent = decision.plan.intent
     # Attach PDF download links before composing answer prose so citation
     # details can prefer SKI download_url and never emit OCS source_uri.

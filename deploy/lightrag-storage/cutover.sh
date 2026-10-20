@@ -24,8 +24,13 @@ done
 
 log "backup to $BACKUP"
 docker compose exec -T postgres pg_dump -U skip -d skip -Fc > "$BACKUP/postgres-skip.dump"
-docker run --rm -v softnix-knowledge-intelligence_lightrag:/data:ro -v "$BACKUP":/backup alpine tar czf /backup/lightrag-volume.tgz -C /data .
-docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' | grep -E 'softnix-knowledge-intelligence-(lightrag|postgres|neo4j)' | tee "$BACKUP/memory-before.txt"
+# The volume behind the running container's /app/data, whatever the compose project is called.
+volume=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}' "$(docker compose ps -q lightrag)")
+[ -n "$volume" ] || { log "lightrag is not running with a volume on /app/data"; exit 1; }
+docker run --rm -v "$volume":/data:ro -v "$BACKUP":/backup alpine tar czf /backup/lightrag-volume.tgz -C /data .
+tar tzf "$BACKUP/lightrag-volume.tgz" | grep -q 'rag_storage/kv_store_doc_status.json' || { log "backup of $volume holds no LightRAG store"; exit 1; }
+memory() { docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' $(docker compose ps -q lightrag postgres neo4j); }
+memory | tee "$BACKUP/memory-before.txt"
 
 log "stop lightrag and copy its LLM cache into Postgres"
 docker compose stop lightrag
@@ -48,7 +53,7 @@ docker compose exec -T api python - --workers 2 < "$HERE/reingest.py" | tee "$BA
 status=${PIPESTATUS[0]}
 set -e
 
-docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' | grep -E 'softnix-knowledge-intelligence-(lightrag|postgres|neo4j)' | tee "$BACKUP/memory-after.txt"
+memory | tee "$BACKUP/memory-after.txt"
 docker compose exec -T postgres psql -U skip -d skip -Atc \
   "select relname, pg_size_pretty(pg_total_relation_size(oid)) from pg_class where relname like 'lightrag%' and relkind='r' order by pg_total_relation_size(oid) desc" | tee "$BACKUP/postgres-sizes.txt"
 docker compose exec -T neo4j sh -c 'cypher-shell -u neo4j -p "${NEO4J_AUTH#neo4j/}" "MATCH (n:lightrag) RETURN count(n) AS lightrag_nodes"' | tee -a "$BACKUP/postgres-sizes.txt"

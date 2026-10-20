@@ -101,6 +101,8 @@ def main():
         state_path.write_text(json.dumps(state))
     print(json.dumps({"stage_files": len(stage), "queued": len(ids), "rejected": rejected,
                       "upload_seconds": round(time.monotonic() - started, 1)}), flush=True)
+    if not ids:
+        sys.exit("every file in this stage was rejected; see the rejected codes above")
 
     statuses, peak = {}, {}
     while True:

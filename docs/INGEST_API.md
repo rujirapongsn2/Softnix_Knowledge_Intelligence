@@ -439,6 +439,21 @@ if (documentId) console.log(await waitFor(documentId));
 การอัปโหลดใช้เวลานานกว่าการอ่าน จึงควรจำกัดจำนวน worker ที่อัปโหลดพร้อมกันไม่ให้เกินค่า concurrent
 ที่ตั้งไว้ และใช้ batch endpoint เพื่อลดจำนวน request
 
+เมื่อ Ingest API ถูกเรียกเกินเพดาน server **รอให้มีโควตาว่างก่อน แทนการปฏิเสธทันที** สูงสุด
+`INGEST_LIMIT_WAIT_SECONDS` (ค่าเริ่มต้น 65 วินาที ซึ่งยาวกว่ารอบนับ 60 วินาที) client ที่ส่งเร็วเกินจะช้าลง แต่ไม่ล้ม
+ถ้ารอจนหมดเวลาแล้วยังไม่ว่าง จะได้ `429` พร้อม header `Retry-After` (วินาที) ให้รอตามนั้นแล้วส่งใหม่
+ครั้งที่ถูกปฏิเสธไม่นับเป็นการใช้โควตา
+
+ส่งพร้อมกันไม่เกินค่า requests/min ของ token แต่ละ request จะรอไม่เกินรอบนาทีถัดไป จึงไม่ได้ `429`
+ตัวอย่างเช่น token 60 requests/min กับ client ที่ส่งพร้อมกัน 5 request จะได้ราว 60 ไฟล์ต่อนาที โดยไม่มี request ใดล้ม
+
+ปรับเพดานของ token เดิมได้โดยไม่ต้องออก secret ใหม่:
+
+```
+PATCH /api/v1/tokens/{token_id}/limits
+{"requests_per_minute": 600, "max_concurrent_requests": 10}
+```
+
 ## ชนิดไฟล์และขนาด
 
 รองรับ `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.xls`, `.txt`, `.md`, `.html`, `.htm`, `.csv`, `.json`

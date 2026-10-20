@@ -385,6 +385,13 @@ class TokenCreate(BaseModel):
     query_timeout_seconds: int = Field(default=60, ge=1, le=300)
 
 
+class TokenLimitsUpdate(BaseModel):
+    """Raise or lower an existing token's budget without issuing a new secret."""
+    requests_per_minute: int | None = Field(default=None, ge=1, le=10000)
+    max_concurrent_requests: int | None = Field(default=None, ge=1, le=100)
+    query_timeout_seconds: int | None = Field(default=None, ge=1, le=300)
+
+
 class TokenOut(ORMModel):
     id: str
     name: str

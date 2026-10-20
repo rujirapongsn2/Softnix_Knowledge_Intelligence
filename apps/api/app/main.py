@@ -36,7 +36,7 @@ from .provider_holds import hold_view
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
-from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
+from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenLimitsUpdate, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
 from .job_queue import lock_knowledge_base_graph, release_if_stale
@@ -120,7 +120,7 @@ def bootstrap() -> None:
 async def structured_http_error(_: Request, exc: HTTPException):
     from fastapi.responses import JSONResponse
     detail = exc.detail if isinstance(exc.detail, dict) else {"code": "VALIDATION_ERROR", "message": str(exc.detail), "retryable": False}
-    return JSONResponse(status_code=exc.status_code, content={"status": "error", "error": detail})
+    return JSONResponse(status_code=exc.status_code, content={"status": "error", "error": detail}, headers=exc.headers)
 
 
 @app.get("/health")
@@ -2286,6 +2286,18 @@ def enable_token(token_id: str, user: User = Depends(current_admin), db: Session
     return {"status": "success"}
 
 
+@app.patch("/api/v1/tokens/{token_id}/limits", response_model=TokenOut)
+def update_token_limits(token_id: str, payload: TokenLimitsUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    token = db.get(TokenKey, token_id)
+    if not token or not token_visible_to(db, user, token):
+        raise HTTPException(404, "Token not found")
+    changes = payload.model_dump(exclude_none=True)
+    for field, value in changes.items():
+        setattr(token, field, value)
+    record_audit(db, "token.limits.update", user.id, "token", token.id, changes); db.commit()
+    return token
+
+
 @app.post("/api/v1/tokens/{token_id}/revoke")
 def revoke_token(token_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     token = db.get(TokenKey, token_id)
@@ -2911,10 +2923,12 @@ def ingest_budget(token: TokenKey = Depends(ingest_token)):
     concurrency slot for the rest of the token's timeout window.
     """
     try:
-        mcp_limiter.acquire(token)
+        # An upload only stores the file and queues its job, so a burst above the token's budget waits for a
+        # slot instead of being refused; a client that sends faster than the budget is slowed, not failed.
+        mcp_limiter.acquire(token, wait_seconds=get_settings().ingest_limit_wait_seconds)
     except McpLimitExceeded as exc:
         raise HTTPException(503 if exc.code == "MCP_LIMIT_STORE_UNAVAILABLE" else 429,
-                            {"code": exc.code, "message": exc.message, "retryable": True})
+                            {"code": exc.code, "message": exc.message, "retryable": True}, headers=exc.retry_after_header)
     try:
         yield token
     finally:

@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # job_stale_after_seconds lost its worker and is re-queued by the stale-job sweep.
     job_heartbeat_seconds: int = 30
     job_stale_after_seconds: int = 900
+    # How long an ingest call above its token's rate or concurrency waits for a slot before answering 429.
+    # Longer than the 60 s rate window, so a burst always reaches the next window; shorter than the proxy timeouts.
+    ingest_limit_wait_seconds: int = 65
     lightrag_workspace_prefix: str = "skip-"
     # The model LightRAG extracts the graph with (compose passes it to LightRAG); empty means llm_model.
     lightrag_llm_model: str = ""

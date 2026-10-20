@@ -1,7 +1,8 @@
 // The API computes each extracted field's review state (metadata_field_states); this only says what each state asks of a person.
+// "inconsistent" only appears on a next action: the value disagrees with the document's legal metadata.
 export const FIELD_STATE_REVIEW = {
   verified: "complete", auto_verified: "complete", not_found: "complete",
-  unverified: "unverified", unchecked: "unverified", blocked: "needs_attention", missing: "needs_attention",
+  unverified: "unverified", unchecked: "unverified", blocked: "needs_attention", missing: "needs_attention", inconsistent: "needs_attention",
 };
 const URGENCY = ["needs_attention", "unverified", "complete"];
 

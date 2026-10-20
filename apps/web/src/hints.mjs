@@ -1,5 +1,6 @@
-// What a hover hint says. Each builder returns {meaning, pending?, action?, detail?} or null.
-import {waitingFields} from "./metadata-states.mjs";
+// What a hover hint says. Each builder returns {meaning, title?, sections?, action?, detail?} or null;
+// a section is {kind, heading, items, ordered?}.
+import {fieldReview, metadataBadge, waitingFields} from "./metadata-states.mjs";
 
 export const ERROR_CODES = [
   "RETRIEVAL_ENGINE_DUPLICATE", "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_UNAVAILABLE", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED",
@@ -28,10 +29,32 @@ export const statusTip = (t, document) => {
   return tip;
 };
 
+const MAX_NAMED_FIELDS = 4;
+const METADATA_TIP = {
+  needs_attention: {effect: ["content", "usable", "blocked", "missing"], steps: ["open", "resolve", "optional"]},
+  unverified: {effect: ["content", "values", "answers"], steps: ["open", "resolve", "counted"]},
+};
+
+const fieldList = (t, names) => names.length > MAX_NAMED_FIELDS
+  ? t("hint.metadata.fields.more", {fields: names.slice(0, MAX_NAMED_FIELDS).join(", "), count: names.length - MAX_NAMED_FIELDS})
+  : names.join(", ");
+
 export const metadataReviewTip = (t, document) => {
-  const pending = waitingFields(document.metadata_template_fields || [], document.metadata_field_states).map(field => field.label || field.key);
-  return {meaning: t(document.metadata_status === "needs_attention" ? "hint.metadata.needs_attention" : "hint.metadata.unverified"),
-    pending: pending.length ? t("hint.metadata.pending", {fields: pending.join(", ")}) : null, action: t("hint.metadata.review.action")};
+  const status = document.metadata_status === "needs_attention" ? "needs_attention" : "unverified";
+  const states = document.metadata_field_states || {};
+  const waiting = waitingFields(document.metadata_template_fields || [], states);
+  const names = review => waiting.filter(field => fieldReview(states[field.key]) === review).map(field => field.label || field.key);
+  const fieldRows = [["needs_attention", "hint.metadata.pending.fix"], ["unverified", "hint.metadata.pending.check"]]
+    .filter(([review]) => names(review).length).map(([review, key]) => t(key, {fields: fieldList(t, names(review))}));
+  return {
+    title: t(metadataBadge(status).labelKey),
+    meaning: t(`hint.metadata.${status}`),
+    sections: [
+      {kind: "effect", heading: t("hint.metadata.section.effect"), items: METADATA_TIP[status].effect.map(key => t(`hint.metadata.${status}.effect.${key}`))},
+      fieldRows.length && {kind: "fields", heading: t("hint.metadata.section.fields"), items: fieldRows},
+      {kind: "steps", heading: t(`hint.metadata.section.steps.${status}`), items: METADATA_TIP[status].steps.map(key => t(`hint.metadata.${status}.step.${key}`)), ordered: true},
+    ].filter(Boolean),
+  };
 };
 
 export const statusFilterTip = (t, value) => {

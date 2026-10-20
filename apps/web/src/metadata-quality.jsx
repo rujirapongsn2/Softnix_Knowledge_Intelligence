@@ -51,9 +51,9 @@ export function MetadataQualityTab({knowledgeBaseId, api, refreshKey, onOpenDocu
         </div>)}
       </div>
       <div className="section-title metadata-quality-next"><div><h3>{t("metadataQuality.nextActions.title")}</h3><p>{t("metadataQuality.nextActions.description")}</p></div>{report.next_actions_total > report.next_actions.length && <span className="section-copy">{t("metadataQuality.nextActions.more", {shown: report.next_actions.length, total: report.next_actions_total})}</span>}</div>
-      {report.next_actions.length ? <div className="kb-quality-document-list">{report.next_actions.map(action => <button type="button" className={`kb-quality-document metadata-next-action metadata-field-${fieldReview(action.state)}`} key={`${action.document_id}:${action.field_key}`} onClick={() => onOpenDocument(action)}>
+      {report.next_actions.length ? <div className="kb-quality-document-list">{report.next_actions.map(action => <button type="button" className={`kb-quality-document metadata-next-action metadata-field-${fieldReview(action.state)}`} key={`${action.document_id}:${action.field_key}:${action.state}`} onClick={() => onOpenDocument(action)}>
         <span className="kb-quality-document-main"><b>{action.title}</b><small>{action.label} · {t(`autoMetadata.state.${action.state}`)}</small></span>
-        <span className="metadata-next-value">{display(action.value) ?? t("metadataQuality.noValue")}</span><span aria-hidden="true">→</span>
+        <span className="metadata-next-value">{display(action.value) ?? t("metadataQuality.noValue")}{action.state === "inconsistent" && <small>{t("metadataQuality.legalValue")}: <span>{display(action.legal_value)}</span></small>}</span><span aria-hidden="true">→</span>
       </button>)}</div> : <p className="quality-all-clear">✓ {t("metadataQuality.allClear")}</p>}
     </>}
   </section>;

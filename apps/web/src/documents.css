@@ -441,7 +441,15 @@
   pointer-events: none;
 }
 .hint-card p { margin: 0; }
-.hint-card .hint-pending { color: var(--text-color-kumo-subtle, #596675); }
+.hint-card .hint-title { font-size: .85rem; font-weight: 700; }
+.hint-card .hint-section { display: grid; gap: .15rem; padding-top: .25rem; }
+.hint-card .hint-section-effect { padding: .35rem .5rem; border-radius: 6px; background: var(--color-kumo-tint, #f1f4f8); }
+.hint-card .hint-heading { color: var(--text-color-kumo-subtle, #596675); font-size: .7rem; font-weight: 650; letter-spacing: .02em; text-transform: uppercase; }
+.hint-card .hint-section ul, .hint-card .hint-section ol { display: grid; gap: .1rem; margin: 0; padding-left: 1.1rem; }
+/* The app's CSS reset sets list-style: none on every list; the tooltip's bullets and step numbers are its structure. */
+.hint-card .hint-section ul { list-style: disc outside; }
+.hint-card .hint-section ol { list-style: decimal outside; }
+.hint-card .hint-section li { display: list-item; overflow-wrap: anywhere; }
 .hint-card .hint-action { padding-top: .3rem; border-top: 1px solid var(--color-kumo-line, #d8dde3); }
 .hint-card .hint-detail { overflow-wrap: anywhere; color: var(--text-color-kumo-subtle, #596675); font-size: .7rem; }
 .metadata-review-badge-attention {background:#c83c3c14;color:#b03030}
@@ -468,4 +476,6 @@
 .metadata-quality-next h3 {margin:0 0 .25rem}
 .metadata-next-action.metadata-field-needs_attention,.metadata-next-action.metadata-field-unverified {border-left-width:4px}
 .metadata-next-value {max-width:16rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-secondary);font-size:.85rem}
+.metadata-next-value small {display:block;white-space:normal}
+.metadata-next-value small span {white-space:nowrap}
 @media(max-width:700px){.metadata-quality-head{display:none}.metadata-quality-row{grid-template-columns:repeat(2,minmax(0,1fr))}.metadata-quality-row>span[data-label]::before{content:attr(data-label);color:var(--color-text-secondary);font-size:.72rem}.metadata-next-value{max-width:8rem}}

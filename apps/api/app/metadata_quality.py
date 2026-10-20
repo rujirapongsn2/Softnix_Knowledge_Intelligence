@@ -1,12 +1,14 @@
 """How often the AI's metadata was right, per template field, and which values a person should look at next."""
 from sqlalchemy.orm import load_only
 
-from .metadata_extraction import FIELD_STATES, field_review_states
+from .metadata_extraction import FIELD_STATES, field_review_states, metadata_consistency_conflicts
 from .models import Document
 
 STATES = ("verified", "auto_verified", "unverified", "blocked", "missing", "unchecked", "not_found")
 OUTCOMES = ("confirmed", "corrected", "rejected")
 NEXT_ACTIONS_LIMIT = 200
+# "inconsistent" is an action-only state: a document details value disagrees with the document's legal metadata.
+ACTION_REVIEW = {**FIELD_STATES, "inconsistent": "needs_attention"}
 
 
 def _accuracy(outcomes):
@@ -24,6 +26,7 @@ def metadata_quality_report(db, kb_id):
     documents = db.query(Document).options(load_only(
         Document.id, Document.title, Document.original_filename, Document.mime_type, Document.metadata_status, Document.metadata_template_id,
         Document.metadata_template_name, Document.metadata_template_fields, Document.document_metadata, Document.metadata_observations,
+        Document.legal_metadata,
     )).filter(Document.knowledge_base_id == kb_id, Document.live()).order_by(Document.created_at.desc())
     rows, actions = {}, []
     for doc in documents:
@@ -49,9 +52,16 @@ def metadata_quality_report(db, kb_id):
                                 "mime_type": doc.mime_type, "template_id": doc.metadata_template_id,
                                 "field_key": field["key"], "label": row["label"], "state": state,
                                 "value": values.get(field["key"], candidates[0].get("value")), "candidate_count": len(observation.get("candidates") or [])})
+        if doc.metadata_status in {"queued", "running"}:
+            continue
+        labels = {field["key"]: field.get("label") or field["key"] for field in doc.metadata_template_fields or []}
+        for key, legal_value in metadata_consistency_conflicts(doc).items():
+            actions.append({"document_id": doc.id, "title": doc.title or doc.original_filename, "original_filename": doc.original_filename,
+                            "mime_type": doc.mime_type, "template_id": doc.metadata_template_id, "field_key": key, "label": labels.get(key, key),
+                            "state": "inconsistent", "value": values.get(key), "legal_value": legal_value, "candidate_count": 0})
     for row in rows.values():
         row["ai_accuracy"] = _accuracy(row["outcomes"])
     fields = sorted(rows.values(), key=_improvement_rank)
     rank = {(row["template_id"], row["field_key"]): index for index, row in enumerate(fields)}
-    actions.sort(key=lambda a: (FIELD_STATES[a["state"]] != "needs_attention", rank[(a["template_id"], a["field_key"])], a["title"]))
+    actions.sort(key=lambda a: (ACTION_REVIEW[a["state"]] != "needs_attention", rank.get((a["template_id"], a["field_key"]), len(rank)), a["title"]))
     return {"fields": fields, "next_actions": actions[:NEXT_ACTIONS_LIMIT], "next_actions_total": len(actions)}

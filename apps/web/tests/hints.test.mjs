@@ -17,18 +17,46 @@ for (const lang of ["en", "th"]) {
     const failed = statusTip(t, {status: "failed", error_code: "RETRIEVAL_ENGINE_BUSY", error_message: "engine said busy"});
     assert.equal(failed.meaning, errorGuide(t, "RETRIEVAL_ENGINE_BUSY").title);
     assert.equal(failed.detail, "RETRIEVAL_ENGINE_BUSY · engine said busy");
-    assert.deepEqual(Object.keys(statusTip(t, {status: "completed"})), ["meaning"]);
+    assert.deepEqual(statusTip(t, {status: "completed"}), {meaning: t("status.completed.help")});
+    assert.deepEqual(Object.keys(failed), ["meaning", "action", "detail"]);
     assert.equal(statusTip(t, {status: "mystery"}), null);
     assert.ok(errorGuide(t, "NOT_A_KNOWN_CODE").action);
   });
 
-  test(`${lang}: the review hint names the waiting fields by label, most urgent first, and says whether something needs fixing`, () => {
+  const section = (tip, kind) => tip.sections.find(item => item.kind === kind);
+
+  test(`${lang}: the review hint is titled with the badge, says what search through the API and MCP does, and how to resolve it`, () => {
+    const attention = metadataReviewTip(t, {metadata_status: "needs_attention"});
+    const unverified = metadataReviewTip(t, {metadata_status: "unverified"});
+    assert.equal(attention.title, t("documents.badge.needsAttention"));
+    assert.equal(unverified.title, t("documents.badge.unverified"));
+    for (const [tip, status] of [[attention, "needs_attention"], [unverified, "unverified"]]) {
+      assert.equal(tip.meaning, t(`hint.metadata.${status}`));
+      assert.deepEqual(tip.sections.map(item => item.kind), ["effect", "steps"], `${status}: nothing waits, so no fields section`);
+      assert.equal(section(tip, "effect").heading, t("hint.metadata.section.effect"));
+      assert.match(section(tip, "effect").heading, /MCP/);
+      assert.equal(section(tip, "steps").heading, t(`hint.metadata.section.steps.${status}`));
+      assert.ok(section(tip, "steps").ordered && section(tip, "steps").items.length >= 2);
+    }
+    assert.deepEqual(section(attention, "effect").items, ["content", "usable", "blocked", "missing"].map(key => t(`hint.metadata.needs_attention.effect.${key}`)));
+    assert.deepEqual(section(unverified, "effect").items, ["content", "values", "answers"].map(key => t(`hint.metadata.unverified.effect.${key}`)));
+    assert.match(section(unverified, "effect").items[1], /"unverified"/);
+    assert.equal(section(attention, "steps").items[1], t("hint.metadata.needs_attention.step.resolve"));
+    assert.notDeepEqual(section(attention, "steps").items, section(unverified, "steps").items);
+  });
+
+  test(`${lang}: the review hint lists the waiting fields by label, most urgent first, and cuts a long list short`, () => {
     const document = {metadata_status: "needs_attention", metadata_template_fields: [{key: "party", label: "Party"}, {key: "other"}, {key: "done", label: "Done"}],
       metadata_field_states: {party: "unverified", other: "blocked", done: "verified"}};
-    assert.match(metadataReviewTip(t, document).pending, /other, Party$/);
-    assert.equal(metadataReviewTip(t, document).meaning, t("hint.metadata.needs_attention"));
-    assert.equal(metadataReviewTip(t, {...document, metadata_status: "unverified"}).meaning, t("hint.metadata.unverified"));
-    assert.equal(metadataReviewTip(t, {}).pending, null);
+    assert.deepEqual(section(metadataReviewTip(t, document), "fields"), {kind: "fields", heading: t("hint.metadata.section.fields"),
+      items: [t("hint.metadata.pending.fix", {fields: "other"}), t("hint.metadata.pending.check", {fields: "Party"})]});
+    const unverified = metadataReviewTip(t, {...document, metadata_status: "unverified", metadata_field_states: {party: "unverified", done: "verified"}});
+    assert.deepEqual(section(unverified, "fields").items, [t("hint.metadata.pending.check", {fields: "Party"})]);
+    const keys = ["a", "b", "c", "d", "e", "f"];
+    const many = metadataReviewTip(t, {metadata_status: "needs_attention", metadata_template_fields: keys.map(key => ({key, label: key.toUpperCase()})),
+      metadata_field_states: Object.fromEntries(keys.map(key => [key, "missing"]))});
+    const more = lang === "en" ? "A, B, C, D and 2 more" : "A, B, C, D และอีก 2 ฟิลด์";
+    assert.deepEqual(section(many, "fields").items, [t("hint.metadata.pending.fix", {fields: more})]);
   });
 
   test(`${lang}: every status filter option has a hint`, () => {

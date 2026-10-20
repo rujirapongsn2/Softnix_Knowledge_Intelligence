@@ -226,20 +226,16 @@ All strings via `translations.js` (en/th parity test already enforced).
 
 ## 9. Production configuration notes (LightRAG & infra)
 
-- **Storage** (required for 50k; current JSON/NetworkX files ≈ 80 MB per 1M chars, all in memory):
-  `LIGHTRAG_KV_STORAGE=PGKVStorage`, `LIGHTRAG_VECTOR_STORAGE=PGVectorStorage`,
-  `LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage`, `LIGHTRAG_GRAPH_STORAGE=Neo4JStorage`
-  (+ `POSTGRES_*`, `NEO4J_*` for LightRAG; separate database/workspace from SKI tables).
-  Move = new empty LightRAG store + **DOC_GRAPH backfill** of existing documents (maintenance lane).
-- **Correct env names** (LightRAG 1.5.4 ignores the ones in our compose today):
-  `MAX_ASYNC` (was `LLM_MODEL_MAX_ASYNC`), `MAX_PARALLEL_INSERT` (was `LIGHTRAG_MAX_PARALLEL_INSERT`),
-  `EMBEDDING_FUNC_MAX_ASYNC`. Prod starting point: `MAX_ASYNC=16`, `MAX_PARALLEL_INSERT=6`,
+- **Storage** (done): LightRAG runs on `PGKVStorage`, `PGVectorStorage`, `PGDocStatusStorage`
+  (tables `lightrag_*`, workspace `lightrag`, in the SKI database) and `Neo4JStorage` (label `lightrag`).
+  The move and its re-ingest are in `deploy/lightrag-storage/`.
+- **Env names** (done): compose sets `MAX_ASYNC` and `MAX_PARALLEL_INSERT`, the names LightRAG 1.5.4 reads,
+  and pins the image. Prod starting point: `MAX_ASYNC=16`, `MAX_PARALLEL_INSERT=6`,
   then raise with measured 429 rate.
 - Cost/speed levers (A/B on Thai quality first): `MAX_GLEANING=0` (−1 extract call/chunk),
   `FORCE_LLM_SUMMARY_ON_MERGE=16`, cheaper extraction model.
 - SKI Postgres: `shared_buffers` 25 % RAM, `maintenance_work_mem` ≥ 1 GB (HNSW), ~15 KB per
   chunk ⇒ ~14 GB for 50k × 10k chars.
-- Retire the dead env names in `docker-compose.yml` in the same change.
 
 ---
 

@@ -91,5 +91,6 @@ vector เดิมใช้กับโมเดลใหม่ไม่ได�
    `alembic downgrade 0038_processing_job_claims && alembic upgrade head`
 2. สั่ง Reindex ทุก Knowledge Base (`POST /api/v1/knowledge-bases/{id}/documents/reindex`) เพื่อสร้าง embedding ใหม่
 3. ingest เอกสารเข้า LightRAG ใหม่ Reindex ในข้อ 2 ไม่แตะ LightRAG และ vector store ของ LightRAG ยังเก็บ vector ของโมเดลเดิม
-   จึงต้องล้าง storage ของ LightRAG แล้วประมวลผลเอกสารใหม่
+   จึงต้องล้างตาราง `lightrag_*` และ node label `lightrag` แล้วรัน `deploy/lightrag-storage/reingest.py`
+   (`rebuild_lightrag_vectors.py` ใช้ได้กับ storage แบบไฟล์เท่านั้น)
    (LightRAG ใส่ prefix `EMBEDDING_*_PREFIX` ไม่ได้ จึงใช้ vector แบบไม่มี prefix)

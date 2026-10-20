@@ -12,11 +12,17 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session, load_only
 
 from .config import get_settings
+from .metadata_extraction import field_state, metadata_consistency_conflicts
 from .models import Document, DocumentChunk, Entity, EntitySource, LegalInstrument
 
 
 LEGAL_TYPES = {"legal", "regulation", "contract"}
+# Part of every cached report's fingerprint: bump it when scoring changes so stored reports are rebuilt.
+SCORING_VERSION = 2
 WEIGHTS = {"content": 20, "structure": 15, "metadata": 20, "retrieval": 20, "citation": 20, "graph": 5}
+# A field whose answer is settled: a usable value, or an absence a person confirmed or a full read found.
+# A blocked value kept from an older source version is not usable, so it does not count.
+COVERED_STATES = {"verified", "auto_verified", "unverified", "not_found"}
 OCR_PAGE_RE = re.compile(r"<!--\s*OCR:\s*page\s+(\d+)\s*-->", re.IGNORECASE)
 THAI_RE = re.compile(r"[\u0E00-\u0E7F]")
 CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
@@ -55,38 +61,6 @@ def _page_quality(text: str) -> list[dict[str, Any]]:
         status = "empty" if len(page_text) < 40 else "warning" if anomalies else "good"
         pages.append({"page": int(match.group(1)), "status": status, "characters": len(page_text), "anomalies": anomalies})
     return pages
-
-
-def _normal(value: Any) -> str:
-    if isinstance(value, dict):
-        value = value.get("name")
-    return " ".join(str(value or "").casefold().split())
-
-
-def _has_value(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, (list, dict, tuple, set)):
-        return bool(value)
-    return True
-
-
-def _metadata_consistency(document: Document) -> list[str]:
-    custom = document.document_metadata or {}
-    legal = document.legal_metadata or {}
-    instrument = legal.get("instrument") if isinstance(legal.get("instrument"), dict) else {}
-    conflicts = []
-    issuer_a = _normal(custom.get("issuer"))
-    issuer_b = _normal(instrument.get("issuer"))
-    if issuer_a and issuer_b and issuer_a != issuer_b:
-        conflicts.append("issuer")
-    date_a = _normal(custom.get("effective_date"))
-    date_b = _normal(legal.get("effective_date") or instrument.get("effective_date"))
-    if date_a and date_b and date_a != date_b:
-        conflicts.append("effective_date")
-    return conflicts
 
 
 def _quality_context(db: Session, document_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -151,14 +125,14 @@ def _build_document_quality_report(document: Document, context: dict[str, Any], 
     fields = [field for field in (document.metadata_template_fields or []) if isinstance(field, dict) and field.get("key")]
     values = document.document_metadata or {}
     observations = document.metadata_observations or {}
-    required = [field for field in fields if field.get("required")]
-    populated = [field for field in fields if _has_value(values.get(field["key"]))]
-    required_populated = [field for field in required if _has_value(values.get(field["key"]))]
-    conflicts = [key for key, observation in observations.items() if isinstance(observation, dict) and observation.get("status") in {"conflict", "invalid_evidence"}]
-    consistency_conflicts = _metadata_consistency(document)
+    states = {field["key"]: field_state(field, values, observations.get(field["key"], {})) for field in fields}
+    covered = {key for key, state in states.items() if state in COVERED_STATES}
+    required = [field["key"] for field in fields if field.get("required")]
+    conflicts = [key for key, state in states.items() if state == "blocked"]
+    consistency_conflicts = list(metadata_consistency_conflicts(document))
     verified = [key for key, observation in observations.items() if isinstance(observation, dict) and observation.get("status") in {"human_verified", "not_found_confirmed"}]
-    custom_coverage = len(populated) / len(fields) if fields else 1.0
-    required_coverage = len(required_populated) / len(required) if required else 1.0
+    custom_coverage = len(covered) / len(fields) if fields else 1.0
+    required_coverage = len(covered.intersection(required)) / len(required) if required else 1.0
     metadata_score = 35 * custom_coverage + 35 * required_coverage
     if document.metadata_status in {"complete", "not_started"}:
         metadata_score += 15
@@ -255,7 +229,7 @@ def _build_document_quality_report(document: Document, context: dict[str, Any], 
             "embedding_coverage": round(embedding_coverage, 4),
             "section_locator_coverage": round(section_coverage, 4),
             "metadata_fields": len(fields),
-            "metadata_populated": len(populated),
+            "metadata_populated": sum(state in {"verified", "auto_verified", "unverified"} for state in states.values()),
             "metadata_conflicts": sorted(set(conflicts + consistency_conflicts)),
             "legal_graph_sources": int(legal_sources),
         },
@@ -269,6 +243,7 @@ def _quality_fingerprint(document: Document, context: dict[str, Any]) -> str:
     """Hash every persisted signal that can change a summary quality score."""
     instrument = context.get("instrument")
     payload = {
+        "scoring": SCORING_VERSION,
         "status": document.status,
         "checksum": document.checksum_sha256,
         "indexed_at": document.indexed_at.isoformat() if document.indexed_at else None,

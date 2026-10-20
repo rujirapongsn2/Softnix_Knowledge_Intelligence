@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.data_quality import _has_value
 from app.main import app
 from app.models import Document, DocumentChunk, QueryResult
 from app.services import exclude_not_queryable_sources
@@ -259,17 +258,6 @@ def test_quality_gate_excludes_unusable_evidence_and_preserves_verified_registry
     assert blocked == {"S1"}
     assert [source["citation_id"] for source in sources] == ["S2"]
     assert warnings[0]["code"] == "DATA_QUALITY_SOURCE_EXCLUDED"
-
-
-def test_quality_metadata_presence_rejects_blank_and_empty_values():
-    assert not _has_value(None)
-    assert not _has_value("")
-    assert not _has_value("   ")
-    assert not _has_value([])
-    assert not _has_value({})
-    assert _has_value("value")
-    assert _has_value(["value"])
-    assert _has_value(False)
 
 
 def test_empty_knowledge_base_quality_has_explicit_not_available_status():

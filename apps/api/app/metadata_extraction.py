@@ -87,6 +87,22 @@ def field_review_states(fields, values, observations):
     return {f["key"]: field_state(f, values or {}, (observations or {}).get(f["key"], {})) for f in fields or [] if f.get("fill_mode") == "extract"}
 
 
+def _comparable(value):
+    return " ".join(str(value or "").casefold().split())
+
+
+def metadata_consistency_conflicts(document):
+    """Document details values that disagree with the document's legal metadata, as {field key: legal value}."""
+    legal = document.legal_metadata or {}
+    instrument = legal.get("instrument") if isinstance(legal.get("instrument"), dict) else {}
+    issuer = instrument.get("issuer")
+    legal_values = {"issuer": issuer.get("name") if isinstance(issuer, dict) else issuer,
+                    "effective_date": legal.get("effective_date") or instrument.get("effective_date")}
+    values = document.document_metadata or {}
+    return {key: legal_value for key, legal_value in legal_values.items()
+            if _comparable(values.get(key)) and _comparable(legal_value) and _comparable(values.get(key)) != _comparable(legal_value)}
+
+
 def update_status(document):
     needs = {FIELD_STATES[state] for state in field_review_states(document.metadata_template_fields, document.document_metadata, document.metadata_observations).values()}
     document.metadata_status = next((status for status in reversed(REVIEW_STATUSES) if status in needs), "complete")

@@ -63,9 +63,13 @@ class Settings(BaseSettings):
     # embeddinggemma's task prompts; the query and document sides must use matching ones.
     embedding_query_prefix: str = "task: search result | query: "
     embedding_document_prefix: str = "title: none | text: "
-    # A Cohere-style POST {base}/rerank server; the base URL and key default to the LLM's.
+    # POST {base}/rerank on a server speaking rerank_api_style (see llm.RERANK_STYLES); the base URL and key
+    # default to the LLM's.
     rerank_base_url: str = ""
     rerank_api_key: str = ""
+    rerank_api_style: Literal["cohere", "tei"] = "cohere"
+    # False accepts a self-signed certificate on a rerank server inside a trusted network.
+    rerank_verify_ssl: bool = True
     rerank_model: str = Field("", validation_alias=AliasChoices("RERANK_MODEL", "OPENROUTER_RERANK_MODEL"))
     rerank_candidate_limit: int = 20
     # Sent as OpenRouter's app attribution headers; llm_app_url is also the fallback for public_app_url.

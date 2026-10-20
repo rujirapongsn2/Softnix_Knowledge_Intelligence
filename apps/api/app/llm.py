@@ -40,6 +40,35 @@ DIALECTS = {
 }
 
 
+def _as_list(payload: Any) -> list:
+    if not isinstance(payload, list):
+        raise TypeError(f"expected a JSON list, got {type(payload).__name__}")
+    return payload
+
+
+@dataclass(frozen=True)
+class RerankStyle:
+    """Request body and response reading of one /rerank API family."""
+    body: Callable[[str, str, list[str], int], dict[str, Any]]
+    results: Callable[[Any], list[tuple[int, float]]]
+    needs_model: bool
+
+
+RERANK_STYLES = {
+    # Cohere, Jina, OpenRouter, vLLM and llama-server --reranking.
+    "cohere": RerankStyle(
+        lambda model, query, documents, top_n: {"model": model, "query": query, "documents": documents, "top_n": top_n},
+        lambda payload: [(item["index"], float(item["relevance_score"])) for item in payload.get("results", [])
+                         if "index" in item and "relevance_score" in item],
+        True),
+    # Hugging Face text-embeddings-inference, which serves a single model.
+    "tei": RerankStyle(
+        lambda model, query, documents, top_n: {"query": query, "texts": documents, "truncate": True},
+        lambda payload: [(item["index"], float(item["score"])) for item in _as_list(payload) if "index" in item and "score" in item],
+        False),
+}
+
+
 def dialect_name(settings) -> str:
     if settings.llm_api_dialect:
         return settings.llm_api_dialect
@@ -314,7 +343,8 @@ class LLMClient:
     @property
     def reranker_enabled(self) -> bool:
         # A rerank server of its own may need no key; one sharing the LLM's base URL uses the LLM key.
-        return bool(self.settings.reranker_enabled and self.settings.rerank_model
+        return bool(self.settings.reranker_enabled
+                    and (self.settings.rerank_model or not RERANK_STYLES[self.settings.rerank_api_style].needs_model)
                     and (self.settings.rerank_base_url or self.settings.llm_api_key))
 
     def _rerank_headers(self) -> dict[str, str]:
@@ -327,19 +357,19 @@ class LLMClient:
             raise RuntimeError("RERANKER_NOT_CONFIGURED")
         if not documents:
             return []
-        client = self._client or httpx.Client(timeout=remaining_timeout(30))
+        style = RERANK_STYLES[self.settings.rerank_api_style]
+        client = self._client or httpx.Client(timeout=remaining_timeout(30), verify=self.settings.rerank_verify_ssl)
         try:
             response = client.post(
                 f"{(self.settings.rerank_base_url or self.settings.llm_base_url).rstrip('/')}/rerank",
                 headers=self._rerank_headers(),
-                json={"model": self.settings.rerank_model, "query": query[:RERANK_QUERY_CHARS],
-                      "documents": [document[:RERANK_DOCUMENT_CHARS] for document in documents],
-                      "top_n": min(top_n, len(documents))},
+                json=style.body(self.settings.rerank_model, query[:RERANK_QUERY_CHARS],
+                                [document[:RERANK_DOCUMENT_CHARS] for document in documents], min(top_n, len(documents))),
             )
             response.raise_for_status()
-            results = response.json().get("results", [])
-            return [(item["index"], float(item["relevance_score"])) for item in results if "index" in item and "relevance_score" in item]
-        except httpx.HTTPError as exc:
+            return style.results(response.json())
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+            # A body in another style's shape is as unusable as an outage: keep the fused order.
             raise RuntimeError("RERANKER_UNAVAILABLE") from exc
         finally:
             if self._client is None:

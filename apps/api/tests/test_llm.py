@@ -279,3 +279,57 @@ def test_rerank_sends_only_the_start_of_long_candidates_so_one_cannot_fail_the_r
     assert [len(document) for document in bodies[0]["documents"]] == [2000, 5]
     assert len(bodies[0]["query"]) == 1000
     get_settings.cache_clear()
+
+
+def _tei_env(monkeypatch, **extra):
+    monkeypatch.setenv("RERANKER_ENABLED", "true")
+    monkeypatch.setenv("RERANK_API_STYLE", "tei")
+    monkeypatch.setenv("RERANK_BASE_URL", "https://reranker.internal")
+    monkeypatch.setenv("RERANK_API_KEY", "rerank-key")
+    monkeypatch.delenv("RERANK_MODEL", raising=False)
+    for name, value in extra.items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+
+
+def test_a_tei_reranker_gets_texts_and_its_bare_list_is_read(monkeypatch):
+    _tei_env(monkeypatch)
+    seen = []
+
+    def handler(request: httpx.Request):
+        seen.append((str(request.url), request.headers["authorization"], json.loads(request.content)))
+        return httpx.Response(200, json=[{"index": 1, "score": 0.99}, {"index": 0, "score": 0.01}])
+
+    client = LLMClient(httpx.Client(transport=httpx.MockTransport(handler)))
+    assert client.reranker_enabled, "a TEI server serves one model, so RERANK_MODEL is not required"
+    assert client.rerank("เมืองหลวง", ["เชียงใหม่", "กรุงเทพ"], 2) == [(1, 0.99), (0, 0.01)]
+    assert seen == [("https://reranker.internal/rerank", "Bearer rerank-key", {"query": "เมืองหลวง", "texts": ["เชียงใหม่", "กรุงเทพ"], "truncate": True})]
+    get_settings.cache_clear()
+
+
+def test_a_reply_in_the_other_style_is_reported_as_unavailable_not_raised(monkeypatch):
+    _tei_env(monkeypatch)
+    client = LLMClient(httpx.Client(transport=httpx.MockTransport(
+        lambda _request: httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.5}]}))))
+    try:
+        client.rerank("q", ["one"], 1)
+        raise AssertionError("expected a failure")
+    except RuntimeError as exc:
+        assert str(exc) == "RERANKER_UNAVAILABLE"
+    get_settings.cache_clear()
+
+
+def test_rerank_verify_ssl_false_reaches_the_http_client(monkeypatch):
+    _tei_env(monkeypatch, RERANK_VERIFY_SSL="false")
+    import app.llm as llm
+    created = []
+    real_client = httpx.Client
+
+    def client_factory(**kwargs):
+        created.append(kwargs.get("verify"))
+        return real_client(transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=[{"index": 0, "score": 1.0}])))
+
+    monkeypatch.setattr(llm.httpx, "Client", client_factory)
+    assert LLMClient().rerank("q", ["one"], 1) == [(0, 1.0)]
+    assert created == [False]
+    get_settings.cache_clear()

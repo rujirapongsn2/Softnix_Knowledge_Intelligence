@@ -43,5 +43,22 @@ RERANK_BASE_URL=http://host.docker.internal:8091/v1
 RERANK_API_KEY=
 ```
 
+## ใช้ reranker บนเครื่องอื่น
+
+แก้ `.env` อย่างเดียว ไม่ต้องแก้โค้ด แล้วสร้าง api และ worker ใหม่ (`docker compose up -d api worker`):
+
+```sh
+# server แบบ Hugging Face text-embeddings-inference (body {"query", "texts"} ตอบเป็น [{"index", "score"}])
+RERANK_BASE_URL=https://<host>          # ระบบต่อท้ายด้วย /rerank
+RERANK_API_STYLE=tei                    # cohere (ค่าเริ่มต้น) หรือ tei; tei ไม่ใช้ RERANK_MODEL
+RERANK_API_KEY=<key>                    # ส่งเป็น Authorization: Bearer
+RERANK_VERIFY_SSL=false                 # เฉพาะ certificate ที่ self-signed ในเครือข่ายที่เชื่อถือได้
+```
+
+วัดเทียบกับ server TEI เครื่องหนึ่งในเครือข่ายด้วยคำถาม 190 ข้อชุดเดียวกัน (30 candidate):
+คุณภาพใกล้กันจนแยกไม่ออก (Recall@10 lenient 0.789 ทั้งคู่; MRR@10 0.594 กับ 0.577 ของเครื่องนี้)
+แต่เร็วกว่าที่ p50 128 ms กับ 2,333 ms ส่วนต่างนี้เหลือราว 0.2 วินาทีบนคำถามจริงที่ใช้เวลารวมราว 9 วินาที
+ค่าเริ่มต้นจึงยังเป็นเครื่องนี้ ข้อความเอกสารและคำถามไม่ต้องออกจากเครื่อง
+
 ถ้า `RERANK_BASE_URL` ว่าง ระบบจะส่ง rerank ไปที่ `LLM_BASE_URL` ด้วย key ของ LLM
 และปิด rerank เฉพาะบาง KB ได้จากนโยบาย retrieval ของ KB นั้น

@@ -17,6 +17,10 @@ from .request_budget import remaining_timeout
 # other 4xx means the provider refused this particular request, which retrying
 # cannot fix.
 _PROVIDER_UNAVAILABLE_4XX = frozenset({408, 429})
+# A cross-encoder reads only the start of each pair (bge-reranker-v2-m3 is trained on 1024 tokens), and one
+# over-long candidate makes llama-server reject the whole request (a 7,107-token LightRAG source did).
+RERANK_DOCUMENT_CHARS = 2000
+RERANK_QUERY_CHARS = 1000
 
 
 @dataclass(frozen=True)
@@ -328,8 +332,9 @@ class LLMClient:
             response = client.post(
                 f"{(self.settings.rerank_base_url or self.settings.llm_base_url).rstrip('/')}/rerank",
                 headers=self._rerank_headers(),
-                json={"model": self.settings.rerank_model, "query": query,
-                      "documents": documents, "top_n": min(top_n, len(documents))},
+                json={"model": self.settings.rerank_model, "query": query[:RERANK_QUERY_CHARS],
+                      "documents": [document[:RERANK_DOCUMENT_CHARS] for document in documents],
+                      "top_n": min(top_n, len(documents))},
             )
             response.raise_for_status()
             results = response.json().get("results", [])

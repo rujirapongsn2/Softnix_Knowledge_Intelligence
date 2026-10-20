@@ -261,3 +261,21 @@ def test_rerank_can_use_its_own_server_without_the_llm_key(monkeypatch):
     assert client.rerank("q", ["one"], 1) == [(0, 0.7)]
     assert seen == [("http://reranker:8091/v1/rerank", None)]
     get_settings.cache_clear()
+
+
+def test_rerank_sends_only_the_start_of_long_candidates_so_one_cannot_fail_the_request(monkeypatch):
+    monkeypatch.setenv("RERANKER_ENABLED", "true")
+    monkeypatch.setenv("RERANK_MODEL", "bge-reranker")
+    monkeypatch.setenv("RERANK_BASE_URL", "http://reranker:8091/v1")
+    get_settings.cache_clear()
+    bodies = []
+
+    def handler(request: httpx.Request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.1}, {"index": 1, "relevance_score": 0.9}]})
+
+    client = LLMClient(httpx.Client(transport=httpx.MockTransport(handler)))
+    assert client.rerank("ถาม" * 2000, ["ก" * 20000, "short"], 2) == [(0, 0.1), (1, 0.9)]
+    assert [len(document) for document in bodies[0]["documents"]] == [2000, 5]
+    assert len(bodies[0]["query"]) == 1000
+    get_settings.cache_clear()

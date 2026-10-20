@@ -333,3 +333,45 @@ def test_rerank_verify_ssl_false_reaches_the_http_client(monkeypatch):
     assert LLMClient().rerank("q", ["one"], 1) == [(0, 1.0)]
     assert created == [False]
     get_settings.cache_clear()
+
+
+def test_an_empty_llm_name_falls_back_to_the_old_name_like_compose_does(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "old-key")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "")
+    monkeypatch.delenv("OPENROUTER_REASONING_EFFORT", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.llm_api_key == "old-key"
+    assert settings.llm_reasoning_effort == "", "an empty effort with no old name still means send none"
+
+
+def test_the_llm_key_never_goes_to_a_separate_rerank_host(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "llm-key")
+    monkeypatch.setenv("RERANKER_ENABLED", "true")
+    monkeypatch.setenv("RERANK_MODEL", "bge")
+    monkeypatch.delenv("RERANK_API_KEY", raising=False)
+    sent = {}
+
+    def headers_for(base_url):
+        monkeypatch.setenv("RERANK_BASE_URL", base_url)
+        get_settings.cache_clear()
+
+        def handler(request: httpx.Request):
+            sent[base_url] = request.headers.get("authorization")
+            return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 1.0}]})
+        LLMClient(httpx.Client(transport=httpx.MockTransport(handler))).rerank("q", ["one"], 1)
+
+    headers_for("http://reranker:8091/v1")
+    headers_for("https://openrouter.ai/api/v1/")
+    assert sent == {"http://reranker:8091/v1": None, "https://openrouter.ai/api/v1/": "Bearer llm-key"}
+    get_settings.cache_clear()
+
+
+def test_a_tei_reranker_without_its_own_url_is_off_instead_of_calling_the_llm(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "llm-key")
+    monkeypatch.setenv("RERANKER_ENABLED", "true")
+    monkeypatch.setenv("RERANK_API_STYLE", "tei")
+    monkeypatch.delenv("RERANK_BASE_URL", raising=False)
+    get_settings.cache_clear()
+    assert not LLMClient().reranker_enabled
+    get_settings.cache_clear()

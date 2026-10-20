@@ -52,6 +52,8 @@ class RerankStyle:
     body: Callable[[str, str, list[str], int], dict[str, Any]]
     results: Callable[[Any], list[tuple[int, float]]]
     needs_model: bool
+    # A style no LLM provider speaks needs RERANK_BASE_URL; it can never be the LLM's base URL.
+    needs_own_server: bool
 
 
 RERANK_STYLES = {
@@ -60,12 +62,12 @@ RERANK_STYLES = {
         lambda model, query, documents, top_n: {"model": model, "query": query, "documents": documents, "top_n": top_n},
         lambda payload: [(item["index"], float(item["relevance_score"])) for item in payload.get("results", [])
                          if "index" in item and "relevance_score" in item],
-        True),
+        True, False),
     # Hugging Face text-embeddings-inference, which serves a single model.
     "tei": RerankStyle(
         lambda model, query, documents, top_n: {"query": query, "texts": documents, "truncate": True},
         lambda payload: [(item["index"], float(item["score"])) for item in _as_list(payload) if "index" in item and "score" in item],
-        False),
+        False, True),
 }
 
 
@@ -343,14 +345,22 @@ class LLMClient:
     @property
     def reranker_enabled(self) -> bool:
         # A rerank server of its own may need no key; one sharing the LLM's base URL uses the LLM key.
+        style = RERANK_STYLES[self.settings.rerank_api_style]
         return bool(self.settings.reranker_enabled
-                    and (self.settings.rerank_model or not RERANK_STYLES[self.settings.rerank_api_style].needs_model)
-                    and (self.settings.rerank_base_url or self.settings.llm_api_key))
+                    and (self.settings.rerank_model or not style.needs_model)
+                    and (self.settings.rerank_base_url or (self.llm_enabled and not style.needs_own_server)))
+
+    @property
+    def _rerank_base_url(self) -> str:
+        return (self.settings.rerank_base_url or self.settings.llm_base_url).rstrip("/")
 
     def _rerank_headers(self) -> dict[str, str]:
-        if self.settings.rerank_base_url:
-            return {"Authorization": f"Bearer {self.settings.rerank_api_key}"} if self.settings.rerank_api_key else {}
-        return self._headers()
+        if self.settings.rerank_api_key:
+            return {"Authorization": f"Bearer {self.settings.rerank_api_key}"}
+        # The LLM key goes only to the LLM's own server, never to a separate rerank host.
+        if self._rerank_base_url == self.settings.llm_base_url.rstrip("/"):
+            return self._headers()
+        return {}
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
         if not self.reranker_enabled:
@@ -361,7 +371,7 @@ class LLMClient:
         client = self._client or httpx.Client(timeout=remaining_timeout(30), verify=self.settings.rerank_verify_ssl)
         try:
             response = client.post(
-                f"{(self.settings.rerank_base_url or self.settings.llm_base_url).rstrip('/')}/rerank",
+                f"{self._rerank_base_url}/rerank",
                 headers=self._rerank_headers(),
                 json=style.body(self.settings.rerank_model, query[:RERANK_QUERY_CHARS],
                                 [document[:RERANK_DOCUMENT_CHARS] for document in documents], min(top_n, len(documents))),

@@ -18,7 +18,7 @@ from .models import Document, DocumentChunk, Entity, EntitySource, LegalInstrume
 
 LEGAL_TYPES = {"legal", "regulation", "contract"}
 # Part of every cached report's fingerprint: bump it when scoring changes so stored reports are rebuilt.
-SCORING_VERSION = 2
+SCORING_VERSION = 3
 WEIGHTS = {"content": 20, "structure": 15, "metadata": 20, "retrieval": 20, "citation": 20, "graph": 5}
 # A field whose answer is settled: a usable value, or an absence a person confirmed or a full read found.
 # A blocked value kept from an older source version is not usable, so it does not count.

@@ -90,3 +90,16 @@ def test_a_report_cached_under_an_older_scoring_is_rebuilt(monkeypatch):
     monkeypatch.undo()
     rows = api.get(f"/api/v1/knowledge-bases/{kb['id']}/quality-readiness").json()["documents"]
     assert [row["score"] for row in rows if row["document_id"] == doc_id] == [quality(api, doc_id)["score"]]
+
+
+def test_the_same_effective_date_written_in_buddhist_era_or_thai_words_is_not_a_conflict():
+    from types import SimpleNamespace
+    from app.metadata_extraction import metadata_consistency_conflicts
+
+    def conflicts(document_value, legal_value):
+        return metadata_consistency_conflicts(SimpleNamespace(document_metadata={"effective_date": document_value},
+                                                              legal_metadata={"effective_date": legal_value}))
+    assert conflicts("2014-12-01", "2557-12-01") == {}
+    assert conflicts("1954-12-01", "๑ ธันวาคม พ.ศ. ๒๔๙๗") == {}
+    assert conflicts("2018-05-11", "๒๕๖๑-๐๕-๑๑") == {}
+    assert conflicts("2018-05-14", "๒๕๖๑-๐๕-๑๑") == {"effective_date": "๒๕๖๑-๐๕-๑๑"}

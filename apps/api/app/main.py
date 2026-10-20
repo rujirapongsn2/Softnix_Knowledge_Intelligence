@@ -2365,7 +2365,8 @@ def rotate_token(token_id: str, user: User = Depends(current_admin), db: Session
 def authorized_query(payload: QueryRequest, token: TokenKey | None, db: Session):
     kb_ids = payload.knowledge_base_ids or (token.allowed_knowledge_base_ids if token else [])
     if token: authorize(token, "search_knowledge", kb_ids)
-    return build_query_result(db, payload.query, kb_ids, payload.max_sources, token.id if token else None, payload.filters)
+    return build_query_result(db, payload.query, kb_ids, payload.max_sources, token.id if token else None, payload.filters,
+                              generate_answer=payload.response_mode != "evidence")
 
 
 def effective_mcp_knowledge_base_ids(db: Session, token: TokenKey) -> list[str]:

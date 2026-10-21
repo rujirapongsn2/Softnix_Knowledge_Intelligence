@@ -346,3 +346,26 @@ def test_failed_job_rolls_back_a_broken_session(monkeypatch):
         assert services.process_next_job(db) is True
         db.expire_all()
         assert db.get(ProcessingJob, job.id).status == "failed"
+
+
+def test_a_worker_being_stopped_hands_its_job_back_at_once(monkeypatch):
+    """docker stop: the job is re-queued now, keeps its attempt and is not counted as a lost worker."""
+    with SessionLocal() as db:
+        _job(db, _doc(db, _kb(db)))
+    stopped = {}
+
+    def stopped_mid_job(db, claimed):
+        stopped.update(job_id=claimed.id, document_id=claimed.document_id, attempts=claimed.attempt_count)
+        claimed.status, claimed.attempt_count = "running", claimed.attempt_count + 1
+        db.commit()
+        worker.stop_on_sigterm(None, None)
+
+    monkeypatch.setattr(services, "_run_claimed_job", stopped_mid_job)
+    with SessionLocal() as db, pytest.raises(SystemExit):
+        services.process_next_job(db)
+    with SessionLocal() as db:
+        job = db.get(ProcessingJob, stopped["job_id"])
+        assert (job.status, job.error_code, job.lost_count or 0) == ("queued", "WORKER_STOPPED", 0)
+        assert job.attempt_count == stopped["attempts"], "the interrupted attempt is given back"
+        assert job.next_attempt_at <= datetime.utcnow(), "runnable at once, not after the stale-job timeout"
+        assert db.get(Document, stopped["document_id"]).status == "queued"

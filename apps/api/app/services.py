@@ -37,7 +37,7 @@ from .llm import LLMClient
 from .observability import metrics
 from .planner import LegalContext, RetrievalChannel, RetrievalPlan, PlannerDecision, apply_llm_plan, intersect_policies, policy_from_config, rule_plan
 from .graph_retirement import drop_document_evidence
-from .job_queue import ClaimLost, claim_next_graph_event, claim_next_job, job_heartbeat, lock_knowledge_base_graph, own_job
+from .job_queue import ClaimLost, claim_next_graph_event, claim_next_job, hand_back, job_heartbeat, lock_knowledge_base_graph, own_job
 from .provider_holds import provider_of, wait_for_provider
 from .remote_index import IN_FLIGHT_STATUSES, HealOutcome, purge_remote_record, resolve_remote_duplicate
 from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, RetrievalEvidence, classify_track_failure, describe_engine_failure
@@ -2681,10 +2681,19 @@ def process_next_job(db: Session) -> bool:
     job = claim_next_job(db)
     if not job:
         return False
-    job_id = job.id
+    job_id, claim_token = job.id, job.claim_token
     try:
         with own_job(db, job), job_heartbeat(db, job.id, token=job.claim_token):
             _run_claimed_job(db, job)
+    except SystemExit:
+        # The worker is being stopped (worker.py turns SIGTERM into SystemExit): hand the job back now
+        # instead of leaving it "running" for the stale-job sweep.
+        db.rollback()
+        with SessionLocal() as handover:
+            if hand_back(handover, job_id, claim_token):
+                handover.commit()
+                logger.warning("handed a job back to the queue on shutdown", extra={"job_id": job_id})
+        raise
     except ClaimLost:
         # The job was swept as stale or superseded by a reprocess while this
         # worker ran it: discard everything this worker had not committed.

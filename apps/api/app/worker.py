@@ -1,4 +1,5 @@
 import logging
+import signal
 import threading
 import time
 
@@ -78,7 +79,13 @@ def maintenance_loop() -> None:
 
 # Several worker replicas may run this loop: job claims are atomic
 # (job_queue.claim_next_job) and each periodic sweep runs in one process at a time.
+def stop_on_sigterm(_signum, _frame) -> None:
+    """docker stop sends SIGTERM; as SystemExit it unwinds the running job, which hands itself back to the queue."""
+    raise SystemExit(0)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, stop_on_sigterm)
     threading.Thread(target=maintenance_loop, name="worker-maintenance", daemon=True).start()
     while True:
         try:

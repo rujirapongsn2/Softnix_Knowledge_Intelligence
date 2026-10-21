@@ -51,6 +51,7 @@ STALE_MAX_LOSSES = 3
 # A graph event re-queued this many times by the sweep is given up.
 GRAPH_EVENT_MAX_ATTEMPTS = 8
 WORKER_LOST = "WORKER_LOST"
+WORKER_STOPPED = "WORKER_STOPPED"
 
 # Advisory-lock namespaces (first key of the two-int form).
 _LOCK_DOCUMENT = 7410
@@ -252,6 +253,27 @@ def release_stale_job(db: Session, job: ProcessingJob) -> str:
 def _lock_row(db: Session, model, row_id: str):
     """The row locked for update, or None when another transaction holds it (or it is gone)."""
     return db.query(model).filter_by(id=row_id).populate_existing().with_for_update(skip_locked=True).one_or_none()
+
+
+def hand_back(db: Session, job_id: str, claim_token: str | None) -> bool:
+    """Re-queue a job its own worker is being stopped on (docker stop, a redeploy), with its attempt given back.
+
+    A planned stop is not a lost worker: it does not count toward STALE_MAX_LOSSES, and the job is runnable at
+    once instead of after job_stale_after_seconds. Returns False when the job is no longer this worker's.
+    """
+    job = _lock_row(db, ProcessingJob, job_id)
+    if job is None or job.status != "running" or job.claim_token != claim_token:
+        return False
+    disown(job)
+    job.status, job.current_stage, job.next_attempt_at = "queued", "retry_wait", datetime.utcnow()
+    job.attempt_count = max(0, (job.attempt_count or 0) - 1)
+    job.error_code, job.error_message = WORKER_STOPPED, "The worker was stopped while running this job; it was re-queued."
+    doc = db.get(Document, job.document_id) if job.document_id else None
+    if doc is not None and doc.is_live and job.job_type in DOCUMENT_PIPELINE_JOB_TYPES:
+        doc.status = "queued"
+    if doc is not None and doc.is_live and job.job_type == JobType.EXTRACT_DOCUMENT_METADATA:
+        doc.metadata_status = "queued"
+    return True
 
 
 def release_if_stale(db: Session, job_id: str, now: datetime | None = None) -> str | None:

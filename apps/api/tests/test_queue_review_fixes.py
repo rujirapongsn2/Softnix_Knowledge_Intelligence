@@ -1,4 +1,5 @@
 """Code-review fixes for the job queue (SQLite path; PostgreSQL locking in test_job_queue_postgres.py)."""
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -295,11 +296,40 @@ def test_worker_pass_survives_a_failing_sweep(monkeypatch):
         raise RuntimeError("database went away")
 
     monkeypatch.setattr(worker, "sweep_stale_jobs", broken)
-    monkeypatch.setattr(worker, "process_next_graph_projection", lambda _db: False)
     now = time.monotonic()  # retention and recovery just ran; only the sweep is due
     state = {"retention": now, "recovery": now, "stale_sweep": 0.0, "provider_probe": now}
-    assert worker.run_once(state) is False
+    worker.run_maintenance(state)
     assert state["stale_sweep"] > 0
+
+
+def test_a_stale_job_is_swept_while_every_worker_is_busy_with_a_long_job(monkeypatch):
+    """The sweep runs beside the job loop: a job left by a killed worker is re-queued even while the
+    job loop is still inside a long document."""
+    with SessionLocal() as db:
+        doc = _doc(db, _kb(db)); orphan = _job(db, doc)
+        orphan.status = "running"; db.commit()
+        db.query(ProcessingJob).filter_by(id=orphan.id).update({"updated_at": datetime.utcnow() - timedelta(hours=2)}, synchronize_session=False)
+        db.commit()
+    inside_long_job, release = threading.Event(), threading.Event()
+
+    def long_job(_db):
+        inside_long_job.set()
+        release.wait(10)
+        return True
+
+    monkeypatch.setattr(worker, "process_next_job", long_job)
+    monkeypatch.setattr(worker, "process_next_graph_projection", lambda _db: False)
+    job_loop = threading.Thread(target=worker.run_once)
+    job_loop.start()
+    try:
+        assert inside_long_job.wait(5)
+        now = time.monotonic()
+        worker.run_maintenance({"retention": now, "recovery": now, "stale_sweep": 0.0, "provider_probe": now})
+        with SessionLocal() as db:
+            assert db.get(ProcessingJob, orphan.id).status == "queued", "re-queued while the job loop is busy"
+    finally:
+        release.set()
+        job_loop.join(10)
 
 
 def test_failed_job_rolls_back_a_broken_session(monkeypatch):

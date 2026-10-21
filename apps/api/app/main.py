@@ -179,6 +179,18 @@ class _EmbeddingProbe:
 
 _EMBEDDING_PROBE = _EmbeddingProbe()
 
+# The credit balance is asked for at most once a minute; the status page refreshes every 10 s.
+_CREDITS_CACHE: dict[str, tuple[float, float | None]] = {}
+
+
+def llm_credits_view() -> dict | None:
+    """Credits left on the LLM account and whether that is below LLM_CREDIT_WARNING_USD; None when not reported."""
+    now, cached = _time.monotonic(), _CREDITS_CACHE.get("llm")
+    if cached is None or now - cached[0] >= 60:
+        cached = _CREDITS_CACHE["llm"] = (now, LLMClient().credits_remaining())
+    remaining, warning = cached[1], get_settings().llm_credit_warning_usd
+    return None if remaining is None else {"remaining_usd": remaining, "warning_below_usd": warning, "low": remaining < warning}
+
 
 def _probe_dependencies(db: Session) -> tuple[dict, dict]:
     """Probe every backend dependency; return (ready, failed) service maps.
@@ -350,6 +362,7 @@ def system_dashboard(user: User = Depends(require_manager), db: Session = Depend
             "failures": failures,
             # Providers whose credits or key stopped serving jobs; their jobs wait and resume on their own.
             "provider_holds": hold_view(db),
+            "llm_credits": llm_credits_view(),
         },
         "ingest_metrics": {
             "total_documents": total_docs,

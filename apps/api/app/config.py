@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     lightrag_workspace_prefix: str = "skip-"
     # The model LightRAG extracts the graph with (compose passes it to LightRAG); empty means llm_model.
     lightrag_llm_model: str = ""
+    # The status page warns when the LLM account has less than this many USD left (providers that report it).
+    llm_credit_warning_usd: float = 20
     neo4j_http_url: str = ""
     neo4j_username: str = "neo4j"
     neo4j_password: str = ""

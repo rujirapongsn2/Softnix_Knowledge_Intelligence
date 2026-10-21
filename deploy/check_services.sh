@@ -53,6 +53,10 @@ report(embedding["embedding_model_available"], f"embeddings {embedding['embeddin
        + ("" if embedding["embedding_model_available"] else f": {embedding.get('embedding_error')}"))
 
 client = LLMClient()
+credits = client.credits_remaining()
+if credits is not None:
+    warning = client.settings.llm_credit_warning_usd
+    report(credits >= warning, f"llm credits ${credits:.2f} left" + ("" if credits >= warning else f", below ${warning:g}"), required=False)
 if client.reranker_enabled:
     try:
         order = client.rerank("อายุความฟ้องคดี", ["ร้านกาแฟเปิดแปดโมง", "คดีมีอายุความสิบปี"], 2)

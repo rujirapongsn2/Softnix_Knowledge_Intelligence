@@ -411,6 +411,22 @@ class LLMClient:
             if self._client is None:
                 client.close()
 
+    def credits_remaining(self) -> float | None:
+        """USD left on the account, for a provider that reports it (OpenRouter's /credits); None otherwise."""
+        if not self.llm_enabled or dialect_name(self.settings) != "openrouter":
+            return None
+        client = self._client or httpx.Client(timeout=10)
+        try:
+            response = client.get(f"{self.settings.llm_base_url.rstrip('/')}/credits", headers=self._headers())
+            response.raise_for_status()
+            data = response.json()["data"]
+            return round(float(data["total_credits"]) - float(data["total_usage"]), 2)
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            return None
+        finally:
+            if self._client is None:
+                client.close()
+
     def check(self) -> dict[str, Any]:
         if not self.settings.llm_api_key:
             raise RuntimeError("LLM_API_KEY_NOT_CONFIGURED")

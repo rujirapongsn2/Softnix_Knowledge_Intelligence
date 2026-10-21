@@ -138,6 +138,8 @@ def probe_holds(db: Session, now: datetime | None = None) -> list[str]:
 
 
 def hold_view(db: Session) -> list[dict]:
-    return [{"provider": hold.provider, "reason_code": hold.reason_code, "held_since": hold.held_since,
-             "next_probe_at": hold.next_probe_at, "probe_count": hold.probe_count, "last_probe_error": hold.last_probe_error}
+    """The active holds for the status page; times are UTC, marked with Z like the rest of the dashboard."""
+    utc = lambda moment: moment.isoformat() + "Z" if moment else None
+    return [{"provider": hold.provider, "reason_code": hold.reason_code, "held_since": utc(hold.held_since),
+             "next_probe_at": utc(hold.next_probe_at), "probe_count": hold.probe_count, "last_probe_error": hold.last_probe_error}
             for hold in db.query(ProviderHold).filter(ProviderHold.lifted_at.is_(None)).order_by(ProviderHold.held_since)]

@@ -393,3 +393,18 @@ def test_the_hold_probe_fails_while_the_balance_cannot_cover_a_real_request(monk
     affordable["tokens"] = 100_000
     assert client.probe() is None
     get_settings.cache_clear()
+
+
+def test_credits_remaining_reads_openrouter_and_is_none_elsewhere(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request):
+        assert request.url.path == "/api/v1/credits"
+        return httpx.Response(200, json={"data": {"total_credits": 300, "total_usage": 184.471}})
+
+    assert LLMClient(httpx.Client(transport=httpx.MockTransport(handler))).credits_remaining() == 115.53
+    monkeypatch.setenv("LLM_BASE_URL", "http://vllm.local:8000/v1")
+    get_settings.cache_clear()
+    assert LLMClient().credits_remaining() is None, "a provider that reports no balance is not asked"
+    get_settings.cache_clear()

@@ -2,46 +2,158 @@
 
 แพลตฟอร์มจัดการเอกสารและค้นคืนความรู้แบบมีหลักฐานอ้างอิง (citation) สำหรับผู้ดูแลระบบและ MCP/AI agent
 
-## เริ่มใช้งานอย่างย่อ
+## การติดตั้ง
+
+### สิ่งที่ต้องมี
+
+- Docker พร้อม Compose v2 (Docker Desktop บน macOS หรือ Windows)
+- repository [Anydoc-ocr](https://github.com/rujirapongsn2/Anydoc-ocr) วางไว้ข้างโฟลเดอร์นี้ (`../Anydoc-ocr`) เพราะ image ของ api และ worker build ตัวแปลงเอกสารจาก repository นั้น ถ้าวางไว้ที่อื่น ให้ตั้ง `ANYDOC_DIR`
+- `llama-server` ของ [llama.cpp](https://github.com/ggml-org/llama.cpp) สำหรับ embedding server บน macOS ติดตั้งด้วย `brew install llama.cpp`
+- API key ของผู้ให้บริการ LLM ที่รองรับ OpenAI API เช่น OpenRouter หรือ OpenAI
+
+### 1. ดาวน์โหลด source
+
+```bash
+git clone https://github.com/rujirapongsn2/Softnix_Knowledge_Intelligence.git
+git clone https://github.com/rujirapongsn2/Anydoc-ocr.git
+cd Softnix_Knowledge_Intelligence
+```
+
+### 2. เปิด embedding server
+
+embedding server สร้าง vector ของเอกสารและคำถาม ถ้าไม่เปิด การค้นหาแบบ vector และการ index ของ LightRAG จะใช้ไม่ได้
+
+```bash
+llama-server -hf ggml-org/embeddinggemma-2-GGUF:BF16 --no-mmproj --embeddings \
+  --host 0.0.0.0 --port 8090 -ngl 99 -c 32768 -b 8192 -ub 8192 --parallel 4 --api-key <embedding-key>
+```
+
+ครั้งแรกจะดาวน์โหลดโมเดลก่อน วิธีให้รันตลอดด้วย launchd และวิธีทดสอบอยู่ที่ [deploy/embedding-server](deploy/embedding-server/README.md)
+
+ถ้าต้องการ reranker (ไม่บังคับ แต่ช่วยให้ผลค้นหาอันดับแรกตรงขึ้น) ให้เปิด server ตาม [deploy/reranker-server](deploy/reranker-server/README.md)
+
+### 3. ตั้งค่า `.env`
 
 ```bash
 cp .env.example .env
-# แก้ APP_SECRET_KEY, TOKEN_HASH_SECRET, INITIAL_ADMIN_PASSWORD และ LLM_API_KEY (provider ใดก็ได้ที่รองรับ OpenAI API)
-docker compose up --build
+openssl rand -hex 32   # รันหนึ่งครั้งต่อค่า secret แต่ละตัว
 ```
 
-- Web UI: `http://localhost:8081` (ปรับด้วย `WEB_PORT`)
-- REST API: `http://localhost:8001` (ปรับด้วย `API_PORT`)
-- ตรวจสุขภาพ: `/health` และ `/ready`
-- MCP: `/mcp`
+ค่าที่ต้องแก้ก่อนเริ่มระบบ:
 
-เข้าสู่ระบบด้วยค่าจาก `INITIAL_ADMIN_USERNAME`/`INITIAL_ADMIN_PASSWORD` ใน `.env` จากนั้นสร้าง Knowledge Base, อัปโหลดเอกสาร และใช้ Query Playground ได้ทันที
+| ตัวแปร | ค่า |
+|---|---|
+| `APP_SECRET_KEY`, `TOKEN_HASH_SECRET`, `LIGHTRAG_API_KEY` | ค่าสุ่มที่ไม่ซ้ำกัน |
+| `INITIAL_ADMIN_PASSWORD`, `NEO4J_PASSWORD` | รหัสผ่านใหม่ |
+| `LLM_API_KEY` | key ของผู้ให้บริการ LLM ถ้าไม่ได้ใช้ OpenRouter ให้แก้ `LLM_BASE_URL` และ `LLM_MODEL` ด้วย ดูตัวอย่างใน `.env.example` |
+| `EMBEDDING_API_KEY` | key เดียวกับที่ใส่ใน `--api-key` ของขั้นที่ 2 |
+| `SOFTNIX_OCR_BASE_URL`, `SOFTNIX_OCR_TOKEN` | ถ้ายังไม่มี OCR server ให้ปล่อย `SOFTNIX_OCR_TOKEN=` ว่าง ค่าตัวอย่างใน `.env.example` ชี้ไปที่ host ที่ไม่มีอยู่จริง ถ้าปล่อยไว้ `/ready` จะตอบ 503 และ api จะไม่ขึ้นเป็น healthy |
+| `RERANKER_ENABLED`, `RERANK_*` | ตั้งเมื่อเปิด reranker แล้วเท่านั้น |
 
-> ระบบจะสร้างผู้ดูแลเริ่มต้นเฉพาะตอนยังไม่มีบัญชีเท่านั้น การเปลี่ยนค่าใน `.env` ภายหลังจะไม่รีเซ็ตรหัสผ่านเดิมโดยอัตโนมัติ
+- อย่า commit ไฟล์ `.env`
+- บน Linux ไม่มี `host.docker.internal` ให้อัตโนมัติ ให้ใช้ IP ของ host ใน `EMBEDDING_BASE_URL` แทน หรือเพิ่ม `extra_hosts` ตาม [deploy/embedding-server](deploy/embedding-server/README.md)
+
+### 4. build และเริ่มระบบ
+
+```bash
+docker compose up -d --build
+```
+
+การ build ครั้งแรกใช้เวลาหลายนาที เพราะต้อง compile ตัวแปลงเอกสาร (Rust) Compose จะเริ่ม service ตามลำดับนี้:
+
+1. `postgres`, `redis` และ `neo4j`
+2. `migrate` สร้างหรือปรับ schema ฐานข้อมูล แล้วจบ
+3. `lightrag`, `api`, `worker` (3 replicas) และ `web`
+
+| URL | ใช้ทำอะไร |
+|---|---|
+| `http://localhost:8081` | Web UI (ปรับด้วย `WEB_PORT`) |
+| `http://localhost:8001` | REST API และ `/mcp` (ปรับด้วย `API_PORT`) |
+
+### 5. ตรวจสถานะหลังติดตั้ง
+
+```bash
+bash deploy/check_services.sh
+```
+
+script ตรวจทุกอย่างที่ระบบต้องใช้ โดยไม่แสดง key หรือรหัสผ่าน และจบด้วย exit code ที่ไม่ใช่ 0 เมื่อมีข้อที่จำเป็นไม่ผ่าน
+
+| กลุ่ม | สิ่งที่ตรวจ | ถ้าไม่ผ่าน |
+|---|---|---|
+| containers | `api`, `worker`, `web`, `postgres`, `redis`, `neo4j` และ `lightrag` กำลังรัน และ `migrate` จบด้วย exit code 0 | `docker compose logs <service>` |
+| http | `GET /health` ตอบ 200 | api ยังไม่ขึ้น ดู `docker compose logs api` |
+| | `GET /ready` ตอบ `ready` ทุก dependency ได้แก่ database, redis, neo4j, lightrag, embeddings และ ocr_chain (ocr_chain ตรวจเมื่อตั้ง `SOFTNIX_OCR_TOKEN` แล้ว) | คำตอบ 503 ระบุชื่อ dependency ที่ใช้ไม่ได้ใน `details` |
+| | Web UI ตอบ 200 | `docker compose logs web` |
+| providers | LLM ตอบ และมีโมเดลตาม `LLM_MODEL` | ตรวจ `LLM_API_KEY`, `LLM_BASE_URL` และชื่อโมเดล |
+| | embedding server สร้าง vector ได้ | ตรวจว่า `llama-server` ยังรันอยู่ และ `EMBEDDING_API_KEY` ตรงกับ `--api-key` |
+| | reranker เรียงผลได้ถูกต้อง (ตรวจเฉพาะเมื่อ `RERANKER_ENABLED=true`) | ดู [deploy/reranker-server](deploy/reranker-server/README.md) |
+
+ผลที่ถูกต้องจะมีลักษณะดังนี้:
+
+```text
+containers
+  ok    api running (1)
+  ok    worker running (3)
+  ...
+  ok    migrate finished
+http
+  ok    api http://127.0.0.1:8001/health
+  ok    api /ready: database ready, redis ready, neo4j ready, lightrag ready, ocr_chain ready, embeddings ready
+  ok    web http://127.0.0.1:8081
+providers (checked from inside the api container)
+  ok    llm anthropic/claude-sonnet-5.5 (openrouter)
+  ok    embeddings embeddinggemma-2 at host.docker.internal:8090
+  ok    reranker bge-reranker-v2-m3
+
+all required checks passed
+```
+
+ตรวจทีละส่วนด้วยมือได้ดังนี้:
+
+```bash
+docker compose ps -a                     # migrate ต้อง Exited (0), api/web/postgres/redis/lightrag ต้อง healthy
+curl -s http://localhost:8001/health     # {"status":"healthy"}
+curl -s http://localhost:8001/ready      # {"status":"ready","dependencies":{...}}
+```
+
+หลังเข้าสู่ระบบแล้ว หน้า **สถานะระบบ** (System Status) แสดงสถานะเดียวกันพร้อมคิวงาน `GET /api/v1/system/dashboard` ให้ข้อมูลเดียวกันในรูป JSON ได้แก่ จำนวนงานในคิว (`ingest_metrics.in_queue_count`), เอกสารที่ล้ม และผู้ให้บริการที่ถูกพักเพราะเครดิตหมดหรือ key ใช้ไม่ได้ (`services.provider_holds`)
+
+### 6. ทดลองใช้งาน
+
+1. เข้าสู่ระบบที่ Web UI ด้วย `INITIAL_ADMIN_USERNAME` และ `INITIAL_ADMIN_PASSWORD` แล้วเปลี่ยนรหัสผ่านทันที
+2. สร้าง Knowledge Base แล้วกดเปิดใช้งาน
+3. อัปโหลดเอกสารหนึ่งไฟล์ รอจนสถานะเป็น `completed` แล้วถามคำถามใน Query Playground
+
+ระบบสร้างผู้ดูแลเริ่มต้นเฉพาะตอนที่ยังไม่มีบัญชีใดเลย ถ้าแก้ค่าใน `.env` ภายหลัง รหัสผ่านเดิมจะไม่ถูกรีเซ็ต
+
+การติดตั้งแบบ production (HTTPS, restart policy, พอร์ตที่ห้ามเปิด) และการ migrate ดูที่ [Deployment](docs/DEPLOYMENT.md)
 
 ## ภาพรวมการทำงาน
 
 ```mermaid
 flowchart LR
-  User[ผู้ดูแล / MCP client] --> Web[Web UI หรือ /mcp]
+  User[ผู้ดูแล / MCP client / ระบบภายนอก] --> Web[Web UI, /mcp หรือ Ingest API]
   Web --> API[FastAPI REST + MCP]
   API --> Auth[Session / token scope]
-  API --> PG[(PostgreSQL<br/>metadata + chunks + vectors + FTS)]
-  API --> Redis[(Redis queue)]
-  Redis --> Worker[Worker: extract, chunk, embed, graph]
+  API --> Redis[(Redis<br/>rate limit ของ token)]
+  API --> PG[(PostgreSQL<br/>metadata, chunks, vectors, FTS<br/>และคิวงาน)]
+  PG --> Worker[Worker x3: extract, chunk, embed, metadata, graph]
   Worker --> Files[(File storage)]
   Worker --> PG
   Worker --> Neo4j[(Neo4j graph)]
-  Worker --> RAG[LightRAG adapter]
+  Worker --> RAG[LightRAG<br/>เก็บข้อมูลใน PostgreSQL + Neo4j]
   API --> Planner[Rule-first retrieval planner]
   Planner --> Executor[Parallel retrieval + fusion + citations]
   Executor --> PG
   Executor --> Neo4j
   Executor --> RAG
-  Executor --> LLM[LLM provider: answer / optional rerank]
+  Executor --> RR[Reranker server: optional]
+  Executor --> LLM[LLM provider: answer]
   Executor --> EMB[Embedding server: chunk + query vectors]
   LLM --> API
 ```
+
+คิวงานอยู่ใน PostgreSQL ไฟล์ที่ได้ `202` แล้วจะไม่หาย แม้ api หรือ worker จะ restart งานของ worker ที่หยุดกลางคันจะถูกคืนเข้าคิว ถ้าเครดิตของผู้ให้บริการ AI หมด งานจะรอในคิว แล้วทำต่อเองหลังเติมเครดิต
 
 ดูไดอะแกรมและขอบเขตข้อมูลฉบับเต็มที่ [High-level Data Flow](docs/DATA_FLOW.md) และรายละเอียดส่วนประกอบที่ [Architecture](docs/ARCHITECTURE.md)
 
@@ -107,9 +219,18 @@ MCP เป็นฝั่งอ่าน ถ้าต้องการให้
 จากนั้น poll สถานะจนได้ `completed` — ในหน้าเดียวกันมีปุ่มคัดลอกตัวอย่าง curl/Python/Node ที่ใส่ค่าจริงให้แล้ว
 ดูรายละเอียดทั้งหมดที่ [Ingestion API](docs/INGEST_API.md)
 
+ingest token ใหม่ส่งได้ 600 request ต่อนาที และพร้อมกันได้ 10 request request ที่เกินจะได้ `429` ทันที พร้อม header `Retry-After`
+client ต้องรอตามนั้นแล้วส่งใหม่ ปรับ limit ของ token เดิมได้ด้วย `PATCH /api/v1/tokens/{id}/limits` โดยไม่ต้องออก secret ใหม่
+
+นำเข้าเอกสารจำนวนมากพร้อมไฟล์อ้างอิง (PDF, DOCX) ด้วย [deploy/bulk-import](deploy/bulk-import/README.md)
+script รันซ้ำได้ ไม่ส่งไฟล์ซ้ำ และรอเมื่อเจอ rate limit ให้เอง
+
 ## ลิงก์สำคัญ
 
 - [Deployment](docs/DEPLOYMENT.md) — ตั้งค่า, migration, production และ reindex
+- [Embedding server](deploy/embedding-server/README.md) และ [Reranker server](deploy/reranker-server/README.md) — ติดตั้ง llama-server บนเครื่อง
+- [Bulk import](deploy/bulk-import/README.md) — นำเข้าเอกสารจำนวนมากพร้อมไฟล์อ้างอิง
+- [LightRAG storage](deploy/lightrag-storage/README.md) — ย้าย storage ของ LightRAG และทดสอบนำเข้าเป็นขั้น
 - [API](docs/API.md) — endpoint และรูปแบบ query/filter
 - [Ingestion API](docs/INGEST_API.md) — ให้ระบบภายนอกนำเข้าเอกสารด้วย API token พร้อมตัวอย่างโค้ด
 - [MCP](docs/MCP.md) — เชื่อม Claude Code หรือ agent ด้วย token, และสร้าง Agent Skill (SKILL.md)
@@ -125,6 +246,10 @@ MCP เป็นฝั่งอ่าน ถ้าต้องการให้
 cd apps/api
 pytest -q
 ruff check app tests
+cd ../web && npm run build && npm test
 ```
 
-การทดสอบ integration ของ PostgreSQL/pgvector ใช้ `docker-compose.pgvector-test.yml` และจะ skip หากไม่ได้ตั้ง `TEST_POSTGRES_DATABASE_URL`
+การทดสอบ integration บางชุดจะถูกข้ามถ้าไม่ได้ตั้งตัวแปรที่ต้องใช้:
+
+- PostgreSQL และ pgvector ต้องตั้ง `TEST_POSTGRES_DATABASE_URL` หรือรัน `make test-postgres` ซึ่งใช้ `docker-compose.pgvector-test.yml`
+- rate limiter กับ Redis จริง ต้องตั้ง `TEST_REDIS_URL` ให้ชี้ไปยัง database ของ Redis ที่ล้างได้ วิธีรันอยู่ใน `apps/api/tests/test_mcp_limits_redis.py`

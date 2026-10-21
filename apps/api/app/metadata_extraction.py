@@ -210,7 +210,13 @@ def _read_window(fields, window, client):
     answers = {f["key"]: _read_answer(f, result.get(f["key"], []), window) for f in fields}
     retry = [f for f in fields if answers[f["key"]][1]]
     if retry:
-        again = client.extract_document_metadata(retry, window)
+        try:
+            again = client.extract_document_metadata(retry, window)
+        except RuntimeError as exc:
+            # The first answers stand; the fields asked again stay marked unusable.
+            if str(exc) != "METADATA_EXTRACTION_INVALID_RESPONSE":
+                raise
+            return answers
         for field in retry:
             second = _read_answer(field, again.get(field["key"], []), window)
             if not second[1] or len(second[0]) >= len(answers[field["key"]][0]):

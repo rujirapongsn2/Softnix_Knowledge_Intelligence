@@ -654,3 +654,24 @@ def test_a_document_no_window_of_which_is_readable_still_fails():
     text, quotes = _two_windows()
     with pytest.raises(RuntimeError, match="METADATA_EXTRACTION_INVALID_RESPONSE"):
         extract_candidates([field()], text, _FlakyWindows(text, quotes, {0: 2, 1: 2}))
+
+
+def test_a_single_window_document_still_unusable_after_its_retry_fails():
+    text = "ออกโดยกรมที่ดิน"
+    with pytest.raises(RuntimeError, match="METADATA_EXTRACTION_INVALID_RESPONSE"):
+        extract_candidates([field()], text, _FlakyWindows(text, {0: text}, {0: 2}))
+
+
+def test_an_unusable_reply_to_the_per_field_retry_keeps_the_first_answers():
+    text = "ออกโดยกรมที่ดิน ลงวันที่ 1 มกราคม"
+    replies = [{"issuer": [{"value": "กรมที่ดิน", "evidence_quote": "ออกโดยกรมที่ดิน"}],
+                "signer": [{"value": "อธิบดี", "evidence_quote": "ไม่มีในเอกสาร"}]}]
+
+    def extract(fields, window):
+        if replies:
+            return replies.pop()
+        raise RuntimeError("METADATA_EXTRACTION_INVALID_RESPONSE")
+
+    result = extract_candidates([field(), field("signer")], text, SimpleNamespace(extract_document_metadata=extract))
+    assert [c["value"] for c in result["issuer"]["candidates"]] == ["กรมที่ดิน"]
+    assert result["signer"]["candidates"] == []

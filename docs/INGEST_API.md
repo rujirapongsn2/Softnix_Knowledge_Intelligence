@@ -433,11 +433,22 @@ if (documentId) console.log(await waitFor(documentId));
 ## Rate limit และ concurrency
 
 แต่ละ token มีเพดานของตัวเอง ตั้งค่าได้ที่ **Advanced limits** ตอนสร้าง token
-(ค่าเริ่มต้น 60 requests/min และ 5 concurrent requests) เพดานนี้**ใช้ร่วมกันระหว่าง Ingest API กับ `/mcp`**
-เพราะเป็นงบประมาณของ token ใบเดียวกัน
+ถ้าเว้นว่างไว้ ingest token จะได้ 600 requests/min และ 10 concurrent requests ส่วน MCP token จะได้ 60 และ 5
+เพดานนี้**ใช้ร่วมกันระหว่าง Ingest API กับ `/mcp`** เพราะเป็นงบประมาณของ token ใบเดียวกัน
 
 การอัปโหลดใช้เวลานานกว่าการอ่าน จึงควรจำกัดจำนวน worker ที่อัปโหลดพร้อมกันไม่ให้เกินค่า concurrent
 ที่ตั้งไว้ และใช้ batch endpoint เพื่อลดจำนวน request
+
+request ที่เกินเพดานได้ `429` ทันที พร้อม header `Retry-After` (วินาที) ให้รอตามนั้นแล้วส่ง request เดิมใหม่
+request ที่ถูกปฏิเสธไม่ถูกนับในโควตา server ไม่ถือ request ค้างไว้รอโควตา เพื่อไม่ให้การส่งเกินเพดานทำให้ API ช้าลงทั้งระบบ
+ไฟล์ที่ได้ `202` แล้วอยู่ในคิวถาวร และถูกประมวลผลตามลำดับแม้ api หรือ worker จะ restart
+
+ปรับเพดานของ token เดิมได้โดยไม่ต้องออก secret ใหม่:
+
+```
+PATCH /api/v1/tokens/{token_id}/limits
+{"requests_per_minute": 600, "max_concurrent_requests": 10}
+```
 
 ## ชนิดไฟล์และขนาด
 

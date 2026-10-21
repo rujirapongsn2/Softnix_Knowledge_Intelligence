@@ -867,6 +867,7 @@ def test_mcp_rate_limit_returns_jsonrpc_error():
     response = test_client.post("/mcp", headers={"Authorization": f"Bearer {token['token']}"}, json=request)
     assert response.status_code == 200
     assert response.json()["error"]["code"] == "MCP_RATE_LIMITED"
+    assert 1 <= response.json()["error"]["retry_after_seconds"] <= 60
 
 
 def test_custom_document_template_keeps_a_safe_processing_profile_and_user_metadata():

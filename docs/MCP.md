@@ -35,7 +35,7 @@ Authorization: Bearer skik_live_...
 
 Token เดิมที่สร้างก่อนมี `document_inventory_summary` จะยังไม่ถูกเพิ่มสิทธิ์ให้อัตโนมัติเพื่อไม่ขยายสิทธิ์โดยไม่ตั้งใจ ให้สร้าง/หมุน token ใหม่และเลือกเครื่องมือนี้ หรือใช้ `search_knowledge` กับคำถามต้นฉบับ ซึ่ง server มี deterministic inventory fallback สำหรับคำถามนับ/แบ่งประเภท
 
-Token มี expiry, enable/disable/revoke, rate limit, concurrency limit และ query timeout หากถูกปฏิเสธจะได้ JSON-RPC error code เช่น `MCP_RATE_LIMITED`, `MCP_TIMEOUT`, `AUTH_TOOL_NOT_ALLOWED` หรือ `KNOWLEDGE_BASE_INACTIVE`
+Token มี expiry, enable/disable/revoke, rate limit, concurrency limit และ query timeout หากถูกปฏิเสธจะได้ JSON-RPC error code เช่น `MCP_RATE_LIMITED`, `MCP_TIMEOUT`, `AUTH_TOOL_NOT_ALLOWED` หรือ `KNOWLEDGE_BASE_INACTIVE` error จาก rate limit และ concurrency limit มี `retry_after_seconds` บอกเวลาที่ควรรอก่อนส่งใหม่
 
 ## Claude Code
 

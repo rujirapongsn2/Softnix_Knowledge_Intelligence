@@ -636,6 +636,42 @@ def test_ingest_rate_limit_is_charged_per_token():
     assert limited.status_code == 429
     assert limited.json()["error"]["code"] == "MCP_RATE_LIMITED"
     assert limited.json()["error"]["retryable"] is True
+    assert 1 <= int(limited.headers["Retry-After"]) <= 60
+
+
+def test_a_refused_request_does_not_use_up_the_window():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, "ingest-api-refused")
+    secret = _token(test_client, [kb_id], requests_per_minute=2)
+    assert _upload(test_client, secret, kb_id, "one.txt", b"One.").status_code == 202
+    assert _upload(test_client, secret, kb_id, "two.txt", b"Two.").status_code == 202
+    for n in range(3):
+        assert _upload(test_client, secret, kb_id, f"refused-{n}.txt", f"Refused {n}.".encode()).status_code == 429
+    from app.mcp_limits import mcp_limiter
+    from app.models import TokenKey
+    from app.db import SessionLocal
+    with SessionLocal() as db:
+        token = db.query(TokenKey).filter_by(name="ingest-agent").order_by(TokenKey.created_at.desc()).first()
+        assert len(mcp_limiter._requests[token.id]) == 2, "only the two accepted requests count"
+
+
+def test_an_admin_can_raise_an_existing_tokens_limits():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, "ingest-api-limits")
+    secret = _token(test_client, [kb_id], requests_per_minute=1)
+    token_id = next(row["id"] for row in test_client.get("/api/v1/tokens").json() if row["name"] == "ingest-agent")
+    assert _upload(test_client, secret, kb_id, "a.txt", b"A.").status_code == 202
+    assert _upload(test_client, secret, kb_id, "b.txt", b"B.").status_code == 429
+    updated = test_client.patch(f"/api/v1/tokens/{token_id}/limits", json={"requests_per_minute": 600, "max_concurrent_requests": 10})
+    assert updated.status_code == 200
+    assert (updated.json()["requests_per_minute"], updated.json()["max_concurrent_requests"]) == (600, 10)
+    assert _upload(test_client, secret, kb_id, "b.txt", b"B.").status_code == 202, "the same secret keeps working"
+    assert test_client.patch(f"/api/v1/tokens/{token_id}/limits", json={"requests_per_minute": 0}).status_code == 422
+    empty = test_client.patch(f"/api/v1/tokens/{token_id}/limits", json={})
+    assert empty.status_code == 400 and empty.json()["error"]["code"] == "TOKEN_LIMITS_REQUIRED"
+    assert test_client.post(f"/api/v1/tokens/{token_id}/revoke").status_code == 200
+    revoked = test_client.patch(f"/api/v1/tokens/{token_id}/limits", json={"requests_per_minute": 5})
+    assert revoked.status_code == 409 and revoked.json()["error"]["code"] == "TOKEN_REVOKED"
 
 
 def test_ingest_observability_records_attribution_without_the_secret():
@@ -658,3 +694,15 @@ def test_ingest_observability_records_attribution_without_the_secret():
 def test_reference_file_validation_treats_unreadable_file_as_invalid(tmp_path):
     from app.services import _valid_reference_file
     assert _valid_reference_file(tmp_path / "missing.pdf", ".pdf", 10) is False
+
+
+def test_new_tokens_get_the_default_limits_of_their_kind():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, "token-default-limits")
+    ingest = test_client.post("/api/v1/tokens", json={"name": "importer", "allowed_scopes": [INGEST_SCOPE], "allowed_ingest_knowledge_base_id": kb_id}).json()
+    mcp = test_client.post("/api/v1/tokens", json={"name": "agent", "allowed_knowledge_base_ids": [kb_id], "allowed_tools": ["search_knowledge"]}).json()
+    chosen = test_client.post("/api/v1/tokens", json={"name": "slow-importer", "allowed_scopes": [INGEST_SCOPE], "allowed_ingest_knowledge_base_id": kb_id,
+                                                      "requests_per_minute": 30, "max_concurrent_requests": 2}).json()
+    assert (ingest["requests_per_minute"], ingest["max_concurrent_requests"]) == (600, 10)
+    assert (mcp["requests_per_minute"], mcp["max_concurrent_requests"]) == (60, 5)
+    assert (chosen["requests_per_minute"], chosen["max_concurrent_requests"]) == (30, 2), "an explicit limit is kept"

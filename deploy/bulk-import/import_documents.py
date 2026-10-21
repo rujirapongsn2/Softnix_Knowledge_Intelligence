@@ -26,6 +26,16 @@ REFERENCE_SUFFIXES = (".pdf", ".docx", ".doc", ".xlsx", ".xls", ".txt")
 SETTLED = {"completed", "failed", "ocr_required"}
 
 
+def retry_after(exc, attempt):
+    """Seconds to wait before sending again: a doubling backoff, never shorter than the server's Retry-After.
+    A 503 from a restarting rate-limit store says Retry-After 1, but the restart takes longer than that."""
+    backoff = min(60, 2 ** attempt)
+    try:
+        return min(120, max(backoff, int(exc.headers.get("Retry-After"))))
+    except (TypeError, ValueError):
+        return backoff
+
+
 class Api:
     def __init__(self, base, token):
         self.base, self.token = base.rstrip("/"), token
@@ -40,7 +50,7 @@ class Api:
                     return response.status, json.load(response)
             except urllib.error.HTTPError as exc:
                 if exc.code in (429, 502, 503, 504) and attempt < 9:
-                    time.sleep(min(60, 2 ** attempt))
+                    time.sleep(retry_after(exc, attempt))
                     continue
                 try:
                     return exc.code, json.load(exc)

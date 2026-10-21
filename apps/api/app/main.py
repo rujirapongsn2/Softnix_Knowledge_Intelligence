@@ -36,7 +36,7 @@ from .provider_holds import hold_view
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
-from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenOut, UserCreate, UserOut, UserUpdate
+from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenLimitsUpdate, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
 from .job_queue import lock_knowledge_base_graph, release_if_stale
@@ -120,7 +120,7 @@ def bootstrap() -> None:
 async def structured_http_error(_: Request, exc: HTTPException):
     from fastapi.responses import JSONResponse
     detail = exc.detail if isinstance(exc.detail, dict) else {"code": "VALIDATION_ERROR", "message": str(exc.detail), "retryable": False}
-    return JSONResponse(status_code=exc.status_code, content={"status": "error", "error": detail})
+    return JSONResponse(status_code=exc.status_code, content={"status": "error", "error": detail}, headers=exc.headers)
 
 
 @app.get("/health")
@@ -2172,6 +2172,11 @@ def query_impact(payload: ImpactRequest, user: User = Depends(current_admin), db
     return analyze_impact(db, payload.subject, payload.knowledge_base_ids, payload.max_depth, payload.include_indirect, payload.entity_id)
 
 
+# (requests_per_minute, max_concurrent_requests) a new token gets when the request leaves them unset. An upload only
+# queues work, and an import client sent 205 files in 82 seconds; a search runs the LLM, LightRAG and the reranker.
+TOKEN_DEFAULT_LIMITS = {"ingest": (600, 10), "mcp": (60, 5)}
+
+
 @app.post("/api/v1/tokens", response_model=TokenCreated)
 def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     # An unknown name would silently grant nothing now that authorize() requires
@@ -2245,13 +2250,14 @@ def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: 
     requested_kb = set(payload.allowed_knowledge_base_ids) | ({payload.allowed_ingest_knowledge_base_id} if payload.allowed_ingest_knowledge_base_id else set())
     if not requested_kb.issubset(visible):
         raise HTTPException(403, {"code": "TOKEN_SCOPE_EXCEEDS_ROLE", "message": "Token scope may not exceed the Knowledge Bases available to your account.", "retryable": False})
+    default_rpm, default_concurrency = TOKEN_DEFAULT_LIMITS["ingest" if INGEST_SCOPE in payload.allowed_scopes else "mcp"]
     secret = create_token_secret()
     token = TokenKey(name=payload.name, description=payload.description, token_prefix=secret[:16], token_hash=token_digest(secret),
                      allowed_knowledge_base_ids=payload.allowed_knowledge_base_ids, allowed_tools=payload.allowed_tools,
                      allowed_scopes=payload.allowed_scopes, allowed_ingest_knowledge_base_id=payload.allowed_ingest_knowledge_base_id,
-                     expires_at=payload.expires_at, requests_per_minute=payload.requests_per_minute,
-                     max_concurrent_requests=payload.max_concurrent_requests, query_timeout_seconds=payload.query_timeout_seconds,
-                     created_by=user.id)
+                     expires_at=payload.expires_at, requests_per_minute=payload.requests_per_minute or default_rpm,
+                     max_concurrent_requests=payload.max_concurrent_requests or default_concurrency,
+                     query_timeout_seconds=payload.query_timeout_seconds, created_by=user.id)
     db.add(token); db.flush(); record_audit(db, "token.create", user.id, "token", token.id, {"name": token.name}); db.commit(); db.refresh(token)
     return {**TokenOut.model_validate(token).model_dump(), "token": secret}
 
@@ -2284,6 +2290,22 @@ def enable_token(token_id: str, user: User = Depends(current_admin), db: Session
     token.status = "active"
     record_audit(db, "token.enable", user.id, "token", token.id); db.commit()
     return {"status": "success"}
+
+
+@app.patch("/api/v1/tokens/{token_id}/limits", response_model=TokenOut)
+def update_token_limits(token_id: str, payload: TokenLimitsUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    token = db.get(TokenKey, token_id)
+    if not token or not token_visible_to(db, user, token):
+        raise HTTPException(404, "Token not found")
+    if token.status == "revoked":
+        raise HTTPException(409, {"code": "TOKEN_REVOKED", "message": "A revoked token cannot be changed.", "retryable": False})
+    changes = payload.model_dump(exclude_none=True)
+    if not changes:
+        raise HTTPException(400, {"code": "TOKEN_LIMITS_REQUIRED", "message": "Send at least one limit to change.", "retryable": False})
+    for field, value in changes.items():
+        setattr(token, field, value)
+    record_audit(db, "token.limits.update", user.id, "token", token.id, changes); db.commit()
+    return token
 
 
 @app.post("/api/v1/tokens/{token_id}/revoke")
@@ -2689,8 +2711,11 @@ def _legal_relation_payload(db: Session, relation: LegalInstrumentRelation) -> d
             "confidence": relation.confidence, "origin": relation.origin, "review_status": relation.review_status}
 
 
-def mcp_error(request_id: Any, code: str, message: str, *, retryable: bool = False):
-    return JSONResponse(status_code=200, content={"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message, "retryable": retryable}})
+def mcp_error(request_id: Any, code: str, message: str, *, retryable: bool = False, retry_after_seconds: int | None = None):
+    error = {"code": code, "message": message, "retryable": retryable}
+    if retry_after_seconds is not None:
+        error["retry_after_seconds"] = retry_after_seconds
+    return JSONResponse(status_code=200, content={"jsonrpc": "2.0", "id": request_id, "error": error})
 
 
 def mcp_audit_arguments(name: str, arguments: dict[str, Any], effective_kb_ids: list[str] | None = None) -> dict:
@@ -2876,7 +2901,8 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
                                message=exc.message, duration_ms=round((time.monotonic() - mcp_started_at) * 1000),
                                query_preview=mcp_audit_arguments(tool_name, tool_arguments).get("query") if tool_name else None)
         db.commit()
-        return mcp_error(request_id, exc.code, exc.message, retryable=exc.code == "MCP_LIMIT_STORE_UNAVAILABLE")
+        return mcp_error(request_id, exc.code, exc.message, retryable=exc.code == "MCP_LIMIT_STORE_UNAVAILABLE",
+                         retry_after_seconds=int(exc.retry_after_header["Retry-After"]))
     except RuntimeError as exc:
         if token is not None and tool_name:
             record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code=str(exc))
@@ -2914,7 +2940,7 @@ def ingest_budget(token: TokenKey = Depends(ingest_token)):
         mcp_limiter.acquire(token)
     except McpLimitExceeded as exc:
         raise HTTPException(503 if exc.code == "MCP_LIMIT_STORE_UNAVAILABLE" else 429,
-                            {"code": exc.code, "message": exc.message, "retryable": True})
+                            {"code": exc.code, "message": exc.message, "retryable": True}, headers=exc.retry_after_header)
     try:
         yield token
     finally:

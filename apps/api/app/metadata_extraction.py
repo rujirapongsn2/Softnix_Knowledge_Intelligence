@@ -199,12 +199,24 @@ def _read_answer(field, answer, window):
 
 def _read_window(fields, window, client):
     """Answers for one window. A field whose answer was unusable is asked once more on its own, because models
-    sometimes drop the quote or the list shape the first time. The retry replaces the first answer unless it is worse."""
-    result = client.extract_document_metadata(fields, window)
+    sometimes drop the quote or the list shape the first time. The retry replaces the first answer unless it is worse.
+    A reply that is not usable JSON at all is asked for once more: it comes and goes (2 of 120 pilot documents hit one)."""
+    try:
+        result = client.extract_document_metadata(fields, window)
+    except RuntimeError as exc:
+        if str(exc) != "METADATA_EXTRACTION_INVALID_RESPONSE":
+            raise
+        result = client.extract_document_metadata(fields, window)
     answers = {f["key"]: _read_answer(f, result.get(f["key"], []), window) for f in fields}
     retry = [f for f in fields if answers[f["key"]][1]]
     if retry:
-        again = client.extract_document_metadata(retry, window)
+        try:
+            again = client.extract_document_metadata(retry, window)
+        except RuntimeError as exc:
+            # The first answers stand; the fields asked again stay marked unusable.
+            if str(exc) != "METADATA_EXTRACTION_INVALID_RESPONSE":
+                raise
+            return answers
         for field in retry:
             second = _read_answer(field, again.get(field["key"], []), window)
             if not second[1] or len(second[0]) >= len(answers[field["key"]][0]):
@@ -302,10 +314,20 @@ def extract_candidates(fields, text, client):
     collected = {f["key"]: [] for f in fields}
     invalid = set()
     truncated = len(text) > WINDOW * MAX_WINDOWS + WINDOW_OVERLAP  # the last window reads the overlap past the cap
-    for start in range(0, min(len(text), WINDOW * MAX_WINDOWS), WINDOW):
+    starts = range(0, min(len(text), WINDOW * MAX_WINDOWS), WINDOW)
+    unread = 0
+    for start in starts:
         # The overlap keeps a sentence that crosses a window boundary whole in one of the two windows.
         window = text[start:start + WINDOW + WINDOW_OVERLAP]
-        for key, (entries, bad) in _read_window(fields, window, client).items():
+        try:
+            answers = _read_window(fields, window, client)
+        except RuntimeError as exc:
+            # A window still unreadable after its retry is skipped; what the others found is kept, marked partial.
+            if str(exc) != "METADATA_EXTRACTION_INVALID_RESPONSE" or unread + 1 == len(starts):
+                raise
+            unread += 1
+            continue
+        for key, (entries, bad) in answers.items():
             if bad:
                 invalid.add(key)
             for value, quote in entries:
@@ -315,6 +337,8 @@ def extract_candidates(fields, text, client):
                         collected[key].append(entry)
                     else:
                         invalid.add(key)
+    # Not every part of the text was read: nothing is auto-accepted, and a value not found may still be there.
+    partial = truncated or unread > 0
     observations = {}
     digest = content_digest(text)
     for field in fields:
@@ -323,13 +347,13 @@ def extract_candidates(fields, text, client):
         if field.get("field_type") == "text_list" and candidates:
             # The items found are one value; each keeps the quote that backs it.
             candidates = [{"value": [c["value"] for c in candidates], "evidence": candidates[0]["evidence"], "item_evidence": [c["evidence"] for c in candidates]}]
-        accepted = _accepted_candidate(field, candidates) if not truncated and key not in invalid else None
+        accepted = _accepted_candidate(field, candidates) if not partial and key not in invalid else None
         status = "suggested" if candidates else "not_found"
         if len(candidates) > 1 and not accepted:
             status = "conflict"
         elif key in invalid and not (candidates and field.get("field_type") == "text_list"):
             status = "invalid_evidence"
-        elif truncated:
+        elif partial:
             status = "partial"
         elif key in invalid:
             status = "suggested"
@@ -337,7 +361,7 @@ def extract_candidates(fields, text, client):
             status, candidates = "auto_accepted", [accepted]
         observations[key] = {"status": status, "origin": "document_extraction", "candidates": candidates,
                              "content_version": digest, "extractor_version": EXTRACTOR_VERSION,
-                             "coverage": "partial" if truncated else "full", "locked": False}
+                             "coverage": "partial" if partial else "full", "locked": False}
     return observations
 
 

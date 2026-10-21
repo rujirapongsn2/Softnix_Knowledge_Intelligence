@@ -170,6 +170,28 @@ def test_a_resumed_document_waits_for_its_stopped_attempt_and_keeps_the_track(mo
     assert engine.ingests == 3
 
 
+class _BusyDeleteEngine(_LeftoverEngine):
+    """The stopped attempt left a failed record, and LightRAG refuses to delete it while other documents index."""
+    def __init__(self, busy_deletes):
+        super().__init__(["failed"])
+        self.busy_deletes = busy_deletes
+
+    def ingest(self, document_id, knowledge_base_id, text, title):
+        self.ingests += 1
+        if self.busy_deletes:
+            self.busy_deletes -= 1
+            raise services.RetrievalEngineError("RETRIEVAL_ENGINE_BUSY", "LightRAG refused the delete while its pipeline is busy.")
+        return self.finished_track
+
+
+def test_a_failed_record_that_lightrag_will_not_delete_yet_is_waited_for(monkeypatch):
+    monkeypatch.setattr(services.time, "sleep", lambda _seconds: None)
+    engine = _BusyDeleteEngine(busy_deletes=4)
+    with SessionLocal() as db:
+        assert services._ingest_after_own_attempt(engine, _doc(db), "body", "t") == "track-existing"
+    assert engine.ingests == 5, "asked again after each busy refusal instead of failing the document"
+
+
 def test_a_busy_engine_without_a_record_of_this_document_is_still_busy():
     with SessionLocal() as db, pytest.raises(services.RetrievalEngineError, match="RETRIEVAL_ENGINE_BUSY"):
         engine = _LeftoverEngine(["processing"])

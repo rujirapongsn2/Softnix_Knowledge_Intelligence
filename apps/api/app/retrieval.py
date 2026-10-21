@@ -273,7 +273,7 @@ class LightRAGRetrievalEngine(RetrievalEngine):
             "doc_ids": [remote_document_id], "delete_file": False, "delete_llm_cache": True,
         })
         if result.get("status") == "busy":
-            raise RuntimeError("RETRIEVAL_ENGINE_BUSY")
+            raise RetrievalEngineError("RETRIEVAL_ENGINE_BUSY", "LightRAG refused the delete while its pipeline is busy.")
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             data = self._request("GET", "/documents")

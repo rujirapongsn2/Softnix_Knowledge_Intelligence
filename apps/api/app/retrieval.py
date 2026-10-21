@@ -228,6 +228,15 @@ class LightRAGRetrievalEngine(RetrievalEngine):
             data = self._request("POST", "/documents/text", json=payload)
         return data.get("track_id") or data.get("id")
 
+    def pipeline_progress(self) -> tuple | None:
+        """What LightRAG's pipeline last reported; it changes with every chunk it extracts. None when unknown."""
+        try:
+            status = self._request("GET", "/documents/pipeline_status")
+        except RuntimeError:
+            return None
+        history = status.get("history_messages") or []
+        return (status.get("job_start"), status.get("cur_batch"), status.get("latest_message"), len(history))
+
     def is_healthy(self) -> bool:
         """True when LightRAG answers its health endpoint (used before re-queueing failed documents)."""
         if not self.enabled:

@@ -149,6 +149,9 @@ class _LeftoverEngine:
     def __init__(self, statuses, finished_track="track-existing"):
         self.statuses, self.finished_track, self.ingests = list(statuses), finished_track, 0
 
+    def pipeline_progress(self):
+        return None
+
     def find_document(self, document_id, knowledge_base_id):
         # Each look at the record lets LightRAG move on to its next status.
         status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
@@ -205,6 +208,27 @@ def test_waiting_for_a_stuck_attempt_ends_in_a_timeout(monkeypatch):
     monkeypatch.setattr(services.time, "sleep", lambda _seconds: None)
     with SessionLocal() as db, pytest.raises(services.RetrievalEngineError, match="RETRIEVAL_ENGINE_TIMEOUT"):
         services._ingest_after_own_attempt(_LeftoverEngine(["processing"]), _doc(db), "body", "t")
+
+
+def test_a_document_waits_past_the_timeout_while_the_pipeline_keeps_moving(monkeypatch):
+    """A long manual indexes for longer than LIGHTRAG_PROCESSING_TIMEOUT_SECONDS; only a stalled pipeline times out."""
+    clock = {"now": 0}
+    monkeypatch.setattr(services.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(services.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + 300))
+    stall = services.get_settings().lightrag_processing_timeout_seconds
+    engine = _LeftoverEngine(["processing"] * 40 + ["processed"])
+    chunks = iter(range(1_000))
+    engine.pipeline_progress = lambda: ("job", 1, f"Chunk {next(chunks)} extracted", 0)
+    with SessionLocal() as db:
+        assert services._ingest_after_own_attempt(engine, _doc(db), "body", "t") == "track-existing"
+    assert clock["now"] > 3 * stall, "waited well past the timeout because every look showed progress"
+
+    clock["now"] = 0
+    engine = _LeftoverEngine(["processing"])
+    engine.pipeline_progress = lambda: ("job", 1, "Chunk 7 extracted", 0)
+    with SessionLocal() as db, pytest.raises(services.RetrievalEngineError, match="RETRIEVAL_ENGINE_TIMEOUT"):
+        services._ingest_after_own_attempt(engine, _doc(db), "body", "t")
+    assert stall <= clock["now"] < stall + 600, "a pipeline that stands still times out after the timeout"
 
 
 def test_a_job_that_keeps_failing_alone_stops_waiting_and_fails(monkeypatch):

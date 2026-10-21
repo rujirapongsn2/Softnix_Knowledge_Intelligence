@@ -145,6 +145,9 @@ def test_worker_requeues_budget_failure_with_next_attempt():
             def track_status(self, track_id):
                 return {"status": "failed", "error": "402 in_flight_budget_exhausted"}
 
+            def pipeline_progress(self):
+                return None
+
         original = services.LightRAGRetrievalEngine
         services.LightRAGRetrievalEngine = lambda: FakeEngine()
         try:

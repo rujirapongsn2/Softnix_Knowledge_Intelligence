@@ -2598,6 +2598,23 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
     db.commit()
 
 
+class _UntilEngineStalls:
+    """Times out when LightRAG's pipeline has reported no progress for LIGHTRAG_PROCESSING_TIMEOUT_SECONDS.
+
+    A fixed deadline failed a 977,000-character manual that LightRAG finished 11 minutes past it; a document
+    is given as long as it needs while the pipeline keeps moving, whether on it or on the ones before it.
+    """
+    def __init__(self, engine: LightRAGRetrievalEngine):
+        self.engine, self.stall_seconds = engine, get_settings().lightrag_processing_timeout_seconds
+        self.progress, self.moved_at = engine.pipeline_progress(), time.monotonic()
+
+    def expired(self) -> bool:
+        progress, now = self.engine.pipeline_progress(), time.monotonic()
+        if progress is not None and progress != self.progress:
+            self.progress, self.moved_at = progress, now
+        return now - self.moved_at >= self.stall_seconds
+
+
 def _ingest_after_own_attempt(engine: LightRAGRetrievalEngine, doc: Document, text: str, title: str) -> str | None:
     """Ingest, waiting while an earlier attempt of this same document is still in flight in LightRAG.
 
@@ -2607,7 +2624,7 @@ def _ingest_after_own_attempt(engine: LightRAGRetrievalEngine, doc: Document, te
     A failed one is waited for too when LightRAG refuses to delete it while its pipeline is busy with other
     documents, which lasts as long as a large document indexes; LightRAG may also pick the record up again.
     """
-    deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
+    deadline = _UntilEngineStalls(engine)
     while True:
         try:
             return engine.ingest(doc.id, doc.knowledge_base_id, text, title)
@@ -2618,8 +2635,8 @@ def _ingest_after_own_attempt(engine: LightRAGRetrievalEngine, doc: Document, te
             status = str((record or {}).get("status") or "")
             if status not in IN_FLIGHT_STATUSES | {"failed"}:
                 raise
-            if time.monotonic() >= deadline:
-                raise RetrievalEngineError("RETRIEVAL_ENGINE_TIMEOUT", f"An earlier attempt of this document is still {status} in the retrieval engine.") from exc
+            if deadline.expired():
+                raise RetrievalEngineError("RETRIEVAL_ENGINE_TIMEOUT", f"An earlier attempt of this document is still {status} in the retrieval engine, which has stopped making progress.") from exc
             time.sleep(5)
 
 
@@ -2634,11 +2651,11 @@ def index_in_engine(db: Session, engine: LightRAGRetrievalEngine, doc: Document,
     # into enough concurrent upstream LLM calls to exhaust the shared provider budget.
     with _indexing_semaphore:
         track_id = doc.external_engine_id = _ingest_after_own_attempt(engine, doc, text, title)
-        deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
+        deadline = _UntilEngineStalls(engine)
         healed = False
         while track_id:
-            if time.monotonic() >= deadline:
-                raise RetrievalEngineError("RETRIEVAL_ENGINE_TIMEOUT")
+            if deadline.expired():
+                raise RetrievalEngineError("RETRIEVAL_ENGINE_TIMEOUT", "The retrieval engine stopped making progress before indexing this document.")
             track = engine.track_status(track_id)
             if track["status"] == "processed":
                 return

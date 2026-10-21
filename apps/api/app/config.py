@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     lightrag_base_url: str = ""
     lightrag_api_key: str = ""
     lightrag_timeout_seconds: int = 120
+    # How long LightRAG's pipeline may report no progress before a document waiting on it times out.
     lightrag_processing_timeout_seconds: int = 900
     # Queue health: a running job refreshes updated_at every job_heartbeat_seconds; one not refreshed for
     # job_stale_after_seconds lost its worker and is re-queued by the stale-job sweep.

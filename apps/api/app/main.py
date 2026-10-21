@@ -179,15 +179,18 @@ class _EmbeddingProbe:
 
 _EMBEDDING_PROBE = _EmbeddingProbe()
 
-# The credit balance is asked for at most once a minute; the status page refreshes every 10 s.
+# The credit balance is asked for at most once a minute (10 s after a failed ask); the status page refreshes
+# every 10 s, and the lock keeps simultaneous refreshes from asking the provider together.
 _CREDITS_CACHE: dict[str, tuple[float, float | None]] = {}
+_CREDITS_LOCK = threading.Lock()
 
 
 def llm_credits_view() -> dict | None:
-    """Credits left on the LLM account and whether that is below LLM_CREDIT_WARNING_USD; None when not reported."""
-    now, cached = _time.monotonic(), _CREDITS_CACHE.get("llm")
-    if cached is None or now - cached[0] >= 60:
-        cached = _CREDITS_CACHE["llm"] = (now, LLMClient().credits_remaining())
+    """Credits left on the LLM key and whether that is below LLM_CREDIT_WARNING_USD; None when not reported."""
+    with _CREDITS_LOCK:
+        now, cached = _time.monotonic(), _CREDITS_CACHE.get("llm")
+        if cached is None or now - cached[0] >= (60 if cached[1] is not None else 10):
+            cached = _CREDITS_CACHE["llm"] = (now, LLMClient().credits_remaining())
     remaining, warning = cached[1], get_settings().llm_credit_warning_usd
     return None if remaining is None else {"remaining_usd": remaining, "warning_below_usd": warning, "low": remaining < warning}
 

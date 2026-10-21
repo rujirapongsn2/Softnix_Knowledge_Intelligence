@@ -398,10 +398,12 @@ class LLMClient:
         """
         if not self.llm_enabled:
             return "LLM_API_KEY_NOT_CONFIGURED"
-        client = self._client or httpx.Client(timeout=10)
+        # A reasoning model may think before its one word; a timeout here would read as an outage and keep the hold.
+        client = self._client or httpx.Client(timeout=30)
         try:
             response = client.post(f"{self.settings.llm_base_url.rstrip('/')}/chat/completions", headers=self._headers(),
-                                   json={**self._llm(max_tokens=METADATA_MAX_TOKENS, model=model), "messages": [{"role": "user", "content": "ping"}]})
+                                   json={**self._llm(max_tokens=METADATA_MAX_TOKENS, model=model),
+                                         "messages": [{"role": "user", "content": "Reply with the single word: ok"}]})
             response.raise_for_status()
             return None
         except httpx.HTTPError as exc:
@@ -412,15 +414,23 @@ class LLMClient:
                 client.close()
 
     def credits_remaining(self) -> float | None:
-        """USD left on the account, for a provider that reports it (OpenRouter's /credits); None otherwise."""
+        """USD this key can still spend, for a provider that reports it (OpenRouter); None otherwise.
+
+        A key with its own credit limit is refused at that limit whatever the account holds, so the key's
+        limit_remaining wins over the account balance from /credits.
+        """
         if not self.llm_enabled or dialect_name(self.settings) != "openrouter":
             return None
-        client = self._client or httpx.Client(timeout=10)
+        base, client = self.settings.llm_base_url.rstrip("/"), self._client or httpx.Client(timeout=10)
         try:
-            response = client.get(f"{self.settings.llm_base_url.rstrip('/')}/credits", headers=self._headers())
-            response.raise_for_status()
-            data = response.json()["data"]
-            return round(float(data["total_credits"]) - float(data["total_usage"]), 2)
+            key = client.get(f"{base}/key", headers=self._headers())
+            key.raise_for_status()
+            key_left = key.json()["data"].get("limit_remaining")
+            credits = client.get(f"{base}/credits", headers=self._headers())
+            credits.raise_for_status()
+            data = credits.json()["data"]
+            account_left = float(data["total_credits"]) - float(data["total_usage"])
+            return round(account_left if key_left is None else min(account_left, float(key_left)), 2)
         except (httpx.HTTPError, KeyError, TypeError, ValueError):
             return None
         finally:

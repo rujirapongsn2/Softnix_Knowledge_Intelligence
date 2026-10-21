@@ -2599,20 +2599,25 @@ def _extract_legal_metadata(db: Session, job: ProcessingJob, doc: Document, text
 
 
 class _UntilEngineStalls:
-    """Times out when LightRAG's pipeline has reported no progress for LIGHTRAG_PROCESSING_TIMEOUT_SECONDS.
+    """Times out when LightRAG's pipeline has reported no progress for LIGHTRAG_PROCESSING_TIMEOUT_SECONDS,
+    or after MAX_STALLS times that in all.
 
     A fixed deadline failed a 977,000-character manual that LightRAG finished 11 minutes past it; a document
-    is given as long as it needs while the pipeline keeps moving, whether on it or on the ones before it.
+    is given longer while the pipeline keeps moving, whether on it or on the ones before it. The progress is
+    the whole pipeline's, so the ceiling stops a document LightRAG lost from waiting as long as others index.
     """
+    MAX_STALLS = 4
+
     def __init__(self, engine: LightRAGRetrievalEngine):
         self.engine, self.stall_seconds = engine, get_settings().lightrag_processing_timeout_seconds
-        self.progress, self.moved_at = engine.pipeline_progress(), time.monotonic()
+        self.started_at = self.moved_at = time.monotonic()
+        self.progress = None
 
     def expired(self) -> bool:
         progress, now = self.engine.pipeline_progress(), time.monotonic()
         if progress is not None and progress != self.progress:
             self.progress, self.moved_at = progress, now
-        return now - self.moved_at >= self.stall_seconds
+        return now - self.moved_at >= self.stall_seconds or now - self.started_at >= self.MAX_STALLS * self.stall_seconds
 
 
 def _ingest_after_own_attempt(engine: LightRAGRetrievalEngine, doc: Document, text: str, title: str) -> str | None:
@@ -2681,18 +2686,21 @@ def process_next_job(db: Session) -> bool:
     job = claim_next_job(db)
     if not job:
         return False
-    job_id, claim_token = job.id, job.claim_token
+    job_id, claim_token, attempts = job.id, job.claim_token, job.attempt_count or 0
     try:
         with own_job(db, job), job_heartbeat(db, job.id, token=job.claim_token):
             _run_claimed_job(db, job)
     except SystemExit:
         # The worker is being stopped (worker.py turns SIGTERM into SystemExit): hand the job back now
-        # instead of leaving it "running" for the stale-job sweep.
-        db.rollback()
-        with SessionLocal() as handover:
-            if hand_back(handover, job_id, claim_token):
-                handover.commit()
-                logger.warning("handed a job back to the queue on shutdown", extra={"job_id": job_id})
+        # instead of leaving it "running" for the stale-job sweep. The stop goes on even if that fails.
+        try:
+            db.rollback()
+            with SessionLocal() as handover:
+                if hand_back(handover, job_id, claim_token, attempts):
+                    handover.commit()
+                    logger.warning("handed a job back to the queue on shutdown", extra={"job_id": job_id})
+        except Exception:
+            logger.exception("could not hand a job back on shutdown; the stale-job sweep will", extra={"job_id": job_id})
         raise
     except ClaimLost:
         # The job was swept as stale or superseded by a reprocess while this

@@ -211,17 +211,22 @@ def test_waiting_for_a_stuck_attempt_ends_in_a_timeout(monkeypatch):
 
 
 def test_a_document_waits_past_the_timeout_while_the_pipeline_keeps_moving(monkeypatch):
-    """A long manual indexes for longer than LIGHTRAG_PROCESSING_TIMEOUT_SECONDS; only a stalled pipeline times out."""
+    """A long manual indexes for longer than LIGHTRAG_PROCESSING_TIMEOUT_SECONDS; a stalled pipeline times out,
+    and so does a moving one after MAX_STALLS timeouts in all, since its progress may be other documents'."""
     clock = {"now": 0}
     monkeypatch.setattr(services.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(services.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + 300))
     stall = services.get_settings().lightrag_processing_timeout_seconds
-    engine = _LeftoverEngine(["processing"] * 40 + ["processed"])
-    chunks = iter(range(1_000))
-    engine.pipeline_progress = lambda: ("job", 1, f"Chunk {next(chunks)} extracted", 0)
+    chunks = iter(range(10_000))
+
+    def moving():
+        return ("job", 1, f"Chunk {next(chunks)} extracted", 0)
+
+    engine = _LeftoverEngine(["processing"] * (3 * stall // 300) + ["processed"])
+    engine.pipeline_progress = moving
     with SessionLocal() as db:
         assert services._ingest_after_own_attempt(engine, _doc(db), "body", "t") == "track-existing"
-    assert clock["now"] > 3 * stall, "waited well past the timeout because every look showed progress"
+    assert clock["now"] >= 2 * stall, "waited past the timeout because every look showed progress"
 
     clock["now"] = 0
     engine = _LeftoverEngine(["processing"])
@@ -229,6 +234,14 @@ def test_a_document_waits_past_the_timeout_while_the_pipeline_keeps_moving(monke
     with SessionLocal() as db, pytest.raises(services.RetrievalEngineError, match="RETRIEVAL_ENGINE_TIMEOUT"):
         services._ingest_after_own_attempt(engine, _doc(db), "body", "t")
     assert stall <= clock["now"] < stall + 600, "a pipeline that stands still times out after the timeout"
+
+    clock["now"] = 0
+    engine = _LeftoverEngine(["processing"])
+    engine.pipeline_progress = moving
+    with SessionLocal() as db, pytest.raises(services.RetrievalEngineError, match="RETRIEVAL_ENGINE_TIMEOUT"):
+        services._ingest_after_own_attempt(engine, _doc(db), "body", "t")
+    ceiling = services._UntilEngineStalls.MAX_STALLS * stall
+    assert ceiling <= clock["now"] < ceiling + 600, "a document LightRAG never finishes stops at the ceiling"
 
 
 def test_a_job_that_keeps_failing_alone_stops_waiting_and_fails(monkeypatch):

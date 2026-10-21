@@ -4,6 +4,7 @@ from typing import Any
 import hashlib
 import json
 import re
+import threading
 import time
 import unicodedata
 import uuid
@@ -141,6 +142,44 @@ _PROBE_CACHE: dict[str, tuple[float, tuple[dict, dict]]] = {}
 _PROBE_CACHE_TTL_SECONDS = 6.0
 
 
+class _EmbeddingProbe:
+    """The embedding server is probed in a thread with a long timeout; readiness waits only WAIT_SECONDS for it.
+
+    During a bulk import the server answered in 7 s with all its slots busy, and a 3 s probe reported it down.
+    A probe still running past WAIT_SECONDS, or one that answered slowly, is "slow" when the server answered
+    last time; one that never answered, or failed, is "unavailable". Results are kept per server URL.
+    """
+    WAIT_SECONDS, TIMEOUT_SECONDS = 3, 30
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running: dict[str, threading.Thread] = {}
+        self._last: dict[str, str] = {}
+
+    def _run(self, url: str) -> None:
+        started = _time.monotonic()
+        answered = EmbeddingClient(timeout=self.TIMEOUT_SECONDS).check()["embedding_model_available"]
+        state = "unavailable" if not answered else "slow" if _time.monotonic() - started > self.WAIT_SECONDS else "ready"
+        with self._lock:
+            self._last[url] = state
+
+    def state(self, url: str) -> str:
+        with self._lock:
+            probe = self._running.get(url)
+            if probe is None or not probe.is_alive():
+                probe = self._running[url] = threading.Thread(target=self._run, args=(url,), name="embedding-probe", daemon=True)
+                probe.start()
+        probe.join(self.WAIT_SECONDS)
+        with self._lock:
+            last = self._last.get(url)
+        if probe.is_alive():
+            return "slow" if last in ("ready", "slow") else "unavailable"
+        return last or "unavailable"
+
+
+_EMBEDDING_PROBE = _EmbeddingProbe()
+
+
 def _probe_dependencies(db: Session) -> tuple[dict, dict]:
     """Probe every backend dependency; return (ready, failed) service maps.
 
@@ -183,9 +222,9 @@ def _probe_dependencies(db: Session) -> tuple[dict, dict]:
         except (httpx.HTTPError, OSError):
             failures["ocr_chain"] = "unavailable"
     if settings.embedding_base_url.strip():
-        # A short timeout of its own: a slow embedding server must not hold up readiness for the client's full 30s.
-        if EmbeddingClient(timeout=3).check()["embedding_model_available"]: dependencies["embeddings"] = "ready"
-        else: failures["embeddings"] = "unavailable"
+        state = _EMBEDDING_PROBE.state(settings.embedding_base_url.strip())
+        if state == "unavailable": failures["embeddings"] = state
+        else: dependencies["embeddings"] = state
     else:
         dependencies["embeddings"] = "not_configured"
     _PROBE_CACHE["result"] = (now, (dependencies, failures))

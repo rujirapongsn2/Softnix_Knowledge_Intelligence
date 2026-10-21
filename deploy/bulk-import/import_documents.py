@@ -27,11 +27,13 @@ SETTLED = {"completed", "failed", "ocr_required"}
 
 
 def retry_after(exc, attempt):
-    """Seconds to wait before sending again: the server's Retry-After when it gave one, else a doubling backoff."""
+    """Seconds to wait before sending again: a doubling backoff, never shorter than the server's Retry-After.
+    A 503 from a restarting rate-limit store says Retry-After 1, but the restart takes longer than that."""
+    backoff = min(60, 2 ** attempt)
     try:
-        return min(120, max(1, int(exc.headers.get("Retry-After"))))
+        return min(120, max(backoff, int(exc.headers.get("Retry-After"))))
     except (TypeError, ValueError):
-        return min(60, 2 ** attempt)
+        return backoff
 
 
 class Api:

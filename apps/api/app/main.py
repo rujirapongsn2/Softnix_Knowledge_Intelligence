@@ -2711,8 +2711,11 @@ def _legal_relation_payload(db: Session, relation: LegalInstrumentRelation) -> d
             "confidence": relation.confidence, "origin": relation.origin, "review_status": relation.review_status}
 
 
-def mcp_error(request_id: Any, code: str, message: str, *, retryable: bool = False):
-    return JSONResponse(status_code=200, content={"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message, "retryable": retryable}})
+def mcp_error(request_id: Any, code: str, message: str, *, retryable: bool = False, retry_after_seconds: int | None = None):
+    error = {"code": code, "message": message, "retryable": retryable}
+    if retry_after_seconds is not None:
+        error["retry_after_seconds"] = retry_after_seconds
+    return JSONResponse(status_code=200, content={"jsonrpc": "2.0", "id": request_id, "error": error})
 
 
 def mcp_audit_arguments(name: str, arguments: dict[str, Any], effective_kb_ids: list[str] | None = None) -> dict:
@@ -2898,7 +2901,8 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
                                message=exc.message, duration_ms=round((time.monotonic() - mcp_started_at) * 1000),
                                query_preview=mcp_audit_arguments(tool_name, tool_arguments).get("query") if tool_name else None)
         db.commit()
-        return mcp_error(request_id, exc.code, exc.message, retryable=exc.code == "MCP_LIMIT_STORE_UNAVAILABLE")
+        return mcp_error(request_id, exc.code, exc.message, retryable=exc.code == "MCP_LIMIT_STORE_UNAVAILABLE",
+                         retry_after_seconds=int(exc.retry_after_header["Retry-After"]))
     except RuntimeError as exc:
         if token is not None and tool_name:
             record_mcp_tool_audit(db, token, request_id, tool_name, tool_arguments, [], mcp_started_at, error_code=str(exc))

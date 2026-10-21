@@ -58,3 +58,25 @@ def test_a_rate_key_without_expiry_gets_one_again(store):
     store.set(f"skip:mcp:rate:{token.id}", 5)
     assert _refusal(limiter, token).code == "MCP_RATE_LIMITED"
     assert 0 < store.ttl(f"skip:mcp:rate:{token.id}") <= 60, "the stuck counter expires with the window"
+
+
+def test_retries_against_a_leaked_concurrency_count_do_not_keep_it_alive(store):
+    """A killed request leaves the active count full; its client's retries must not renew the expiry."""
+    limiter, token = McpLimiter(), _token(rpm=600, concurrent=2)
+    limiter.acquire(token)
+    limiter.acquire(token)
+    active = f"skip:mcp:active:{token.id}"
+    store.expire(active, 3)
+    for _ in range(5):
+        assert _refusal(limiter, token).code == "MCP_CONCURRENCY_LIMITED"
+    assert store.ttl(active) <= 3, "refusals leave the expiry alone"
+
+
+def test_a_release_after_the_active_key_expired_does_not_go_below_zero(store):
+    limiter, token = McpLimiter(), _token(rpm=600, concurrent=1)
+    limiter.acquire(token)
+    store.delete(f"skip:mcp:active:{token.id}")
+    limiter.release(token)
+    assert store.get(f"skip:mcp:active:{token.id}") is None
+    limiter.acquire(token)
+    assert _refusal(limiter, token).code == "MCP_CONCURRENCY_LIMITED", "the limit still holds after the late release"

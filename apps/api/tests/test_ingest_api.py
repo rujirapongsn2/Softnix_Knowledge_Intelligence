@@ -16,7 +16,6 @@ os.environ["LLM_API_KEY"] = ""
 os.environ["EXT_OCR_KEY"] = ""
 
 from fastapi.testclient import TestClient
-from app.config import get_settings
 from app.main import app
 from app.db import SessionLocal
 from app.models import Document, ProcessingJob
@@ -628,8 +627,7 @@ def test_unknown_tool_or_scope_is_rejected_at_issue_time():
     assert bad_scope.status_code == 400 and bad_scope.json()["error"]["code"] == "TOKEN_SCOPE_UNKNOWN"
 
 
-def test_ingest_rate_limit_is_charged_per_token(monkeypatch):
-    monkeypatch.setattr(get_settings(), "ingest_limit_wait_seconds", 0)
+def test_ingest_rate_limit_is_charged_per_token():
     test_client = next(client())
     kb_id = _knowledge_base(test_client, "ingest-api-ratelimit")
     secret = _token(test_client, [kb_id], requests_per_minute=1)
@@ -641,24 +639,7 @@ def test_ingest_rate_limit_is_charged_per_token(monkeypatch):
     assert 1 <= int(limited.headers["Retry-After"]) <= 60
 
 
-def test_an_ingest_burst_waits_for_the_token_budget_instead_of_failing(monkeypatch):
-    from app import mcp_limits
-
-    clock = {"now": 1000.0}
-    monkeypatch.setattr(mcp_limits, "time", lambda: clock["now"])
-    monkeypatch.setattr(mcp_limits, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr(mcp_limits, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
-    monkeypatch.setattr(get_settings(), "ingest_limit_wait_seconds", 90)
-    test_client = next(client())
-    kb_id = _knowledge_base(test_client, "ingest-api-burst")
-    secret = _token(test_client, [kb_id], requests_per_minute=2)
-    statuses = [_upload(test_client, secret, kb_id, f"burst-{n}.txt", f"Burst body {n}.".encode()).status_code for n in range(5)]
-    assert statuses == [202] * 5, "requests above the budget wait for the next minute instead of a 429"
-    assert clock["now"] >= 1000.0 + 120, "five uploads at two per minute span at least two windows"
-
-
-def test_a_refused_request_does_not_use_up_the_window(monkeypatch):
-    monkeypatch.setattr(get_settings(), "ingest_limit_wait_seconds", 0)
+def test_a_refused_request_does_not_use_up_the_window():
     test_client = next(client())
     kb_id = _knowledge_base(test_client, "ingest-api-refused")
     secret = _token(test_client, [kb_id], requests_per_minute=2)
@@ -674,8 +655,7 @@ def test_a_refused_request_does_not_use_up_the_window(monkeypatch):
         assert len(mcp_limiter._requests[token.id]) == 2, "only the two accepted requests count"
 
 
-def test_an_admin_can_raise_an_existing_tokens_limits(monkeypatch):
-    monkeypatch.setattr(get_settings(), "ingest_limit_wait_seconds", 0)
+def test_an_admin_can_raise_an_existing_tokens_limits():
     test_client = next(client())
     kb_id = _knowledge_base(test_client, "ingest-api-limits")
     secret = _token(test_client, [kb_id], requests_per_minute=1)
@@ -687,6 +667,11 @@ def test_an_admin_can_raise_an_existing_tokens_limits(monkeypatch):
     assert (updated.json()["requests_per_minute"], updated.json()["max_concurrent_requests"]) == (600, 10)
     assert _upload(test_client, secret, kb_id, "b.txt", b"B.").status_code == 202, "the same secret keeps working"
     assert test_client.patch(f"/api/v1/tokens/{token_id}/limits", json={"requests_per_minute": 0}).status_code == 422
+    empty = test_client.patch(f"/api/v1/tokens/{token_id}/limits", json={})
+    assert empty.status_code == 400 and empty.json()["error"]["code"] == "TOKEN_LIMITS_REQUIRED"
+    assert test_client.post(f"/api/v1/tokens/{token_id}/revoke").status_code == 200
+    revoked = test_client.patch(f"/api/v1/tokens/{token_id}/limits", json={"requests_per_minute": 5})
+    assert revoked.status_code == 409 and revoked.json()["error"]["code"] == "TOKEN_REVOKED"
 
 
 def test_ingest_observability_records_attribution_without_the_secret():

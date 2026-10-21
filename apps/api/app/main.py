@@ -2297,7 +2297,11 @@ def update_token_limits(token_id: str, payload: TokenLimitsUpdate, user: User = 
     token = db.get(TokenKey, token_id)
     if not token or not token_visible_to(db, user, token):
         raise HTTPException(404, "Token not found")
+    if token.status == "revoked":
+        raise HTTPException(409, {"code": "TOKEN_REVOKED", "message": "A revoked token cannot be changed.", "retryable": False})
     changes = payload.model_dump(exclude_none=True)
+    if not changes:
+        raise HTTPException(400, {"code": "TOKEN_LIMITS_REQUIRED", "message": "Send at least one limit to change.", "retryable": False})
     for field, value in changes.items():
         setattr(token, field, value)
     record_audit(db, "token.limits.update", user.id, "token", token.id, changes); db.commit()
@@ -2929,9 +2933,7 @@ def ingest_budget(token: TokenKey = Depends(ingest_token)):
     concurrency slot for the rest of the token's timeout window.
     """
     try:
-        # An upload only stores the file and queues its job, so a burst above the token's budget waits for a
-        # slot instead of being refused; a client that sends faster than the budget is slowed, not failed.
-        mcp_limiter.acquire(token, wait_seconds=get_settings().ingest_limit_wait_seconds)
+        mcp_limiter.acquire(token)
     except McpLimitExceeded as exc:
         raise HTTPException(503 if exc.code == "MCP_LIMIT_STORE_UNAVAILABLE" else 429,
                             {"code": exc.code, "message": exc.message, "retryable": True}, headers=exc.retry_after_header)

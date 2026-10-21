@@ -18,7 +18,7 @@ corpus/
 ## รัน
 
 สร้าง ingest token ของ KB ปลายทาง (หน้า API Keys แบบ Ingest หรือ `POST /api/v1/tokens` พร้อม `allowed_scopes: ["documents:write"]`)
-แล้วตั้ง `requests_per_minute` ให้สูงพอ เช่น 600
+ค่าเริ่มต้นของ ingest token (600 requests/min, 10 พร้อมกัน) เพียงพอสำหรับ script นี้
 
 ```sh
 INGEST_TOKEN=<token> python3 deploy/bulk-import/import_documents.py \
@@ -37,7 +37,7 @@ script ทำงานตามลำดับนี้:
 
 - เอกสารที่ส่งแล้วจะไม่ถูกส่งซ้ำ ส่วนไฟล์อ้างอิงที่ยังไม่ได้ผูก จะถูกผูกต่อ
 - ถ้าส่งไปแล้วแต่ไม่ได้รับคำตอบกลับ API จะตอบ `FILE_DUPLICATE` แล้ว script จะหา `document_id` เดิมจากชื่อไฟล์ใน KB ให้เอง
-- ถ้าโดน rate limit (429) หรือ API ไม่ตอบชั่วคราว script จะรอแล้วลองใหม่
+- ถ้าโดน rate limit (429) script จะรอตาม `Retry-After` แล้วส่งใหม่ ถ้า API ไม่ตอบชั่วคราว (502–504) จะรอนานขึ้นทีละเท่าแล้วลองใหม่
 
 เมื่อเครดิตของผู้ให้บริการ AI หมดระหว่างนำเข้า งานจะรออยู่ในคิว และทำต่อเองหลังเติมเครดิต ไม่ต้องรัน script ใหม่
 ดูสถานะการพักได้ที่ `services.provider_holds` ของ `GET /api/v1/system/dashboard`

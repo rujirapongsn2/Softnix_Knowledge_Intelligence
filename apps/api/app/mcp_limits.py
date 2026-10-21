@@ -2,7 +2,7 @@
 import math
 from collections import defaultdict
 from threading import Lock
-from time import monotonic, sleep, time
+from time import time
 
 import redis
 
@@ -19,6 +19,26 @@ class McpLimitExceeded(RuntimeError):
         return {"Retry-After": str(max(1, math.ceil(self.retry_after)))}
 
 
+# Checked and charged atomically; a refusal gives back what it took inside the script, so the give-back cannot
+# land after the window's key expired (that DECR would recreate it at -1 with no TTL and refuse the token forever).
+_ACQUIRE = """
+local rate = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], 60) end
+if rate > tonumber(ARGV[1]) then
+  redis.call('DECR', KEYS[1])
+  return {1, redis.call('TTL', KEYS[1])}
+end
+local active = redis.call('INCR', KEYS[2])
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+if active > tonumber(ARGV[2]) then
+  redis.call('DECR', KEYS[2])
+  redis.call('DECR', KEYS[1])
+  return {2, 1}
+end
+return {0, 0}
+"""
+
+
 class McpLimiter:
     def __init__(self):
         self._lock = Lock()
@@ -29,35 +49,17 @@ class McpLimiter:
         url = get_settings().redis_url
         return redis.Redis.from_url(url, socket_connect_timeout=1, socket_timeout=1) if url else None
 
-    def acquire(self, token, wait_seconds: float = 0) -> None:
-        """Take a slot of the token's budget, waiting up to ``wait_seconds`` for one to free up."""
-        deadline = monotonic() + wait_seconds
-        while True:
-            try:
-                return self._try_acquire(token)
-            except McpLimitExceeded as exc:
-                remaining = deadline - monotonic()
-                if exc.code == "MCP_LIMIT_STORE_UNAVAILABLE" or remaining <= 0:
-                    raise
-                sleep(min(remaining, max(0.2, exc.retry_after)))
-
-    def _try_acquire(self, token) -> None:
+    def acquire(self, token) -> None:
         key = token.id
         try:
             client = self._redis()
             if client:
-                rate_key, active_key = f"skip:mcp:rate:{key}", f"skip:mcp:active:{key}"
-                count = client.incr(rate_key)
-                if count == 1:
-                    client.expire(rate_key, 60)
-                if count > token.requests_per_minute:
-                    # A refused request does not use up the window it was refused in.
-                    client.decr(rate_key)
-                    raise McpLimitExceeded("MCP_RATE_LIMITED", "Token request rate limit exceeded", max(1, client.ttl(rate_key)))
-                active = client.incr(active_key)
-                client.expire(active_key, max(5, token.query_timeout_seconds + 5))
-                if active > token.max_concurrent_requests:
-                    client.decr(active_key)
+                refused, retry_after = client.eval(_ACQUIRE, 2, f"skip:mcp:rate:{key}", f"skip:mcp:active:{key}",
+                                                   token.requests_per_minute, token.max_concurrent_requests,
+                                                   max(5, token.query_timeout_seconds + 5))
+                if refused == 1:
+                    raise McpLimitExceeded("MCP_RATE_LIMITED", "Token request rate limit exceeded", max(1, retry_after))
+                if refused == 2:
                     raise McpLimitExceeded("MCP_CONCURRENCY_LIMITED", "Token concurrency limit exceeded")
                 return
         except redis.RedisError as exc:

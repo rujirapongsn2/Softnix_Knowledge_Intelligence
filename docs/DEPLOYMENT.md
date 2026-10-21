@@ -18,7 +18,8 @@ docker compose ps
 - `WEB_PORT` (ค่าเริ่มต้น 8081), `API_PORT` (ค่าเริ่มต้น 8001)
 - `EXT_OCR_KEY` หากต้องการ OCR PDF สแกน
 
-บริการหลักคือ `web`, `api`, `worker`, `migrate`, `postgres`, `redis`, `neo4j` และ `lightrag` โดยข้อมูลอยู่ใน named volumes (`files`, `postgres`, `redis`, `neo4j`, `lightrag`)
+บริการหลักคือ `web`, `api`, `worker` (3 replicas ปรับด้วย `WORKER_REPLICAS`), `migrate`, `postgres`, `redis`, `neo4j` และ `lightrag` โดยข้อมูลอยู่ใน named volumes (`files`, `postgres`, `redis`, `neo4j`, `lightrag`)
+คิวงานอยู่ใน PostgreSQL ส่วน Redis เก็บตัวนับ rate limit ของ token และ LightRAG เก็บข้อมูลใน PostgreSQL และ Neo4j
 
 ## Production
 
@@ -47,12 +48,14 @@ docker compose up -d --build api worker web
 ตรวจสถานะด้วย:
 
 ```bash
-curl http://localhost:8001/health
-curl http://localhost:8001/ready
-docker compose ps
+bash deploy/check_services.sh
 ```
 
-`/ready` ต้องเห็น database, Redis, Neo4j, LightRAG และ external OCR เป็น `ready` ตามบริการที่ตั้งค่าไว้
+script ตรวจว่า container ทุกตัวรันอยู่ และ `migrate` จบด้วย exit code 0 ตรวจ `/health`, `/ready` และ Web UI แล้วเรียก LLM, embedding server และ reranker (ถ้าเปิดไว้) จากใน container ของ api
+ความหมายของแต่ละข้อดูที่ [README](../README.md#5-ตรวจสถานะหลังติดตั้ง)
+
+`/ready` ต้องเห็น database, redis, neo4j, lightrag และ embeddings เป็น `ready` ส่วน ocr_chain จะตรวจเฉพาะเมื่อตั้ง `SOFTNIX_OCR_TOKEN` แล้ว
+ถ้า `SOFTNIX_OCR_*` ยังเป็นค่าตัวอย่างจาก `.env.example` `/ready` จะตอบ 503 และ api จะไม่ขึ้นเป็น healthy
 
 ## การเปลี่ยนแปลงที่มักต้องทำเพิ่ม
 

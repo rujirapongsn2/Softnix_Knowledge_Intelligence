@@ -45,7 +45,7 @@ openssl rand -hex 32   # รันหนึ่งครั้งต่อค่�
 |---|---|
 | `APP_SECRET_KEY`, `TOKEN_HASH_SECRET`, `LIGHTRAG_API_KEY` | ค่าสุ่มที่ไม่ซ้ำกัน |
 | `INITIAL_ADMIN_PASSWORD`, `NEO4J_PASSWORD` | รหัสผ่านใหม่ |
-| `LLM_API_KEY` | key ของผู้ให้บริการ LLM ถ้าไม่ได้ใช้ OpenRouter ให้แก้ `LLM_BASE_URL` และ `LLM_MODEL` ด้วย ดูตัวอย่างใน `.env.example` |
+| `LLM_API_KEY` | key ของผู้ให้บริการ LLM ถ้าไม่ได้ใช้ OpenRouter ให้แก้ `LLM_BASE_URL` และ `LLM_MODEL` ด้วย ตั้ง `LLM_ANSWER_MODEL` ถ้าต้องการให้คำตอบใช้โมเดลอื่น (ค่าว่างใช้ `LLM_MODEL`) ดูตัวอย่างใน `.env.example` |
 | `EMBEDDING_API_KEY` | key เดียวกับที่ใส่ใน `--api-key` ของขั้นที่ 2 |
 | `SOFTNIX_OCR_BASE_URL`, `SOFTNIX_OCR_TOKEN` | ถ้ายังไม่มี OCR server ให้ปล่อย `SOFTNIX_OCR_TOKEN=` ว่าง ค่าตัวอย่างใน `.env.example` ชี้ไปที่ host ที่ไม่มีอยู่จริง ถ้าปล่อยไว้ `/ready` จะตอบ 503 และ api จะไม่ขึ้นเป็น healthy |
 | `RERANKER_ENABLED`, `RERANK_*` | ตั้งเมื่อเปิด reranker แล้วเท่านั้น |
@@ -84,7 +84,7 @@ script ตรวจทุกอย่างที่ระบบต้องใ�
 | http | `GET /health` ตอบ 200 | api ยังไม่ขึ้น ดู `docker compose logs api` |
 | | `GET /ready` ตอบ `ready` ทุก dependency ได้แก่ database, redis, neo4j, lightrag, embeddings และ ocr_chain (ocr_chain ตรวจเมื่อตั้ง `SOFTNIX_OCR_TOKEN` แล้ว) embeddings อาจเป็น `slow` ระหว่างนำเข้าชุดใหญ่ ซึ่งไม่นับว่าล้ม | คำตอบ 503 ระบุชื่อ dependency ที่ใช้ไม่ได้ใน `details` |
 | | Web UI ตอบ 200 | `docker compose logs web` |
-| providers | LLM ตอบ และมีโมเดลตาม `LLM_MODEL` | ตรวจ `LLM_API_KEY`, `LLM_BASE_URL` และชื่อโมเดล |
+| providers | LLM ตอบ และมีโมเดลตาม `LLM_MODEL` (และ `LLM_ANSWER_MODEL` ถ้าตั้งไว้) | ตรวจ `LLM_API_KEY`, `LLM_BASE_URL` และชื่อโมเดล |
 | | embedding server สร้าง vector ได้ | ตรวจว่า `llama-server` ยังรันอยู่ และ `EMBEDDING_API_KEY` ตรงกับ `--api-key` |
 | | reranker เรียงผลได้ถูกต้อง (ตรวจเฉพาะเมื่อ `RERANKER_ENABLED=true`) | ดู [deploy/reranker-server](deploy/reranker-server/README.md) |
 | | เครดิต LLM คงเหลือ (เฉพาะ OpenRouter) ขึ้น `warn` เมื่อต่ำกว่า `LLM_CREDIT_WARNING_USD` (ค่าเริ่มต้น $20) | เติมเครดิตก่อนนำเข้าชุดใหญ่ ถ้าหมด งานจะรอในคิวแล้วทำต่อเอง |

@@ -45,6 +45,9 @@ try:
     llm = LLMClient().check()
     report(llm["llm_model_available"], f"llm {llm['llm_model']} ({llm['llm_dialect']})"
            + ("" if llm["llm_model_available"] else ": the provider does not list this model"))
+    if "llm_answer_model" in llm:
+        report(llm["llm_answer_model_available"], f"llm answers {llm['llm_answer_model']}"
+               + ("" if llm["llm_answer_model_available"] else ": the provider does not list this model"))
 except Exception as exc:
     report(False, f"llm: {exc}")
 

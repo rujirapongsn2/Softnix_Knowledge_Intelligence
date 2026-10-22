@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     lightrag_llm_model: str = ""
     # The status page warns when the LLM account has less than this many USD left (providers that report it).
     llm_credit_warning_usd: float = 20
+    # The model grounded answers are written with; empty means llm_model, which every other LLM call uses.
+    llm_answer_model: str = ""
     neo4j_http_url: str = ""
     neo4j_username: str = "neo4j"
     neo4j_password: str = ""

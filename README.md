@@ -231,6 +231,9 @@ script รันซ้ำได้ ไม่ส่งไฟล์ซ้ำ แ�
 - [Deployment](docs/DEPLOYMENT.md) — ตั้งค่า, migration, production และ reindex
 - [Embedding server](deploy/embedding-server/README.md) และ [Reranker server](deploy/reranker-server/README.md) — ติดตั้ง llama-server บนเครื่อง
 - [Bulk import](deploy/bulk-import/README.md) — นำเข้าเอกสารจำนวนมากพร้อมไฟล์อ้างอิง
+- `deploy/readiness_test.py` — ทดสอบความพร้อมก่อนนำเข้าชุดใหญ่ด้วยเอกสารจริง 3 ฉบับ ผ่านเส้นทางเดียวกับการนำเข้าจริง (`ADMIN_PASSWORD=... python3 deploy/readiness_test.py`)
+- `deploy/model-compare/` — เทียบผลสกัด metadata และข้อมูลกฎหมายของสองโมเดลบนเอกสารชุดเดียวกัน ก่อนเปลี่ยน `LLM_MODEL` (`run_eval.py` แล้ว `analyze.py`)
+- `deploy/metadata/apply_review_guardrails.py` — ให้เอกสารเดิมใช้กฎการตรวจแบบเดียวกับเอกสารใหม่ในฟิลด์เสี่ยง (รันแบบ dry run ก่อน `--apply`)
 - [LightRAG storage](deploy/lightrag-storage/README.md) — ย้าย storage ของ LightRAG และทดสอบนำเข้าเป็นขั้น
 - [API](docs/API.md) — endpoint และรูปแบบ query/filter
 - [Ingestion API](docs/INGEST_API.md) — ให้ระบบภายนอกนำเข้าเอกสารด้วย API token พร้อมตัวอย่างโค้ด

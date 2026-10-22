@@ -2,7 +2,7 @@
 import hashlib
 import json
 import re
-from datetime import date
+from datetime import date, timedelta
 
 from .document_templates import TEXT_LIST_MAX_ITEMS, metadata_search_text, validate_metadata_values
 from .legal_registry import gregorian_year, parse_thai_date
@@ -198,6 +198,8 @@ def _read_answer(field, answer, window):
                 value = written.isoformat()
             value = validate_metadata_values([{**field, "required": False}], {field["key"]: [value] if is_list else value})[field["key"]]
             value = value[0] if is_list else value
+            if field.get("field_type") == "date" and (value := _date_from_quote(value, quote)) is None:
+                raise ValueError("METADATA_DATE_NOT_IN_QUOTE")
             # JSON rejects NaN/Infinity even though Python floats accept them.
             json.dumps(value, allow_nan=False)
         except (ValueError, KeyError, TypeError):
@@ -242,7 +244,8 @@ def _evidence(window, start, quote):
 _THAI_MONTHS = {name: number for number, name in enumerate(
     ["มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
      "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"], start=1)}
-_THAI_DATE = re.compile(r"(?<!\d)(\d{1,2})\s*(" + "|".join(_THAI_MONTHS) + r")\s*(พ\s*\.?\s*ศ\s*\.?)?\s*(\d{4})(?!\d)")
+# "11 ตุลาคม พุทธศักราช 2475" and "26 เดือน พฤศจิกายน พ.ศ. 2544" are written too.
+_THAI_DATE = re.compile(r"(?<!\d)(\d{1,2})\s*(?:เดือน\s*)?(" + "|".join(_THAI_MONTHS) + r")\s*(พ\s*\.?\s*ศ\s*\.?|พุทธศักราช)?\s*(\d{4})(?!\d)")
 _THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 # A date field that names one particular date in a legal text: its quote must carry the phrase that introduces that date,
 # otherwise another date in the same sentence (the gazette date, say) could stand in for it.
@@ -290,10 +293,45 @@ def _anchored_date_in(value, quote, anchor):
     return False
 
 
+# Notes a consolidated text adds about what later laws did to this document, as in "ข้อ ๑ (๑) ยกเลิกโดย กฎกระทรวง ฉบับที่ ๔๙".
+# A value quoting one is about the other law, and models read its direction backwards (8 of the 30 values GPT-6 Luna
+# auto-accepted in the 2026-10-22 comparison were wrong, 7 of them this way), so such a value always waits for a person.
+CONSOLIDATION_NOTES = ("ยกเลิกโดย", "แก้ไขเพิ่มเติมโดย", "แก้ไขโดย", "(ยกเลิก)")
+# A date the quote does not write may still be computed from a clause it quotes ("ใช้บังคับตั้งแต่วันถัดจากวันประกาศ").
+RELATIVE_DATE_PHRASES = ("ถัดจากวัน", "นับแต่วัน", "นับจากวัน", "พ้นกำหนด", "วันถัดไป", "ตั้งแต่วันประกาศ", "เป็นต้นไป")
+
+
+def _date_from_quote(value, quote):
+    """The date an answer may keep, or None when the document does not support it, like a template's example date
+    copied into the answer. Kept: a date the quote writes, one computed from a relative clause it quotes, and the day
+    after a gazette date it writes (a Thai law takes effect the day after publication unless it says otherwise). A
+    pre-2484 January to March date a model converted with a plain minus 543 becomes the date the quote writes."""
+    text = _normalize_thai(quote)
+    written = {iso for iso, _, _ in _thai_date_matches(text)}
+    written |= {found.isoformat() for found in map(parse_thai_date, re.findall(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)", text)) if found}
+    if value in written or any(phrase in text for phrase in RELATIVE_DATE_PHRASES):
+        return value
+    if "ราชกิจจานุเบกษา" in text and any(date.fromisoformat(iso) + timedelta(days=1) == date.fromisoformat(value) for iso in written):
+        return value
+    for match in _THAI_DATE.finditer(text):
+        day, month, _, year = match.groups()
+        year, month = int(year), _THAI_MONTHS[month]
+        try:
+            if year <= 2483 and month <= 3 and date(year - 543, month, int(day)).isoformat() == value:
+                return date(gregorian_year(year, month), month, int(day)).isoformat()
+        except ValueError:
+            continue
+    return None
+
+
 def _auto_acceptable(field, candidate):
     """Only values that are literally their own quote pass without a person. A date passes when the quote writes exactly
-    that date (and its anchor phrase); a computed date never does. Numbers, booleans and graph facts need review."""
+    that date (and its anchor phrase); a computed date never does. Numbers, booleans and graph facts need review, and so
+    does any value quoting a consolidation note."""
     if field.get("review_policy", "evidence") != "evidence" or field.get("graph_relationship"):
+        return False
+    quotes = [e["quote"] for e in candidate.get("item_evidence") or [candidate["evidence"]]]
+    if any(note in _normalize_thai(quote) for quote in quotes for note in CONSOLIDATION_NOTES):
         return False
     kind, value = field.get("field_type", "text"), candidate["value"]
     if kind in {"text", "textarea", "select"}:

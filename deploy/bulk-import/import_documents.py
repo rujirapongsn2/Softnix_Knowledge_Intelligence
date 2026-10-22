@@ -61,9 +61,10 @@ class Api:
                     raise
                 time.sleep(min(60, 2 ** attempt))
 
-    def upload(self, path, field_files):
+    def upload(self, path, field_files, form=None):
         boundary = uuid.uuid4().hex
-        parts = []
+        parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+                 for name, value in (form or {}).items() if value]
         for field, file in field_files:
             kind = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
             parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{file.name}"\r\n'
@@ -102,7 +103,7 @@ def main():
     for start in range(0, len(todo), args.batch):
         batch = todo[start:start + args.batch]
         status, reply = api.upload(f"/api/v1/ingest/knowledge-bases/{args.kb}/documents/batch",
-                                   [("files", doc) for doc, _ in batch])
+                                   [("files", doc) for doc, _ in batch], {"document_type_id": args.document_type_id})
         if status != 202:
             sys.exit(f"batch upload failed: HTTP {status} {reply}")
         for (doc, ref), result in zip(batch, reply["results"]):
@@ -158,6 +159,8 @@ parser.add_argument("--api", default="http://127.0.0.1:8001")
 parser.add_argument("--kb", required=True)
 parser.add_argument("--dir", required=True)
 parser.add_argument("--batch", type=int, default=20)
+# The Knowledge Base's document type whose fields are extracted; without it documents are "general" and get no metadata.
+parser.add_argument("--document-type-id")
 parser.add_argument("--wait", action="store_true")
 parser.add_argument("--poll", type=int, default=30)
 args = parser.parse_args()

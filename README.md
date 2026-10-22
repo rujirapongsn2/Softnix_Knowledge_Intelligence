@@ -82,7 +82,7 @@ script ตรวจทุกอย่างที่ระบบต้องใ�
 |---|---|---|
 | containers | `api`, `worker`, `web`, `postgres`, `redis`, `neo4j` และ `lightrag` กำลังรัน และ `migrate` จบด้วย exit code 0 | `docker compose logs <service>` |
 | http | `GET /health` ตอบ 200 | api ยังไม่ขึ้น ดู `docker compose logs api` |
-| | `GET /ready` ตอบ `ready` ทุก dependency ได้แก่ database, redis, neo4j, lightrag, embeddings และ ocr_chain (ocr_chain ตรวจเมื่อตั้ง `SOFTNIX_OCR_TOKEN` แล้ว) embeddings อาจเป็น `slow` ระหว่างนำเข้าชุดใหญ่ ซึ่งไม่นับว่าล้ม | คำตอบ 503 ระบุชื่อ dependency ที่ใช้ไม่ได้ใน `details` |
+| | `GET /ready` ตอบ `ready` ทุก dependency ได้แก่ database, redis, neo4j, lightrag, embeddings และ ocr_chain (ocr_chain ตรวจเมื่อตั้ง `SOFTNIX_OCR_TOKEN` แล้ว) embeddings อาจเป็น `slow` ระหว่างนำเข้าชุดใหญ่ และ ocr_chain เป็น `degraded` เมื่อ Softnix OCR ล่มแต่ยังมี Tesseract หรือ Mistral อ่านเอกสารสแกนแทน ทั้งสองสถานะไม่นับว่าล้ม | คำตอบ 503 ระบุชื่อ dependency ที่ใช้ไม่ได้ใน `details` |
 | | Web UI ตอบ 200 | `docker compose logs web` |
 | providers | LLM ตอบ และมีโมเดลตาม `LLM_MODEL` (และ `LLM_ANSWER_MODEL` ถ้าตั้งไว้) | ตรวจ `LLM_API_KEY`, `LLM_BASE_URL` และชื่อโมเดล |
 | | embedding server สร้าง vector ได้ | ตรวจว่า `llama-server` ยังรันอยู่ และ `EMBEDDING_API_KEY` ตรงกับ `--api-key` |

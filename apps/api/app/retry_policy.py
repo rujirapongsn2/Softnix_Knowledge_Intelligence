@@ -36,11 +36,17 @@ PROVIDER_RETRY = RetryPolicy(6, exponential_delay(60, 900, floor=60))
 # The recovery sweep re-queues what is still failed after that.
 ENGINE_DOWN_RETRY = RetryPolicy(8, exponential_delay(30, 300))
 
+# LightRAG answers 409 to new work while it deletes documents, which takes minutes for a large one, and a
+# document sent meanwhile failed within 30 seconds on DEFAULT_RETRY: 15s doubling to 5 minutes, twelve attempts,
+# about 38 minutes in all. A retry that is refused again costs one request, and the worker serves other jobs between.
+ENGINE_BUSY_RETRY = RetryPolicy(12, exponential_delay(15, 300))
+
 PROCESSING_RETRY_POLICIES: dict[str, RetryPolicy] = {
     **dict.fromkeys((
-        "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_TIMEOUT",
+        "RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_TIMEOUT",
         "EXTERNAL_OCR_UNAVAILABLE", "EXTERNAL_OCR_TIMEOUT", "OCR_CHAIN_FAILED",
     ), DEFAULT_RETRY),
+    "RETRIEVAL_ENGINE_BUSY": ENGINE_BUSY_RETRY,
     **dict.fromkeys(("LLM_UNAVAILABLE", "EMBEDDING_UNAVAILABLE"), PROVIDER_RETRY),
     "RETRIEVAL_ENGINE_UNAVAILABLE": ENGINE_DOWN_RETRY,
 }

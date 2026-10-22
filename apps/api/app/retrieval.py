@@ -67,6 +67,14 @@ def classify_track_failure(error_detail: str | None) -> str:
     return "RETRIEVAL_ENGINE_REJECTED"
 
 
+# How LightRAG 1.5 words a /query/data "failure" that only means nothing matched (lightrag.py aquery_data, operate.py).
+_NO_RESULT_MESSAGES = {"Query returned no results", "No relevant document chunks found.", "Query returned empty dataset."}
+
+
+def _is_no_result(data: dict[str, Any]) -> bool:
+    return (data.get("metadata") or {}).get("failure_reason") == "no_results" or data.get("message") in _NO_RESULT_MESSAGES
+
+
 def duplicate_original_id(error: str | None) -> str | None:
     """Extract the LightRAG id of the record the duplicate collided with."""
     match = _DUPLICATE_ORIGINAL.search(error or "")
@@ -333,7 +341,9 @@ class LightRAGRetrievalEngine(RetrievalEngine):
     def query(self, query: str, knowledge_base_ids: list[str], limit: int) -> RetrievalEvidence:
         if len(knowledge_base_ids) != 1:
             raise RuntimeError("MULTI_KNOWLEDGE_BASE_ENGINE_QUERY_UNSUPPORTED")
-        data = self._request("POST", "/query", json={
+        # /query/data returns what LightRAG retrieved without having its LLM write an answer. /query wrote one on
+        # every call and this adapter discarded it: on dev that answer took about 10 of a fresh query's 14 seconds.
+        data = self._request("POST", "/query/data", json={
             "query": protect_query_text(query),
             "mode": "mix",
             "include_references": True,
@@ -341,30 +351,39 @@ class LightRAGRetrievalEngine(RetrievalEngine):
             "enable_rerank": self.reranker_enabled,
             "top_k": limit,
         })
+        if data.get("status") != "success":
+            # LightRAG answers "failure" with HTTP 200 both when nothing matched and when the query itself broke.
+            if _is_no_result(data):
+                return RetrievalEvidence([], [], [], [], None)
+            raise RetrievalEngineError("RETRIEVAL_ENGINE_REJECTED", f"/query/data {data.get('status')!r}: {str(data.get('message'))[:300]}")
+        retrieved = data.get("data") or {}
+        # Each reference is one source document; its chunks carry the reference_id, in LightRAG's order.
+        contents: dict[str, list[str]] = {}
+        for chunk in retrieved.get("chunks", []):
+            if chunk.get("reference_id") is not None:
+                contents.setdefault(str(chunk["reference_id"]), []).append(chunk.get("content") or "")
         sources: list[dict] = []
         requested_knowledge_base_id = knowledge_base_ids[0]
-        for index, reference in enumerate(data.get("references", [])[:limit], 1):
-            file_path = reference.get("file_path", "")
-            source_identity = self._decode_source_label(file_path)
+        for reference in retrieved.get("references", []):
+            source_identity = self._decode_source_label(reference.get("file_path", ""))
             # The configured development LightRAG server shares one index and
             # returns only the file_source basename in references. Release only
-            # evidence carrying the selected Knowledge Base's identity.
+            # evidence carrying the selected Knowledge Base's identity, filtered
+            # before the limit so other Knowledge Bases cannot crowd it out.
             if source_identity is None or source_identity[0] != requested_knowledge_base_id:
                 continue
             _, source_document_id, source_title = source_identity
-            content = reference.get("content", [])
-            if isinstance(content, list):
-                content = "\n\n".join(content)
+            reference_id = reference.get("reference_id")
             sources.append({
-                "citation_id": f"S{index}",
+                "citation_id": f"S{len(sources) + 1}",
                 "document_id": reference.get("metadata", {}).get("document_id", source_document_id),
                 "title": source_title or reference.get("file_name") or "LightRAG source",
-                "chunk_id": str(reference.get("reference_id", index)),
-                "excerpt": content or "",
+                "chunk_id": str(reference_id if reference_id is not None else len(sources) + 1),
+                "excerpt": "\n\n".join(contents.get(str(reference_id), [])) if reference_id is not None else "",
                 "relevance": reference.get("score", 0.0),
             })
-        # The current development LightRAG deployment has a shared index. Its
-        # generated response may synthesize content from references outside the
-        # selected KB, so only return identity-checked evidence. The platform
-        # generates the final answer from these scoped excerpts.
+            if len(sources) == limit:
+                break
+        # LightRAG shares one index across Knowledge Bases, so only identity-checked
+        # evidence is returned; the platform writes the answer from these excerpts.
         return RetrievalEvidence(sources, [], [], [], None)

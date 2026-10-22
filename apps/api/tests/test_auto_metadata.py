@@ -717,3 +717,25 @@ def test_a_buddhist_year_date_answer_is_stored_in_the_common_era():
     for answer in ("2558-01-22", "22 มกราคม 2558"):
         result = extract_date("signed_date", quote, (answer, quote))
         assert [c["value"] for c in result["candidates"]] == ["2015-01-22"], answer
+
+
+def test_a_value_quoting_a_consolidation_note_waits_for_a_person():
+    """GPT-6 Luna read "ยกเลิกโดย" backwards and auto-accepted the later law as the one this document cancels."""
+    quote = "# ข้อ 1 (1) ยกเลิกโดย กฎกระทรวง ฉบับที่ 49 (พ.ศ.2544)"
+    result = extract_candidates([field("cancel_law_by")], quote, extractor({"cancel_law_by": [{"value": "กฎกระทรวง ฉบับที่ 49 (พ.ศ.2544)", "evidence_quote": quote}]}))
+    assert result["cancel_law_by"]["status"] == "suggested"
+    plain = "ให้ยกเลิกกฎกระทรวง ฉบับที่ 31 (พ.ศ. 2530)"
+    result = extract_candidates([field("cancel_law_by")], plain, extractor({"cancel_law_by": [{"value": "กฎกระทรวง ฉบับที่ 31 (พ.ศ. 2530)", "evidence_quote": plain}]}))
+    assert result["cancel_law_by"]["status"] == "auto_accepted", "a document's own cancelling clause still passes"
+
+
+def test_a_date_its_quote_neither_writes_nor_computes_is_dropped():
+    """The template's example date 2026-09-15 came back as effective_date_end with an unrelated quote."""
+    text = "ข้อ 3 ให้ใช้บังคับตั้งแต่วันถัดจากวันประกาศในราชกิจจานุเบกษาเป็นต้นไป ข้อ 4 ให้อธิบดีรักษาการ"
+    result = extract_candidates([field("effective_date_end", field_type="date", required=False)], text,
+                                extractor({"effective_date_end": [{"value": "2026-09-15", "evidence_quote": "ข้อ 4 ให้อธิบดีรักษาการ"}]}))
+    assert result["effective_date_end"]["candidates"] == [] and result["effective_date_end"]["status"] == "invalid_evidence"
+    computed = extract_candidates([field("effective_date", field_type="date", required=False)], text,
+                                  extractor({"effective_date": [{"value": "2019-06-13", "evidence_quote": "ข้อ 3 ให้ใช้บังคับตั้งแต่วันถัดจากวันประกาศในราชกิจจานุเบกษาเป็นต้นไป"}]}))
+    assert [c["value"] for c in computed["effective_date"]["candidates"]] == ["2019-06-13"], "a date computed from a relative clause is kept"
+    assert computed["effective_date"]["status"] == "suggested", "and still waits for a person"

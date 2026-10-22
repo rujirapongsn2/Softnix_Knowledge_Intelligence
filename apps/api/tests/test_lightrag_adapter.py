@@ -2,7 +2,7 @@ import json
 
 import httpx
 
-from app.retrieval import LightRAGRetrievalEngine
+from app.retrieval import LightRAGRetrievalEngine, RetrievalEngineError
 
 
 def test_lightrag_adapter_ingests_and_maps_citations():
@@ -36,6 +36,39 @@ def test_lightrag_adapter_ingests_and_maps_citations():
     assert len(evidence.sources) == 1, "another Knowledge Base's reference is filtered out"
     assert evidence.sources[0]["excerpt"] == "Customer Portal is hosted on APP-01.\n\nAPP-01 runs in the primary data centre.", "a document's chunks are joined in order"
     assert requests[0].headers["X-API-Key"] == "key"
+
+
+def _query_engine(payload):
+    return LightRAGRetrievalEngine(base_url="http://lightrag.test", client=httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))))
+
+
+def test_lightrag_adapter_fills_the_limit_after_dropping_other_knowledge_bases():
+    foreign = [{"reference_id": str(i), "file_path": f"softnix-kb=other-kb__doc=other-{i}__Other"} for i in range(1, 6)]
+    own = [{"reference_id": str(i), "file_path": f"softnix-kb=kb-1__doc=doc-{i}__Own {i}"} for i in range(6, 9)]
+    evidence = _query_engine({"status": "success", "data": {
+        "chunks": [{"reference_id": "7", "content": "own seven"}, {"content": "chunk without a reference"}],
+        "references": foreign + own,
+    }}).query("question", ["kb-1"], 2)
+    assert [s["document_id"] for s in evidence.sources] == ["doc-6", "doc-7"], "foreign references ahead must not use up the limit"
+    assert [s["citation_id"] for s in evidence.sources] == ["S1", "S2"], "citations are numbered without gaps"
+    assert [s["excerpt"] for s in evidence.sources] == ["", "own seven"], "a chunk without a reference_id is not attached to anything"
+
+
+def test_lightrag_adapter_reads_no_result_as_no_evidence():
+    for payload in ({"status": "failure", "message": "Query returned no results", "data": {}, "metadata": {"failure_reason": "no_results"}},
+                    {"status": "failure", "message": "Query returned empty dataset.", "data": {"chunks": [], "references": []}}):
+        assert _query_engine(payload).query("question", ["kb-1"], 10).sources == []
+
+
+def test_lightrag_adapter_raises_when_the_query_itself_failed():
+    try:
+        _query_engine({"status": "failure", "message": "Missing tokenizer, cannot build LLM context.", "data": {}}).query("question", ["kb-1"], 10)
+    except RetrievalEngineError as exc:
+        assert exc.code == "RETRIEVAL_ENGINE_REJECTED"
+        assert "Missing tokenizer" in exc.detail
+    else:
+        raise AssertionError("a failed LightRAG query must not read as an empty result")
 
 
 def test_lightrag_adapter_reads_processing_track_status():

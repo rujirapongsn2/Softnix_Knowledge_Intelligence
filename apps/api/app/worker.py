@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 
 from .db import SessionLocal
@@ -12,11 +13,18 @@ from .services import process_next_graph_projection, process_next_job
 logger = logging.getLogger(__name__)
 
 
-def run_once(state: dict[str, float]) -> bool:
-    """One pass of the worker loop. Returns whether any job or event was processed."""
+def run_once() -> bool:
+    """One pass of the job loop. Returns whether any job or event was processed."""
     with SessionLocal() as db:
         processed_document = process_next_job(db)
         processed_graph = process_next_graph_projection(db)
+        return processed_document or processed_graph
+
+
+def run_maintenance(state: dict[str, float]) -> None:
+    """The periodic sweeps that are due. They run beside the job loop, not between jobs: one large document
+    can index for up to LIGHTRAG_PROCESSING_TIMEOUT_SECONDS, and with every worker on one nothing would sweep."""
+    with SessionLocal() as db:
         now = time.monotonic()
         if now - state["stale_sweep"] >= 60:
             state["stale_sweep"] = now
@@ -56,16 +64,25 @@ def run_once(state: dict[str, float]) -> bool:
             except Exception:  # a failed sweep must never stop document processing
                 db.rollback()
                 logger.exception("recovery sweep failed")
-        return processed_document or processed_graph
+
+
+def maintenance_loop() -> None:
+    state = {"retention": 0.0, "recovery": 0.0, "stale_sweep": 0.0, "provider_probe": 0.0}
+    while True:
+        try:
+            run_maintenance(state)
+        except Exception:
+            logger.exception("worker maintenance failed")
+        time.sleep(5)
 
 
 # Several worker replicas may run this loop: job claims are atomic
 # (job_queue.claim_next_job) and each periodic sweep runs in one process at a time.
 if __name__ == "__main__":
-    state = {"retention": 0.0, "recovery": 0.0, "stale_sweep": 0.0, "provider_probe": 0.0}
+    threading.Thread(target=maintenance_loop, name="worker-maintenance", daemon=True).start()
     while True:
         try:
-            processed = run_once(state)
+            processed = run_once()
         except Exception:
             # Database restarts, network blips and unexpected bugs must not end the
             # process; a job left running is recovered by the stale-job sweep.

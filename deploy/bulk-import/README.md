@@ -22,8 +22,11 @@ corpus/
 
 ```sh
 INGEST_TOKEN=<token> python3 deploy/bulk-import/import_documents.py \
-  --api http://127.0.0.1:8001 --kb <KB_ID> --dir corpus --wait
+  --api http://127.0.0.1:8001 --kb <KB_ID> --dir corpus --document-type-id <DOCUMENT_TYPE_ID> --wait
 ```
+
+`--document-type-id` คือประเภทเอกสารของ KB ที่กำหนดฟิลด์ให้ระบบสกัด ดู id ได้จาก `GET /api/v1/ingest/knowledge-bases/<KB_ID>/document-types`
+ถ้าไม่ใส่ เอกสารจะเป็นประเภท general และระบบจะไม่สกัด metadata
 
 script ทำงานตามลำดับนี้:
 

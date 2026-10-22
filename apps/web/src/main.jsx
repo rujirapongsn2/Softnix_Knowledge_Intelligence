@@ -826,6 +826,8 @@ function SystemStatusView() {
   const services = data?.services?.dependencies || {};
   const failures = data?.services?.failures || {};
   const isAllReady = data?.status === "ready";
+  const credits = data?.services?.llm_credits;
+  const holds = data?.services?.provider_holds || [];
 
   // Service cards are derived from what the backend actually probed, so a new
   // dependency appears automatically and an unconfigured one (absent from both
@@ -856,6 +858,14 @@ function SystemStatusView() {
 
     {error && <p className="inline-error access-error" role="alert">{error}</p>}
 
+    {(credits || holds.length > 0) && <section className="content-section">
+      <div className="section-title"><div><h2>{t("systemStatus.providersTitle")}</h2></div></div>
+      {holds.map(hold => <p key={hold.provider} className="inline-error" role="alert">{t("systemStatus.providerHeld", {provider: hold.provider, code: hold.reason_code, since: new Date(hold.held_since).toLocaleString()})}</p>)}
+      {credits && <p className={credits.low ? "inline-error" : "section-copy"} role={credits.low ? "alert" : undefined}>
+        {t(credits.low ? "systemStatus.creditsLow" : "systemStatus.creditsLeft", {amount: credits.remaining_usd.toFixed(2), threshold: credits.warning_below_usd})}
+      </p>}
+    </section>}
+
     <section className="content-section">
       <div className="section-title">
         <div>
@@ -871,9 +881,10 @@ function SystemStatusView() {
       <div className="service-status-grid">
         {serviceKeys.map(key => {
           const name = serviceLabels[key] || key;
-          // "ready" | "not_configured" (an optional service left unset, not a failure) | "unavailable"
+          // "ready" | "slow" (answering, but behind under load) | "not_configured" (an optional service left unset, not a failure) | "unavailable"
           const state = failures[key] ? "unavailable" : services[key];
           const look = state === "ready" ? {dot: "ready", text: t("systemStatus.serviceReady"), badge: t("systemStatus.up"), variant: "success"}
+            : state === "slow" ? {dot: "warning", text: t("systemStatus.serviceSlow"), badge: t("systemStatus.slow"), variant: "warning"}
             : state === "not_configured" ? {dot: "warning", text: t("systemStatus.serviceNotConfigured"), badge: t("systemStatus.notConfigured"), variant: "warning"}
             : {dot: "unavailable", text: t("systemStatus.serviceUnavailable"), badge: t("systemStatus.down"), variant: "error"};
           return (

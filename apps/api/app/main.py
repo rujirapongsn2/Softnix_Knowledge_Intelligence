@@ -4,6 +4,7 @@ from typing import Any
 import hashlib
 import json
 import re
+import threading
 import time
 import unicodedata
 import uuid
@@ -141,6 +142,59 @@ _PROBE_CACHE: dict[str, tuple[float, tuple[dict, dict]]] = {}
 _PROBE_CACHE_TTL_SECONDS = 6.0
 
 
+class _EmbeddingProbe:
+    """The embedding server is probed in a thread with a long timeout; readiness waits only WAIT_SECONDS for it.
+
+    During a bulk import the server answered in 7 s with all its slots busy, and a 3 s probe reported it down.
+    A probe still running past WAIT_SECONDS, or one that answered slowly, is "slow" when the server answered
+    last time; one that never answered, or failed, is "unavailable". Results are kept per server URL.
+    """
+    WAIT_SECONDS, TIMEOUT_SECONDS = 3, 30
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running: dict[str, threading.Thread] = {}
+        self._last: dict[str, str] = {}
+
+    def _run(self, url: str) -> None:
+        started = _time.monotonic()
+        answered = EmbeddingClient(timeout=self.TIMEOUT_SECONDS).check()["embedding_model_available"]
+        state = "unavailable" if not answered else "slow" if _time.monotonic() - started > self.WAIT_SECONDS else "ready"
+        with self._lock:
+            self._last[url] = state
+
+    def state(self, url: str) -> str:
+        with self._lock:
+            probe = self._running.get(url)
+            if probe is None or not probe.is_alive():
+                probe = self._running[url] = threading.Thread(target=self._run, args=(url,), name="embedding-probe", daemon=True)
+                probe.start()
+        probe.join(self.WAIT_SECONDS)
+        with self._lock:
+            last = self._last.get(url)
+        if probe.is_alive():
+            return "slow" if last in ("ready", "slow") else "unavailable"
+        return last or "unavailable"
+
+
+_EMBEDDING_PROBE = _EmbeddingProbe()
+
+# The credit balance is asked for at most once a minute (10 s after a failed ask); the status page refreshes
+# every 10 s, and the lock keeps simultaneous refreshes from asking the provider together.
+_CREDITS_CACHE: dict[str, tuple[float, float | None]] = {}
+_CREDITS_LOCK = threading.Lock()
+
+
+def llm_credits_view() -> dict | None:
+    """Credits left on the LLM key and whether that is below LLM_CREDIT_WARNING_USD; None when not reported."""
+    with _CREDITS_LOCK:
+        now, cached = _time.monotonic(), _CREDITS_CACHE.get("llm")
+        if cached is None or now - cached[0] >= (60 if cached[1] is not None else 10):
+            cached = _CREDITS_CACHE["llm"] = (now, LLMClient().credits_remaining())
+    remaining, warning = cached[1], get_settings().llm_credit_warning_usd
+    return None if remaining is None else {"remaining_usd": remaining, "warning_below_usd": warning, "low": remaining < warning}
+
+
 def _probe_dependencies(db: Session) -> tuple[dict, dict]:
     """Probe every backend dependency; return (ready, failed) service maps.
 
@@ -183,9 +237,9 @@ def _probe_dependencies(db: Session) -> tuple[dict, dict]:
         except (httpx.HTTPError, OSError):
             failures["ocr_chain"] = "unavailable"
     if settings.embedding_base_url.strip():
-        # A short timeout of its own: a slow embedding server must not hold up readiness for the client's full 30s.
-        if EmbeddingClient(timeout=3).check()["embedding_model_available"]: dependencies["embeddings"] = "ready"
-        else: failures["embeddings"] = "unavailable"
+        state = _EMBEDDING_PROBE.state(settings.embedding_base_url.strip())
+        if state == "unavailable": failures["embeddings"] = state
+        else: dependencies["embeddings"] = state
     else:
         dependencies["embeddings"] = "not_configured"
     _PROBE_CACHE["result"] = (now, (dependencies, failures))
@@ -311,6 +365,7 @@ def system_dashboard(user: User = Depends(require_manager), db: Session = Depend
             "failures": failures,
             # Providers whose credits or key stopped serving jobs; their jobs wait and resume on their own.
             "provider_holds": hold_view(db),
+            "llm_credits": llm_credits_view(),
         },
         "ingest_metrics": {
             "total_documents": total_docs,

@@ -327,6 +327,29 @@ def test_system_status_probes_a_configured_embedding_endpoint(embedding_env):
     assert response.json()["error"]["details"]["embeddings"] == "unavailable"
 
 
+def test_a_busy_embedding_server_is_slow_not_down(embedding_env):
+    """With every slot busy the server answered in 7 s during an import; readiness must not report it down."""
+    import threading
+    import time
+
+    gate = threading.Event()
+
+    def busy(_self, texts, _purpose):
+        gate.wait(5)
+        return [[0.0] * 3 for _ in texts]
+
+    embedding_env.setattr(main_module._EmbeddingProbe, "WAIT_SECONDS", 0.2)
+    embedding_env.setattr(EmbeddingClient, "embed_texts", lambda _self, texts, _purpose: [[0.0] * 3 for _ in texts])
+    with TestClient(app) as client:
+        assert _system_status(client).json()["dependencies"]["embeddings"] == "ready"
+        embedding_env.setattr(EmbeddingClient, "embed_texts", busy)
+        response = _system_status(client)
+        assert response.status_code == 200 and response.json()["dependencies"]["embeddings"] == "slow"
+        gate.set()
+        time.sleep(0.3)
+        assert _system_status(client).json()["dependencies"]["embeddings"] == "ready"
+
+
 def test_a_reindex_waiting_to_retry_keeps_its_document_searchable(embedding_env):
     def unavailable(_self, _texts, _purpose):
         raise RuntimeError("EMBEDDING_UNAVAILABLE")

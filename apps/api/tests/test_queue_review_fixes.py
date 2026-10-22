@@ -346,3 +346,84 @@ def test_failed_job_rolls_back_a_broken_session(monkeypatch):
         assert services.process_next_job(db) is True
         db.expire_all()
         assert db.get(ProcessingJob, job.id).status == "failed"
+
+
+def test_a_worker_being_stopped_hands_its_job_back_at_once(monkeypatch):
+    """docker stop: the job is re-queued now, keeps its attempt and is not counted as a lost worker."""
+    with SessionLocal() as db:
+        _job(db, _doc(db, _kb(db)))
+    stopped = {}
+
+    def stopped_mid_job(db, claimed):
+        stopped.update(job_id=claimed.id, document_id=claimed.document_id, attempts=claimed.attempt_count)
+        claimed.status, claimed.attempt_count = "running", claimed.attempt_count + 1
+        db.commit()
+        worker.stop_on_sigterm(None, None)
+
+    monkeypatch.setattr(services, "_run_claimed_job", stopped_mid_job)
+    with SessionLocal() as db, pytest.raises(SystemExit):
+        services.process_next_job(db)
+    with SessionLocal() as db:
+        job = db.get(ProcessingJob, stopped["job_id"])
+        assert (job.status, job.error_code, job.lost_count or 0) == ("queued", "WORKER_STOPPED", 0)
+        assert job.attempt_count == stopped["attempts"], "the interrupted attempt is given back"
+        assert job.next_attempt_at <= datetime.utcnow(), "runnable at once, not after the stale-job timeout"
+        assert db.get(Document, stopped["document_id"]).status == "queued"
+
+
+def _claim_only(job_id):
+    """Claim this test's job, as claim_next_job would, so other tests' queued jobs are left alone."""
+    def claim(db):
+        job = db.get(ProcessingJob, job_id)
+        job.status, job.claim_token = "running", uuid.uuid4().hex
+        db.commit()
+        return job
+    return claim
+
+
+def test_a_stop_leaves_the_attempts_as_claimed_and_cancels_a_deleted_documents_job(monkeypatch):
+    with SessionLocal() as db:
+        doc = _doc(db, _kb(db)); job = _job(db, doc)
+        job.attempt_count = 2; db.commit()
+        job_id, doc_id = job.id, doc.id
+
+    def deleted_then_stopped(_db, _claimed):
+        with SessionLocal() as other:
+            other.get(Document, doc_id).deleted_at = datetime.utcnow(); other.commit()
+        worker.stop_on_sigterm(None, None)
+
+    monkeypatch.setattr(services, "_run_claimed_job", deleted_then_stopped)
+    monkeypatch.setattr(services, "claim_next_job", _claim_only(job_id))
+    with SessionLocal() as db, pytest.raises(SystemExit):
+        services.process_next_job(db)
+    with SessionLocal() as db:
+        job = db.get(ProcessingJob, job_id)
+        assert (job.status, job.error_code, job.attempt_count) == ("cancelled", "DOCUMENT_DELETED", 2)
+
+
+def test_a_stop_gives_back_only_the_attempt_it_interrupted(monkeypatch):
+    """A job type that counts attempts only on failure (a purge) keeps its earlier attempts."""
+    with SessionLocal() as db:
+        job = _job(db, _doc(db, _kb(db)))
+        job.attempt_count = 2; db.commit()
+        job_id = job.id
+    monkeypatch.setattr(services, "_run_claimed_job", lambda _db, _claimed: worker.stop_on_sigterm(None, None))
+    monkeypatch.setattr(services, "claim_next_job", _claim_only(job_id))
+    with SessionLocal() as db, pytest.raises(SystemExit):
+        services.process_next_job(db)
+    with SessionLocal() as db:
+        assert (db.get(ProcessingJob, job_id).status, db.get(ProcessingJob, job_id).attempt_count) == ("queued", 2)
+
+
+def test_the_worker_still_stops_when_the_hand_back_fails(monkeypatch):
+    with SessionLocal() as db:
+        job_id = _job(db, _doc(db, _kb(db))).id
+
+    def database_gone(*_args):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(services, "_run_claimed_job", lambda _db, _claimed: worker.stop_on_sigterm(None, None))
+    monkeypatch.setattr(services, "claim_next_job", _claim_only(job_id))
+    monkeypatch.setattr(services, "hand_back", database_gone)
+    with SessionLocal() as db, pytest.raises(SystemExit):
+        services.process_next_job(db)

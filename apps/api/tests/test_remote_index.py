@@ -65,6 +65,9 @@ class FakeEngine:
     def track_status(self, track_id):
         return self.tracks.pop(0)
 
+    def pipeline_progress(self):
+        return None
+
 
 def row(remote_id, document_id, status="processed", title="Ghost"):
     return {"id": remote_id, "status": status, "knowledge_base_id": "kb-1", "document_id": document_id, "title": title}

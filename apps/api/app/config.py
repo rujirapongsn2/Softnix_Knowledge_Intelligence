@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     lightrag_base_url: str = ""
     lightrag_api_key: str = ""
     lightrag_timeout_seconds: int = 120
+    # How long LightRAG's pipeline may report no progress before a document waiting on it times out.
     lightrag_processing_timeout_seconds: int = 900
     # Queue health: a running job refreshes updated_at every job_heartbeat_seconds; one not refreshed for
     # job_stale_after_seconds lost its worker and is re-queued by the stale-job sweep.
@@ -43,6 +44,8 @@ class Settings(BaseSettings):
     lightrag_workspace_prefix: str = "skip-"
     # The model LightRAG extracts the graph with (compose passes it to LightRAG); empty means llm_model.
     lightrag_llm_model: str = ""
+    # The status page warns when the LLM account has less than this many USD left (providers that report it).
+    llm_credit_warning_usd: float = 20
     neo4j_http_url: str = ""
     neo4j_username: str = "neo4j"
     neo4j_password: str = ""

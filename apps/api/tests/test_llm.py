@@ -443,7 +443,9 @@ def test_answers_use_llm_answer_model_and_fall_back_to_llm_model(monkeypatch):
 
 
 def test_extraction_keeps_llm_model_when_an_answer_model_is_set(monkeypatch):
-    extract = lambda client: client.extract_document_metadata([{"key": "issuer"}], "text")
+    def extract(client):
+        return client.extract_document_metadata([{"key": "issuer"}], "text")
+
     assert _requested_models(monkeypatch, "anthropic/claude-sonnet-5.5", extract) == ["openai/gpt-6-luna"]
 
 

@@ -309,3 +309,31 @@ def test_an_answer_model_outage_does_not_hold_jobs(monkeypatch):
     assert provider_holds._probe_llm() is None
     assert asked == ["openai/gpt-6-luna"]
     provider_holds.get_settings.cache_clear()
+
+
+def test_a_document_sent_while_lightrag_deletes_waits_instead_of_failing(monkeypatch):
+    """LightRAG answers 409 for as long as a large delete runs; the document failed within 30 seconds."""
+    monkeypatch.setattr(services, "extract_text", lambda _doc: "body text")
+    monkeypatch.setattr(services, "embed_document_chunks", lambda _db, _document_id: None)
+    monkeypatch.setattr(services.LightRAGRetrievalEngine, "enabled", property(lambda _self: True))
+
+    def busy(*_args, **_kwargs):
+        raise services.RetrievalEngineError("RETRIEVAL_ENGINE_BUSY", "HTTP 409: Pipeline is clearing or deleting documents.")
+    monkeypatch.setattr(services, "index_in_engine", busy)
+    with SessionLocal() as db:
+        doc = _doc(db)
+        job = _job(db, doc)
+        waits = []
+        for attempt in range(1, 12):
+            assert services.process_next_job(db) is True
+            db.expire_all()
+            job = db.get(ProcessingJob, job.id)
+            assert (job.status, job.current_stage, job.attempt_count) == ("queued", "retry_wait", attempt), f"attempt {attempt}"
+            assert db.get(Document, doc.id).status == "queued"
+            waits.append(round((job.next_attempt_at - datetime.utcnow()).total_seconds()))
+            job.next_attempt_at = datetime.utcnow() - timedelta(seconds=1)
+            db.commit()
+        assert waits[0] <= 15 and max(waits) <= 300 and waits[-1] > 240, f"backoff doubles to 5 minutes: {waits}"
+        assert services.process_next_job(db) is True
+        db.expire_all()
+        assert (db.get(ProcessingJob, job.id).status, db.get(Document, doc.id).status) == ("failed", "failed"), "it gives up after twelve attempts"

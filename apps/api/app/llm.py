@@ -91,6 +91,9 @@ def provider_error_code(exc: Exception) -> str:
     return "LLM_UNAVAILABLE"
 
 
+# The output budget of a metadata extraction, the largest request the app sends.
+METADATA_MAX_TOKENS = 16000
+
 class LLMClient:
     def __init__(self, client: httpx.Client | None = None):
         self.settings = get_settings()
@@ -210,7 +213,7 @@ class LLMClient:
             response = client.post(
                 f"{self.settings.llm_base_url.rstrip('/')}/chat/completions",
                 headers=self._headers(),
-                json={**self._llm(max_tokens=16000),
+                json={**self._llm(max_tokens=METADATA_MAX_TOKENS),
                       "response_format": {"type": "json_object"},
                       "messages": [
                           {"role": "system", "content": (
@@ -386,16 +389,19 @@ class LLMClient:
                 client.close()
 
     def probe(self, model: str | None = None) -> str | None:
-        """Ask for a few tokens: None when the provider serves the model again, else the failure code.
+        """Ask for a one-word answer: None when the provider serves the model again, else the failure code.
 
-        A request the provider rejects for its own content still shows that credits and key work.
+        A request the provider rejects for its own content still shows that credits and key work. The request
+        allows as many tokens as the largest real one: OpenRouter refuses with 402 any request whose max_tokens
+        the balance cannot cover, so with a few cents left a 16-token probe passes while every metadata
+        extraction is refused, and held jobs would resume only to be held again.
         """
         if not self.llm_enabled:
             return "LLM_API_KEY_NOT_CONFIGURED"
         client = self._client or httpx.Client(timeout=10)
         try:
             response = client.post(f"{self.settings.llm_base_url.rstrip('/')}/chat/completions", headers=self._headers(),
-                                   json={**self._llm(max_tokens=16, model=model), "messages": [{"role": "user", "content": "ping"}]})
+                                   json={**self._llm(max_tokens=METADATA_MAX_TOKENS, model=model), "messages": [{"role": "user", "content": "ping"}]})
             response.raise_for_status()
             return None
         except httpx.HTTPError as exc:

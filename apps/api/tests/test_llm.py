@@ -375,3 +375,21 @@ def test_a_tei_reranker_without_its_own_url_is_off_instead_of_calling_the_llm(mo
     get_settings.cache_clear()
     assert not LLMClient().reranker_enabled
     get_settings.cache_clear()
+
+
+def test_the_hold_probe_fails_while_the_balance_cannot_cover_a_real_request(monkeypatch):
+    """OpenRouter refuses any request whose max_tokens the balance cannot cover; a few cents pass a tiny probe."""
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    get_settings.cache_clear()
+    affordable = {"tokens": 731}
+
+    def handler(request: httpx.Request):
+        if json.loads(request.content)["max_tokens"] > affordable["tokens"]:
+            return httpx.Response(402, json={"error": {"message": "This request requires more credits, or fewer max_tokens."}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "pong"}}]})
+
+    client = LLMClient(httpx.Client(transport=httpx.MockTransport(handler)))
+    assert client.probe() == "LLM_CREDITS_EXHAUSTED", "a balance below a metadata extraction keeps the hold"
+    affordable["tokens"] = 100_000
+    assert client.probe() is None
+    get_settings.cache_clear()

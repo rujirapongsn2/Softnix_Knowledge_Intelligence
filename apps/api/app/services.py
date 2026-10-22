@@ -2604,6 +2604,8 @@ def _ingest_after_own_attempt(engine: LightRAGRetrievalEngine, doc: Document, te
     An attempt that stopped while the provider was out of credits can leave LightRAG still processing the
     document, and LightRAG answers the next insert with 409. engine.ingest already reuses a finished record
     and replaces a failed one; a pending or processing one is waited for here, then ingest is asked again.
+    A failed one is waited for too when LightRAG refuses to delete it while its pipeline is busy with other
+    documents, which lasts as long as a large document indexes; LightRAG may also pick the record up again.
     """
     deadline = time.monotonic() + get_settings().lightrag_processing_timeout_seconds
     while True:
@@ -2614,7 +2616,7 @@ def _ingest_after_own_attempt(engine: LightRAGRetrievalEngine, doc: Document, te
                 raise
             record = engine.find_document(doc.id, doc.knowledge_base_id)
             status = str((record or {}).get("status") or "")
-            if status not in IN_FLIGHT_STATUSES:
+            if status not in IN_FLIGHT_STATUSES | {"failed"}:
                 raise
             if time.monotonic() >= deadline:
                 raise RetrievalEngineError("RETRIEVAL_ENGINE_TIMEOUT", f"An earlier attempt of this document is still {status} in the retrieval engine.") from exc

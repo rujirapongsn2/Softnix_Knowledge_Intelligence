@@ -291,3 +291,21 @@ def test_the_llm_probe_also_asks_the_model_lightrag_extracts_with(monkeypatch):
     assert provider_holds._probe_llm() == "LLM_CREDITS_EXHAUSTED"
     assert asked == ["anthropic/claude-sonnet-5.5", "openai/gpt-4o-mini"]
     provider_holds.get_settings.cache_clear()
+
+
+def test_an_answer_model_outage_does_not_hold_jobs(monkeypatch):
+    # Held jobs extract with LLM_MODEL; answers are synchronous and never wait on a hold.
+    asked = []
+
+    class Client:
+        def probe(self, model=None):
+            asked.append(model)
+            return "LLM_CREDITS_EXHAUSTED" if model == "anthropic/claude-sonnet-5.5" else None
+    monkeypatch.setattr(provider_holds, "LLMClient", Client)
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-6-luna")
+    monkeypatch.delenv("LIGHTRAG_LLM_MODEL", raising=False)
+    monkeypatch.setenv("LLM_ANSWER_MODEL", "anthropic/claude-sonnet-5.5")
+    provider_holds.get_settings.cache_clear()
+    assert provider_holds._probe_llm() is None
+    assert asked == ["openai/gpt-6-luna"]
+    provider_holds.get_settings.cache_clear()

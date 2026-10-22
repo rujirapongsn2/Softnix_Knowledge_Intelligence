@@ -413,4 +413,53 @@ def test_credits_remaining_reads_openrouter_and_is_none_elsewhere(monkeypatch):
     monkeypatch.setenv("LLM_BASE_URL", "http://vllm.local:8000/v1")
     get_settings.cache_clear()
     assert LLMClient().credits_remaining() is None, "a provider that reports no balance is not asked"
+
+def _requested_models(monkeypatch, answer_model: str | None, call) -> list[str]:
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-6-luna")
+    if answer_model is None:
+        monkeypatch.delenv("LLM_ANSWER_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("LLM_ANSWER_MODEL", answer_model)
+    get_settings.cache_clear()
+    models = []
+
+    def handler(request: httpx.Request):
+        models.append(json.loads(request.content)["model"])
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"fields": {}}'}}]})
+
+    call(LLMClient(httpx.Client(transport=httpx.MockTransport(handler))))
+    get_settings.cache_clear()
+    return models
+
+
+def _answer(client):
+    client.answer_from_sources("q", [{"citation_id": "S1", "title": "Doc", "excerpt": "fact"}])
+
+
+def test_answers_use_llm_answer_model_and_fall_back_to_llm_model(monkeypatch):
+    assert _requested_models(monkeypatch, "anthropic/claude-sonnet-5.5", _answer) == ["anthropic/claude-sonnet-5.5"]
+    assert _requested_models(monkeypatch, None, _answer) == ["openai/gpt-6-luna"]
+
+
+def test_extraction_keeps_llm_model_when_an_answer_model_is_set(monkeypatch):
+    extract = lambda client: client.extract_document_metadata([{"key": "issuer"}], "text")
+    assert _requested_models(monkeypatch, "anthropic/claude-sonnet-5.5", extract) == ["openai/gpt-6-luna"]
+
+
+def test_llm_check_reports_the_answer_model_when_it_differs(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-6-luna")
+    monkeypatch.setenv("LLM_ANSWER_MODEL", "anthropic/claude-sonnet-5.5")
+    get_settings.cache_clear()
+    listed = [{"id": "openai/gpt-6-luna"}]
+    http = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={"data": listed})))
+    client = LLMClient(http)
+    report = client.check()
+    assert (report["llm_answer_model"], report["llm_answer_model_available"]) == ("anthropic/claude-sonnet-5.5", False)
+    listed.append({"id": "anthropic/claude-sonnet-5.5"})
+    assert client.check()["llm_answer_model_available"] is True
+    monkeypatch.setenv("LLM_ANSWER_MODEL", "openai/gpt-6-luna")
+    get_settings.cache_clear()
+    assert "llm_answer_model" not in LLMClient(http).check()
     get_settings.cache_clear()

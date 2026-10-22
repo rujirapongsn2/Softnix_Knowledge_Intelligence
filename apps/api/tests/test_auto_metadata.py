@@ -526,7 +526,8 @@ def extract_date(key, text, *answers):
     ("signed_date", GAZETTE, "2015-01-22", "suggested"),
     ("issued_date", GAZETTE, "2015-01-22", "auto_accepted"),
     ("effective_date", COMPUTED, "2008-06-05", "suggested"),
-    ("signed_date", "ให้ไว้ ณ วันที่ ๒๐ กันยายน พ.ศ. ๒๕๓๔", "2534-09-20", "suggested"),
+    # A Buddhist-year ISO answer is read as the Common Era date, which this quote writes.
+    ("signed_date", "ให้ไว้ ณ วันที่ ๒๐ กันยายน พ.ศ. ๒๕๓๔", "2534-09-20", "auto_accepted"),
 ])
 def test_a_date_is_accepted_only_when_its_quote_writes_that_date_and_the_fields_anchor(key, quote, value, status):
     assert extract_date(key, quote, (value, quote))["status"] == status
@@ -675,3 +676,10 @@ def test_an_unusable_reply_to_the_per_field_retry_keeps_the_first_answers():
     result = extract_candidates([field(), field("signer")], text, SimpleNamespace(extract_document_metadata=extract))
     assert [c["value"] for c in result["issuer"]["candidates"]] == ["กรมที่ดิน"]
     assert result["signer"]["candidates"] == []
+
+
+def test_a_buddhist_year_date_answer_is_stored_in_the_common_era():
+    quote = "ให้ไว้ ณ วันที่ ๒๒ มกราคม พ.ศ. ๒๕๕๘"
+    for answer in ("2558-01-22", "22 มกราคม 2558"):
+        result = extract_date("signed_date", quote, (answer, quote))
+        assert [c["value"] for c in result["candidates"]] == ["2015-01-22"], answer

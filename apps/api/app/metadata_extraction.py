@@ -5,6 +5,7 @@ import re
 from datetime import date
 
 from .document_templates import TEXT_LIST_MAX_ITEMS, metadata_search_text, validate_metadata_values
+from .legal_registry import gregorian_year, parse_thai_date
 from .models import Document, JobType, ProcessingJob
 from .llm import LLMClient
 from .provider_holds import provider_of, wait_for_provider
@@ -112,7 +113,7 @@ def _comparable_date(value):
     if (match := re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)):
         year, month, day = (int(part) for part in match.groups())
         try:
-            return date(year - 543 if year > 2400 else year, month, day).isoformat()
+            return date(gregorian_year(year, month), month, day).isoformat()
         except ValueError:
             return _comparable(value)
     written = thai_dates_in(text)
@@ -186,7 +187,11 @@ def _read_answer(field, answer, window):
         try:
             # A list field's answer is one item per object; the item is validated as a one-item list.
             is_list = field.get("field_type") == "text_list"
-            value = validate_metadata_values([{**field, "required": False}], {field["key"]: [candidate.get("value")] if is_list else candidate.get("value")})[field["key"]]
+            value = candidate.get("value")
+            if field.get("field_type") == "date" and isinstance(value, str) and (written := parse_thai_date(value)):
+                # Models answer with the Buddhist year in ISO form ("2558-01-22") or in Thai; the field holds the Common Era date.
+                value = written.isoformat()
+            value = validate_metadata_values([{**field, "required": False}], {field["key"]: [value] if is_list else value})[field["key"]]
             value = value[0] if is_list else value
             # JSON rejects NaN/Infinity even though Python floats accept them.
             json.dumps(value, allow_nan=False)
@@ -253,12 +258,10 @@ def _thai_date_matches(text):
     for match in _THAI_DATE.finditer(text):
         day, month, era, year = match.groups()
         year = int(year)
-        if year > 2400:
-            year -= 543
-        elif era:
+        if year <= 2400 and era:
             continue
         try:
-            matches.append((date(year, _THAI_MONTHS[month], int(day)).isoformat(), match.start(), match.end()))
+            matches.append((date(gregorian_year(year, _THAI_MONTHS[month]), _THAI_MONTHS[month], int(day)).isoformat(), match.start(), match.end()))
         except ValueError:
             continue
     return matches

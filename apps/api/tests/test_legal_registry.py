@@ -476,3 +476,16 @@ def test_update_legal_instrument_rejects_an_invalid_kind():
         instrument_id = instrument.id
     response = test_client.patch(f"/api/v1/legal-instruments/{instrument_id}", json={"kind": "not-a-real-kind"})
     assert response.status_code == 422
+
+
+def test_parse_thai_date_reads_iso_dates_in_either_era():
+    from datetime import date
+    from app.legal_registry import parse_thai_date
+    assert parse_thai_date("2550-10-01") == date(2007, 10, 1), "a model's Buddhist-year ISO date"
+    assert parse_thai_date("2007-10-01") == date(2007, 10, 1)
+    assert parse_thai_date("พ.ศ. 2562-10-01") == date(2019, 10, 1), "an ISO date inside other text"
+    assert parse_thai_date("10 มีนาคม 2476") == date(1934, 3, 10), "before 2484 the Thai year began in April"
+    assert parse_thai_date("2476-03-10") == date(1934, 3, 10)
+    assert parse_thai_date("10 เมษายน 2476") == date(1933, 4, 10)
+    assert parse_thai_date("1 มกราคม 2484") == date(1941, 1, 1)
+    assert parse_thai_date("not a date") is None

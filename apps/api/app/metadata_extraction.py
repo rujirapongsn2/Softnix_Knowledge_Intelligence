@@ -157,11 +157,15 @@ def queue_metadata_extraction(db, document):
 
 
 _WRAPPING_MARKS = "\"'\u201c\u201d\u2018\u2019\u00ab\u00bb"
+# PDF text spells sara am as \u0e33, as nikhahit + sara aa, or with the nikhahit lost to a space ("\u0e01 \u0e32\u0e2b\u0e19\u0e14"); no Thai word starts with \u0e32.
+_BROKEN_SARA_AM = re.compile(r"\u0e4d\u0e32|(?<=[\u0e01-\u0e4c])\s+\u0e32")
+_ANY_SARA_AM = r"(?:\u0e33|\u0e4d\u0e32|\s+\u0e32)"
 
 
 def _locate_quote(quote, window):
     """The exact text in the window that a model's quote points at, or None. Models often wrap a copied quote in quotation
-    marks or change its line breaks and spacing, so those differences are ignored. The text returned is always the document's own."""
+    marks or change its line breaks and spacing, so those differences are ignored. So is how sara am is spelled, since models
+    repair the broken forms PDF text has. The text returned is always the document's own."""
     if quote in window:
         return quote
     cleaned = quote.strip().strip(_WRAPPING_MARKS).strip()
@@ -169,7 +173,8 @@ def _locate_quote(quote, window):
         return None
     if cleaned in window:
         return cleaned
-    match = re.search(r"\s+".join(re.escape(part) for part in cleaned.split()), window)
+    parts = _BROKEN_SARA_AM.sub("ำ", cleaned).split()
+    match = re.search(r"\s+".join(re.escape(part).replace("ำ", _ANY_SARA_AM) for part in parts), window)
     return match.group(0) if match else None
 
 

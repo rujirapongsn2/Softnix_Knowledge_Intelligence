@@ -9,7 +9,7 @@ from sqlalchemy import inspect
 from test_api import client
 from app.db import SessionLocal
 from app.job_queue import claim_next_job
-from app.metadata_extraction import MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, field_review_states, process_metadata_job, queue_metadata_extraction
+from app.metadata_extraction import _locate_quote, MAX_WINDOWS, WINDOW, WINDOW_OVERLAP, extract_candidates, field_review_states, process_metadata_job, queue_metadata_extraction
 from app.metadata_search import MetadataPredicate, apply_typed_predicates, describe_schema
 from app.models import Document, DocumentMetadataValue, ProcessingJob, Relationship
 from app.llm import LLMClient
@@ -432,6 +432,40 @@ def test_a_quote_whose_words_are_not_in_the_document_is_still_rejected(quote):
     answer = {"purpose": [{"value": "Section 7", "evidence_quote": quote}]}
     observation = extract_candidates([field("purpose", field_type="textarea")], DOCUMENT, extractor(answer))["purpose"]
     assert observation["status"] == "invalid_evidence" and observation["candidates"] == []
+
+
+AM, NIKHAHIT_AA, BROKEN_AM = "ำ", "ํา", " า"
+
+
+@pytest.mark.parametrize("window_am, quote_am", [
+    (BROKEN_AM, AM), (BROKEN_AM, NIKHAHIT_AA), (AM, NIKHAHIT_AA), (NIKHAHIT_AA, AM), (AM, BROKEN_AM),
+])
+def test_a_quote_spelling_sara_am_differently_finds_the_documents_own_text(window_am, quote_am):
+    window = f"มาตรา ๕ ให้รัฐมนตรีก{window_am}หนดค่าธรรมเนียม และท{window_am}หน้าที่อื่น"
+    quote = f"ให้รัฐมนตรีก{quote_am}หนดค่าธรรมเนียม และท{quote_am}หน้าที่"
+    assert _locate_quote(quote, window) == f"ให้รัฐมนตรีก{window_am}หนดค่าธรรมเนียม และท{window_am}หน้าที่"
+
+
+def test_a_quote_with_both_a_line_break_and_a_broken_sara_am_is_found():
+    window = f"ข้อ ๓ ค{BROKEN_AM}แนะน{BROKEN_AM}\nในการปฏิบัติงาน"
+    assert _locate_quote(f"ค{AM}แนะน{AM} ในการปฏิบัติงาน", window) == f"ค{BROKEN_AM}แนะน{BROKEN_AM}\nในการปฏิบัติงาน"
+
+
+@pytest.mark.parametrize("quote", [f"ก{AM}หนด", f"ก{NIKHAHIT_AA}หนด", "กำหนดเวลา"])
+def test_sara_am_does_not_match_a_bare_sara_aa_or_other_words(quote):
+    assert _locate_quote(quote, f"ให้กาหนดค่าธรรมเนียม และท{BROKEN_AM}หน้าที่") is None
+
+
+def test_a_repaired_sara_am_quote_is_stored_as_the_documents_broken_text():
+    text = f"มาตรา ๕ ให้รัฐมนตรีก{BROKEN_AM}หนดค่าธรรมเนียม"
+    answer = {"purpose": [{"value": "ก" + AM + "หนดค่าธรรมเนียม", "evidence_quote": f"รัฐมนตรีก{AM}หนดค่าธรรมเนียม"}]}
+    observation = extract_candidates([field("purpose", field_type="textarea")], text, extractor(answer))["purpose"]
+    assert observation["status"] != "invalid_evidence" and len(observation["candidates"]) == 1
+    stored = observation["candidates"][0]["evidence"]
+    assert stored["quote"] == f"รัฐมนตรีก{BROKEN_AM}หนดค่าธรรมเนียม"
+    assert text[stored["char_start"]:stored["char_end"]] == stored["quote"]
+    # The value is spelled differently from the document's quote, so a person reviews it.
+    assert observation["status"] == "suggested"
 
 
 def by_window(answers):

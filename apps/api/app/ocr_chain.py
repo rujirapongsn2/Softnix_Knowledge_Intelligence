@@ -337,6 +337,11 @@ class OcrChain:
                 logger.info("OCR engine '%s' not configured; skipping", name)
         return usable
 
+    def fallback_engines(self) -> list[str]:
+        """Engines that can still read a scan when the Softnix OCR service cannot: Mistral when it has a key, and
+        Tesseract when the binary is installed. recognize() falls through to them in chain order."""
+        return [name for name in self.engine_names() if name == "mistral" or (name == "tesseract" and shutil.which("tesseract"))]
+
     def recognize(self, image: bytes, page: int) -> str:
         attempts: list[str] = []
         for name in self.engine_order:

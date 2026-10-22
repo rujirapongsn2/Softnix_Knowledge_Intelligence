@@ -11,6 +11,7 @@ WEB="http://127.0.0.1:$(env_value WEB_PORT || true)"; [ "$WEB" = "http://127.0.0
 failed=0
 ok() { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failed=1; }
+warn() { printf '  warn  %s\n' "$1"; }
 
 echo "containers"
 states=$(docker compose ps -a --format '{{.Service}} {{.State}} {{.ExitCode}}' 2>/dev/null)
@@ -25,6 +26,8 @@ echo "http"
 ready=$(curl -s "$API/ready")
 if printf '%s' "$ready" | grep -q '"status":"ready"'; then
   ok "api /ready: $(printf '%s' "$ready" | python3 -c 'import json,sys; print(", ".join(f"{k} {v}" for k, v in json.load(sys.stdin)["dependencies"].items()))')"
+  limited=$(printf '%s' "$ready" | python3 -c 'import json,sys; print(", ".join(f"{k} {v}" for k, v in json.load(sys.stdin)["dependencies"].items() if v not in ("ready", "not_configured")))')
+  [ -z "$limited" ] || warn "running with limits: $limited (slow: busy; degraded: a fallback engine is doing the work)"
 else
   bad "api /ready: ${ready:-no answer}"
 fi

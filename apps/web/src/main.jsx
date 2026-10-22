@@ -881,10 +881,11 @@ function SystemStatusView() {
       <div className="service-status-grid">
         {serviceKeys.map(key => {
           const name = serviceLabels[key] || key;
-          // "ready" | "slow" (answering, but behind under load) | "not_configured" (an optional service left unset, not a failure) | "unavailable"
+          // "ready" | "slow" (answering, but behind under load) | "degraded" (a fallback engine is doing the work) | "not_configured" (an optional service left unset, not a failure) | "unavailable"
           const state = failures[key] ? "unavailable" : services[key];
           const look = state === "ready" ? {dot: "ready", text: t("systemStatus.serviceReady"), badge: t("systemStatus.up"), variant: "success"}
             : state === "slow" ? {dot: "warning", text: t("systemStatus.serviceSlow"), badge: t("systemStatus.slow"), variant: "warning"}
+            : state === "degraded" ? {dot: "warning", text: t("systemStatus.serviceDegraded"), badge: t("systemStatus.degradedBadge"), variant: "warning"}
             : state === "not_configured" ? {dot: "warning", text: t("systemStatus.serviceNotConfigured"), badge: t("systemStatus.notConfigured"), variant: "warning"}
             : {dot: "unavailable", text: t("systemStatus.serviceUnavailable"), badge: t("systemStatus.down"), variant: "error"};
           return (

@@ -54,7 +54,7 @@ bash deploy/check_services.sh
 script ตรวจว่า container ทุกตัวรันอยู่ และ `migrate` จบด้วย exit code 0 ตรวจ `/health`, `/ready` และ Web UI แล้วเรียก LLM, embedding server และ reranker (ถ้าเปิดไว้) จากใน container ของ api
 ความหมายของแต่ละข้อดูที่ [README](../README.md#5-ตรวจสถานะหลังติดตั้ง)
 
-`/ready` ต้องเห็น database, redis, neo4j, lightrag และ embeddings เป็น `ready` ส่วน ocr_chain จะตรวจเฉพาะเมื่อตั้ง `SOFTNIX_OCR_TOKEN` แล้ว
+`/ready` ต้องเห็น database, redis, neo4j, lightrag และ embeddings เป็น `ready` ส่วน ocr_chain จะตรวจเฉพาะเมื่อตั้ง `SOFTNIX_OCR_TOKEN` แล้ว ถ้า Softnix OCR ตอบไม่ได้แต่ใน `OCR_CHAIN_ENGINES` ยังมี engine ที่อ่านเอกสารสแกนได้ (Mistral ที่ตั้ง key ไว้ หรือ Tesseract ที่ติดตั้งใน image) `/ready` จะรายงาน ocr_chain เป็น `degraded` และยังตอบ 200 ถ้าไม่เหลือ engine สำรอง จึงจะตอบ 503
 ถ้า `SOFTNIX_OCR_*` ยังเป็นค่าตัวอย่างจาก `.env.example` `/ready` จะตอบ 503 และ api จะไม่ขึ้นเป็น healthy
 
 ## การเปลี่ยนแปลงที่มักต้องทำเพิ่ม

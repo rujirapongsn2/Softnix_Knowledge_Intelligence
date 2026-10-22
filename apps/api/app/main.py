@@ -33,6 +33,7 @@ from .metadata_quality import metadata_quality_report
 from .observability import metrics, now
 from .embeddings import EmbeddingClient
 from .llm import LLMClient
+from .ocr_chain import OcrChain
 from .provider_holds import hold_view
 from .mcp_limits import McpLimitExceeded, mcp_limiter
 from .request_budget import reset_deadline, set_deadline
@@ -235,7 +236,13 @@ def _probe_dependencies(db: Session) -> tuple[dict, dict]:
             probe.raise_for_status()
             dependencies["ocr_chain"] = "ready"
         except (httpx.HTTPError, OSError):
-            failures["ocr_chain"] = "unavailable"
+            # The Softnix OCR service is one engine of a chain; with another engine left, scans are still read
+            # (less well), so the system is degraded, not unavailable.
+            chain = OcrChain(settings)
+            if "softnix" in chain.engine_order and chain.fallback_engines():
+                dependencies["ocr_chain"] = "degraded"
+            else:
+                failures["ocr_chain"] = "unavailable"
     if settings.embedding_base_url.strip():
         state = _EMBEDDING_PROBE.state(settings.embedding_base_url.strip())
         if state == "unavailable": failures["embeddings"] = state

@@ -238,7 +238,7 @@ script รันซ้ำได้ ไม่ส่งไฟล์ซ้ำ แ�
 - [High-level Data Flow](docs/DATA_FLOW.md) — ลำดับการไหลของ upload/query/answer
 - [Security](docs/SECURITY.md) — การป้องกันข้อมูลและ secret
 - [Acceptance walkthrough](docs/ACCEPTANCE.md) — ขั้นตอนทดสอบตั้งแต่ upload ถึง MCP
-- [Backup & restore](docs/BACKUP_RESTORE.md) — สิ่งที่ต้องสำรองและตรวจหลัง restore
+- [Backup & restore](docs/BACKUP_RESTORE.md) — `deploy/backup.sh`, `deploy/restore.sh`, การซ้อมกู้คืน และการย้ายเครื่อง
 
 ## ทดสอบ
 

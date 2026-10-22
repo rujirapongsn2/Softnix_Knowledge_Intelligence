@@ -131,9 +131,14 @@ class Document(Timestamped, Base):
               unique=True,
               sqlite_where=text("deleted_at IS NULL"),
               postgresql_where=text("deleted_at IS NULL")),
+        # A sender's own key for a document; one live document per key in a Knowledge Base (migration 0044).
+        Index("uq_document_external_id_live", "knowledge_base_id", "external_id", unique=True,
+              sqlite_where=text("deleted_at IS NULL AND external_id IS NOT NULL"),
+              postgresql_where=text("deleted_at IS NULL AND external_id IS NOT NULL")),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+    external_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     original_filename: Mapped[str] = mapped_column(String(500))
     stored_filename: Mapped[str] = mapped_column(String(500))
     storage_path: Mapped[str] = mapped_column(String(1000))

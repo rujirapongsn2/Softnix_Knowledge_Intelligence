@@ -2468,11 +2468,15 @@ const INGEST_SNIPPETS = {
 const isIngestToken = token => Boolean(token.allowed_scopes?.includes(INGEST_SCOPE));
 const INGEST_ENDPOINTS = [
   {method: "GET", path: "/ingest/knowledge-bases", descriptionKey: "ingestTokens.endpoints.listKb"},
+  {method: "GET", path: "/ingest/limits", descriptionKey: "ingestTokens.endpoints.limits"},
+  {method: "GET", path: "/ingest/error-codes", descriptionKey: "ingestTokens.endpoints.errorCodes"},
   {method: "GET", path: "/ingest/knowledge-bases/{kb_id}/document-types", descriptionKey: "ingestTokens.endpoints.listDocumentTypes"},
+  {method: "POST", path: "/ingest/knowledge-bases/{kb_id}/documents/lookup", descriptionKey: "ingestTokens.endpoints.lookup"},
   {method: "POST", path: "/ingest/knowledge-bases/{kb_id}/documents", descriptionKey: "ingestTokens.endpoints.uploadOne"},
   {method: "POST", path: "/ingest/knowledge-bases/{kb_id}/documents/text", descriptionKey: "ingestTokens.endpoints.uploadText"},
   {method: "POST", path: "/ingest/knowledge-bases/{kb_id}/documents/batch", descriptionKey: "ingestTokens.endpoints.uploadBatch"},
   {method: "GET", path: "/ingest/knowledge-bases/{kb_id}/documents", descriptionKey: "ingestTokens.endpoints.listDocuments"},
+  {method: "GET", path: "/ingest/knowledge-bases/{kb_id}/queue", descriptionKey: "ingestTokens.endpoints.queue"},
   {method: "GET", path: "/ingest/documents/{document_id}", descriptionKey: "ingestTokens.endpoints.getDocument"},
   {method: "GET", path: "/ingest/documents/{document_id}/file", descriptionKey: "ingestTokens.endpoints.downloadFile"},
   {method: "GET", path: "/ingest/documents/{document_id}/jobs", descriptionKey: "ingestTokens.endpoints.listJobs"},

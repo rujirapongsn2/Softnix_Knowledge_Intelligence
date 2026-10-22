@@ -47,14 +47,14 @@ def _safe_stem(title: str) -> str:
 def create_text_document_job(db: Session, knowledge_base_id: str, title: str, text: str,
                              document_type: str = "general", published_at: date | None = None,
                              metadata_template: dict | None = None,
-                             document_metadata: dict | None = None) -> tuple[Document, ProcessingJob]:
+                             document_metadata: dict | None = None, external_id: str | None = None) -> tuple[Document, ProcessingJob]:
     """Store extracted text as a Markdown document and queue processing.
 
     Mirrors ``create_document_job`` (type validation, storage, checksum
     dedup within the KB, metadata search text) without requiring a binary
     upload — the text is the artifact.
     """
-    from .services import DOCUMENT_TYPES  # local import keeps module import graph flat
+    from .services import DOCUMENT_TYPES, DocumentExists, document_exists_error, live_document_id, normalize_external_id  # local import keeps module import graph flat
 
     if document_type not in DOCUMENT_TYPES:
         raise ValueError("DOCUMENT_TYPE_INVALID")
@@ -62,6 +62,9 @@ def create_text_document_job(db: Session, knowledge_base_id: str, title: str, te
         raise ValueError("TEXT_EMPTY")
     if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
         raise ValueError("FILE_TOO_LARGE")
+    external_id = normalize_external_id(external_id)
+    if external_id and (existing := live_document_id(db, knowledge_base_id, external_id=external_id)):
+        raise DocumentExists("EXTERNAL_ID_EXISTS", existing)
 
     settings = get_settings()
     root = settings.file_root / knowledge_base_id
@@ -73,16 +76,12 @@ def create_text_document_job(db: Session, knowledge_base_id: str, title: str, te
     path.write_bytes(payload)
 
     checksum = hashlib.sha256(payload).hexdigest()
-    from .models import Document as _Document
-    duplicate = db.query(_Document).filter_by(knowledge_base_id=knowledge_base_id, checksum_sha256=checksum).filter(
-        _Document.live()
-    ).first()
-    if duplicate:
+    if duplicate := live_document_id(db, knowledge_base_id, checksum=checksum):
         path.unlink(missing_ok=True)
-        raise ValueError("FILE_DUPLICATE")
+        raise DocumentExists("FILE_DUPLICATE", duplicate)
 
     doc = Document(
-        knowledge_base_id=knowledge_base_id,
+        knowledge_base_id=knowledge_base_id, external_id=external_id,
         original_filename=f"{_safe_stem(title)}.md",
         storage_path=str(path), stored_filename=stored_name, file_size=len(payload),
         mime_type="text/markdown", checksum_sha256=checksum,
@@ -102,14 +101,16 @@ def create_text_document_job(db: Session, knowledge_base_id: str, title: str, te
     db.add(doc)
     try:
         db.flush()
-    except IntegrityError:
-        # Two concurrent sends of the same text: the pre-check above can miss
-        # the race, the unique index (knowledge_base_id, checksum_sha256) is
-        # the real guard. Surface it as the same 409 a retrying client sees
-        # from the non-concurrent path instead of an unhandled 500.
+    except IntegrityError as exc:
+        # Two concurrent sends of the same text or external_id: the pre-checks
+        # above can miss the race, the unique indexes are the real guard.
+        # Surface it as the same 409 a retrying client sees from the
+        # non-concurrent path instead of an unhandled 500.
         db.rollback()
         path.unlink(missing_ok=True)
-        raise ValueError("FILE_DUPLICATE") from None
+        if exists := document_exists_error(db, knowledge_base_id, str(exc), checksum, external_id):
+            raise exists from None
+        raise
     job = ProcessingJob(document_id=doc.id, knowledge_base_id=knowledge_base_id)
     db.add(job)
     db.commit()

@@ -14,6 +14,9 @@ from sqlalchemy.orm import Session
 
 from .models import Document, DocumentMetadataTemplate
 
+# Upper bound on a document's metadata values, as serialized JSON characters.
+METADATA_MAX_CHARS = 100_000
+
 PROCESSING_PROFILES = frozenset({"general", "legal", "regulation", "contract"})
 
 SYSTEM_TEMPLATES: tuple[dict[str, Any], ...] = (
@@ -140,7 +143,7 @@ def validate_metadata_values(fields: list[dict[str, Any]], values: dict[str, Any
     unknown = set(values) - set(allowed)
     if unknown:
         raise ValueError("DOCUMENT_METADATA_FIELD_UNKNOWN")
-    if len(json.dumps(values, ensure_ascii=False)) > 100_000:
+    if len(json.dumps(values, ensure_ascii=False)) > METADATA_MAX_CHARS:
         raise ValueError("DOCUMENT_METADATA_TOO_LARGE")
     result: dict[str, Any] = {}
     for key, field in allowed.items():

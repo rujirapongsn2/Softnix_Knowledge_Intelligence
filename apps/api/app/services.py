@@ -2074,18 +2074,53 @@ def build_document_inventory_result(db: Session, query: str, kb_ids: list[str], 
     return _persist_query_result(db, result, token_id)
 
 
+class DocumentExists(ValueError):
+    """An upload that is already a live document, by content or by the sender's external_id; str() stays the code."""
+    def __init__(self, code: str, document_id: str | None):
+        super().__init__(code)
+        self.document_id = document_id
+
+
+def normalize_external_id(value: str | None) -> str | None:
+    from .ingest_contract import EXTERNAL_ID_MAX_CHARS
+    value = (value or "").strip()
+    if len(value) > EXTERNAL_ID_MAX_CHARS:
+        raise ValueError("EXTERNAL_ID_INVALID")
+    return value or None
+
+
+def live_document_id(db: Session, knowledge_base_id: str, *, checksum: str | None = None, external_id: str | None = None) -> str | None:
+    query = db.query(Document.id).filter(Document.knowledge_base_id == knowledge_base_id, Document.live())
+    query = query.filter(Document.external_id == external_id) if external_id is not None else query.filter(Document.checksum_sha256 == checksum)
+    row = query.first()
+    return row[0] if row else None
+
+
+def document_exists_error(db: Session, knowledge_base_id: str, detail: str, checksum: str, external_id: str | None) -> DocumentExists | None:
+    """The DocumentExists a unique-index violation stands for, or None when the violation is something else.
+
+    str(detail) carries the index or column name on both SQLite and Postgres. Call it after the rollback."""
+    if external_id and ("uq_document_external_id" in detail or "external_id" in detail):
+        return DocumentExists("EXTERNAL_ID_EXISTS", live_document_id(db, knowledge_base_id, external_id=external_id))
+    if "uq_document_checksum" in detail or "checksum_sha256" in detail:
+        return DocumentExists("FILE_DUPLICATE", live_document_id(db, knowledge_base_id, checksum=checksum))
+    return None
+
+
 def create_document_job(db: Session, knowledge_base_id: str, upload, title: str | None = None, document_type: str = "general", published_at=None,
                         metadata_template: dict | None = None, document_metadata: dict | None = None,
-                        reference_pdf=None, reference_file=None) -> tuple[Document, ProcessingJob]:
+                        reference_pdf=None, reference_file=None, external_id: str | None = None) -> tuple[Document, ProcessingJob]:
     if document_type not in DOCUMENT_TYPES:
         raise ValueError("DOCUMENT_TYPE_INVALID")
     if reference_pdf is not None and reference_file is not None:
         raise ValueError("REFERENCE_FILE_CONFLICT")
+    external_id = normalize_external_id(external_id)
+    if external_id and (existing := live_document_id(db, knowledge_base_id, external_id=external_id)):
+        raise DocumentExists("EXTERNAL_ID_EXISTS", existing)
     path, stored, size, checksum, mime = store_upload(upload, knowledge_base_id)
-    duplicate = db.query(Document).filter_by(knowledge_base_id=knowledge_base_id, checksum_sha256=checksum).filter(Document.live()).first()
-    if duplicate:
+    if duplicate := live_document_id(db, knowledge_base_id, checksum=checksum):
         Path(path).unlink(missing_ok=True)
-        raise ValueError("FILE_DUPLICATE")
+        raise DocumentExists("FILE_DUPLICATE", duplicate)
     reference = None
     if reference_pdf is not None or reference_file is not None:
         if Path(upload.filename or "").suffix.lower() != ".md":
@@ -2098,7 +2133,7 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
             raise
     fields = normalize_field_definitions((metadata_template or {}).get("fields") or [])
     values = document_metadata or {}
-    doc = Document(knowledge_base_id=knowledge_base_id, original_filename=upload.filename or stored,
+    doc = Document(knowledge_base_id=knowledge_base_id, external_id=external_id, original_filename=upload.filename or stored,
                    stored_filename=stored, storage_path=path, file_size=size, checksum_sha256=checksum,
                    mime_type=mime, title=title or Path(upload.filename or stored).stem,
                    document_type=document_type, published_at=published_at, status="queued",
@@ -2117,25 +2152,17 @@ def create_document_job(db: Session, knowledge_base_id: str, upload, title: str 
     try:
         db.flush()
     except IntegrityError as exc:
-        # F8 race guard: two concurrent uploads of the same file — the
-        # partial unique index is the real guard; surface the same 409 the
-        # non-concurrent path returns (the text path already did this).
-        # Only a unique-checksum violation maps to FILE_DUPLICATE; any other
-        # integrity failure (FK, NOT NULL) must surface as itself (review M1).
-        # str(exc) carries the constraint/column name on both SQLite and
-        # Postgres (constraint_name lives in exc.orig.diag on PG only).
-        detail = str(exc)
-        if "uq_document_checksum" not in detail and "checksum_sha256" not in detail:
-            db.rollback()
-            Path(path).unlink(missing_ok=True)
-            if reference:
-                Path(reference[0]).unlink(missing_ok=True)
-            raise
+        # F8 race guard: two concurrent uploads of the same file or external_id —
+        # the partial unique indexes are the real guard; surface the same 409 the
+        # non-concurrent path returns. Any other integrity failure (FK, NOT NULL)
+        # must surface as itself (review M1).
         db.rollback()
         Path(path).unlink(missing_ok=True)
         if reference:
             Path(reference[0]).unlink(missing_ok=True)
-        raise ValueError("FILE_DUPLICATE") from None
+        if exists := document_exists_error(db, knowledge_base_id, str(exc), checksum, external_id):
+            raise exists from None
+        raise
     job = ProcessingJob(document_id=doc.id, knowledge_base_id=knowledge_base_id)
     try:
         db.add(job); db.commit(); db.refresh(doc); db.refresh(job)

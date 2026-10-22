@@ -84,6 +84,85 @@ curl "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documen
 ใช้ค่า `id` กับ `document_type_id` ในการนำเข้า ตัวอย่างชนิดมาตรฐานคือ `system:general`,
 `system:legal`, `system:regulation` และ `system:contract` ส่วนชนิดแบบกำหนดเองใช้ id ที่ endpoint นี้คืนมา
 
+## ตรวจข้อจำกัดก่อนส่ง
+
+`GET /api/v1/ingest/limits`
+
+อ่านข้อจำกัดของระบบและของ token จาก endpoint นี้ แทนการ hardcode ค่าไว้ในระบบต้นทาง
+แล้วตรวจไฟล์ก่อนอัปโหลด ไฟล์ที่เกิน `file.max_bytes` จะได้ `413 FILE_TOO_LARGE` หลังจากอัปโหลดจนจบ
+จึงควรตรวจขนาดก่อนส่ง และตั้งจำนวนงานที่ส่งพร้อมกันไม่ให้เกิน `token.max_concurrent_requests`
+
+```json
+{
+  "file": {"max_bytes": 314572800, "extensions": [".csv", ".doc", ".docx", ".htm", ".html", ".json", ".md", ".pdf", ".pptx", ".txt", ".xls", ".xlsx"],
+           "mime_types": {".md": ["text/markdown", "text/plain"], "...": []}, "octet_stream_accepted": true},
+  "reference_file": {"max_bytes": 314572800, "extensions": [".doc", ".docx", ".pdf", ".txt", ".xls", ".xlsx"], "document_extension": ".md"},
+  "text": {"max_bytes": 20971520, "title_max_chars": 255},
+  "batch": {"max_files": 20},
+  "metadata_json": {"max_chars": 100000},
+  "external_id": {"max_chars": 200},
+  "lookup": {"max_items": 100},
+  "document_list": {"max_limit": 100},
+  "token": {"knowledge_base_id": "b17a...", "requests_per_minute": 600, "max_concurrent_requests": 10, "expires_at": null},
+  "polling": {"initial_seconds": 5, "max_seconds": 60}
+}
+```
+
+ข้อจำกัดนี้เป็นของระบบเราเท่านั้น ถ้าเรียกผ่าน proxy หรือ CDN ที่อยู่หน้าระบบ อาจมีเพดานขนาด request ของตัวเองที่ต่ำกว่า
+เช่น Cloudflare ปฏิเสธ request ที่ใหญ่กว่า 100 MB ด้วย `413` ที่เป็นหน้า HTML ก่อนถึงระบบ ซึ่งจะไม่มีบันทึกฝั่งเรา
+
+`GET /api/v1/ingest/error-codes` คืนรหัสข้อผิดพลาดทั้งหมดที่ผู้ส่งอาจเจอ ทั้งคำตอบ HTTP ตอนส่ง (`stage: "request"`)
+และ `error_code` ของเอกสารหรือ job หลังได้ `202` แล้ว (`stage: "processing"`) แต่ละรหัสบอกว่า
+
+| Field | ความหมาย |
+|---|---|
+| `http_status` | HTTP status ของรหัสนั้น (`null` สำหรับรหัสระหว่างประมวลผล) |
+| `retryable` | ส่งคำขอเดิมหรือรอเอกสารเดิมแล้วสำเร็จได้โดยไม่ต้องแก้อะไร |
+| `client_action` | สิ่งที่ผู้ส่งควรทำ: `resend_later` (รอแล้วส่งคำขอเดิมใหม่), `skip` (มีอยู่แล้ว ข้ามได้), `fix_request` (แก้พารามิเตอร์), `fix_file` (แก้ไฟล์), `wait` (ระบบลองใหม่หรือรอเอง ไม่ต้องส่งซ้ำ), `contact_admin` (ต้องให้ผู้ดูแลระบบจัดการ) |
+
+```json
+{"items": [
+  {"code": "FILE_DUPLICATE", "stage": "request", "http_status": 409, "retryable": false, "client_action": "skip", "description": "..."},
+  {"code": "RETRIEVAL_ENGINE_BUSY", "stage": "processing", "http_status": null, "retryable": true, "client_action": "wait", "description": "..."}
+]}
+```
+
+รหัสที่ไม่อยู่ในรายการให้ถือเป็น `contact_admin`
+
+## ตรวจเอกสารซ้ำก่อนอัปโหลด
+
+`POST /api/v1/ingest/knowledge-bases/{kb_id}/documents/lookup` — `application/json`
+
+ค้นเอกสารที่มีอยู่แล้วใน Knowledge Base ด้วย SHA-256 ของเนื้อหา หรือด้วย `external_id` ได้รวมไม่เกิน 100 ค่าต่อคำขอ
+ใช้ในสองกรณี: ก่อนอัปโหลดไฟล์ใหญ่ (ไม่ต้องส่งไฟล์ 160 MB เพื่อได้ `409 FILE_DUPLICATE` กลับมา)
+และเมื่อส่งไปแล้วไม่ได้รับ response เพื่อหา `document_id` ของไฟล์นั้น
+
+checksum คือ SHA-256 ของ byte ของไฟล์ที่ส่งใน `file` ส่วนเอกสารที่นำเข้าเป็นข้อความคือ SHA-256 ของ `text` ที่เข้ารหัสแบบ UTF-8
+ระบบเทียบกับไฟล์หลักเท่านั้น ไม่เทียบกับไฟล์อ้างอิง และนับเฉพาะเอกสารที่ยังไม่ถูกลบ
+
+```bash
+curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documents/lookup" \
+  -H "Authorization: Bearer $SOFTNIX_INGEST_TOKEN" -H "Content-Type: application/json" \
+  -d '{"checksums_sha256": ["'"$(shasum -a 256 land-law.md | cut -d' ' -f1)"'"], "external_ids": ["DMS-2569-0042"]}'
+```
+
+```json
+{"items": [
+  {"checksum_sha256": "9f86d0...", "document": {"document_id": "6f2c...", "status": "completed", "...": "..."}},
+  {"external_id": "DMS-2569-0042", "document": null}
+]}
+```
+
+`document` มีโครงเดียวกับ[สถานะเอกสารรายฉบับ](#สถานะเอกสารรายฉบับ) หรือเป็น `null` เมื่อไม่พบ ลำดับของ `items` ตรงกับที่ส่งไป
+(checksum ก่อน แล้วตามด้วย external_id) checksum ที่ไม่ใช่เลขฐานสิบหก 64 ตัว หรือจำนวนค่าเป็น 0 หรือเกิน 100 ได้ `400 LOOKUP_INVALID`
+
+### external_id
+
+ส่ง `external_id` (ไม่เกิน 200 ตัวอักษร) เป็นรหัสของเอกสารในระบบต้นทาง เช่นเลขที่เอกสารใน DMS ได้กับการนำเข้าทีละไฟล์และการนำเข้าข้อความ
+Knowledge Base หนึ่งมีเอกสารที่ยังไม่ถูกลบได้เพียงฉบับเดียวต่อ `external_id` ส่งซ้ำจะได้ `409 EXTERNAL_ID_EXISTS`
+พร้อม `error.document_id` ของฉบับเดิม แม้เนื้อหาจะเปลี่ยนไป ถ้าต้องการแทนฉบับเดิม ให้ลบฉบับเดิมก่อนแล้วส่งใหม่
+เอกสารที่ถูกลบแล้วคืน `external_id` ให้ใช้ใหม่ได้ batch endpoint ไม่รับ `external_id`
+
 ## นำเข้าเอกสารทีละไฟล์
 
 `POST /api/v1/ingest/knowledge-bases/{kb_id}/documents` — `multipart/form-data`
@@ -99,6 +178,7 @@ curl "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documen
 | `published_at` | | วันที่ประกาศใช้ รูปแบบ `YYYY-MM-DD` |
 | `reference_file` | | ไฟล์อ้างอิงสำหรับ `.md` รองรับ PDF, DOCX, DOC, XLSX, XLS และ TXT เก็บกับเอกสารเดียวกันโดยไม่ OCR หรือสร้างดัชนีซ้ำ |
 | `reference_pdf` | | ฟิลด์เดิมสำหรับ PDF; ยังใช้ได้เพื่อความเข้ากันได้ ห้ามส่งพร้อม `reference_file` |
+| `external_id` | | รหัสเอกสารของระบบต้นทาง ไม่เกิน 200 ตัวอักษร ดู [external_id](#external_id) |
 
 ```bash
 curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documents" \
@@ -132,6 +212,7 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
   "status": "queued",
   "document_id": "6f2c...",
   "job_id": "a91d...",
+  "external_id": null,
   "document_type": "contract",
   "document_type_id": "system:contract",
   "template_id": "system:contract"
@@ -193,6 +274,7 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
 | `template_id` | | ชื่อเดิมที่ยังรองรับ ใช้แทน `document_type_id` เท่านั้น |
 | `metadata_json` | | JSON string ของ metadata (ทางเลือก) |
 | `published_at` | | วันที่ประกาศใช้ รูปแบบ `YYYY-MM-DD` (ทางเลือก) |
+| `external_id` | | รหัสเอกสารของระบบต้นทาง ไม่เกิน 200 ตัวอักษร (ทางเลือก) ดู [external_id](#external_id) |
 
 ```bash
 curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID/documents/text" \
@@ -228,22 +310,33 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
 {
   "document_id": "6f2c...",
   "knowledge_base_id": "b17a...",
+  "external_id": "DMS-2569-0042",
   "title": "สัญญาจัดซื้อ 2569",
   "filename": "contract.pdf",
-  "status": "extracting",
+  "checksum_sha256": "9f86d0...",
+  "status": "queued",
   "document_type": "contract",
   "document_type_id": "system:contract",
   "error_code": null,
+  "error_message": null,
+  "retryable": null,
+  "client_action": null,
   "created_at": "2026-08-03T04:12:55",
+  "updated_at": "2026-08-03T04:13:40",
+  "indexed_at": null,
+  "waiting_for": "RETRIEVAL_ENGINE_BUSY",
+  "next_attempt_at": "2026-08-03T04:14:10Z",
   "latest_job": {
     "id": "a91d...",
     "type": "PROCESS_DOCUMENT",
-    "status": "running",
-    "stage": "embedding",
+    "status": "queued",
+    "stage": "indexing",
     "progress_percent": 60,
     "attempt_count": 1,
-    "error_code": null,
-    "error_message": null
+    "error_code": "RETRIEVAL_ENGINE_BUSY",
+    "error_message": "...",
+    "waiting_for": "RETRIEVAL_ENGINE_BUSY",
+    "next_attempt_at": "2026-08-03T04:14:10Z"
   }
 }
 ```
@@ -258,6 +351,54 @@ curl -X POST "https://knowledge.example.com/api/v1/ingest/knowledge-bases/$KB_ID
 เมื่อ `status` เป็น `failed` ให้ดู `error_code` ประกอบ เช่น `OCR_CHAIN_FAILED` (ทุก engine ใน
 chain ล้ม — ดู log ของ worker ว่า Softnix/Mistral/Tesseract ตัวไหนพร้อมใช้) `OCR_REQUIRED`
 (ปิด chain ไว้ทั้งหมด) หรือ `TEXT_EXTRACTION_FAILED`
+
+field ที่ช่วยแยก "รออยู่" ออกจาก "ต้องลงมือ":
+
+| Field | ความหมาย |
+|---|---|
+| `waiting_for` | รหัสที่ job ล่าสุดกำลังรออยู่ เช่น `RETRIEVAL_ENGINE_BUSY` หรือ `LLM_CREDITS_EXHAUSTED` เป็น `null` เมื่อไม่ได้รออะไร ระบบลองใหม่หรือทำต่อเอง ไม่ต้องส่งซ้ำ |
+| `next_attempt_at` | เวลา UTC ที่ job ล่าสุดจะเริ่มอีกครั้ง เป็น `null` เมื่อพร้อมทำทันทีหรือไม่ได้อยู่ในคิว |
+| `retryable` / `client_action` | มีค่าเฉพาะเอกสาร `failed` ตาม[แค็ตตาล็อกรหัสข้อผิดพลาด](#ตรวจข้อจำกัดก่อนส่ง) |
+| `checksum_sha256` | SHA-256 ของเนื้อหา ใช้กับ [lookup](#ตรวจเอกสารซ้ำก่อนอัปโหลด) |
+| `updated_at` / `indexed_at` | เวลาที่แถวเอกสารเปลี่ยนล่าสุด และเวลาที่เข้าดัชนีค้นหาเสร็จ (เวลา UTC ไม่มี `Z` เหมือน `created_at`) |
+
+### Active Queue และสถานะการประมวลผล
+
+`GET /api/v1/ingest/knowledge-bases/{kb_id}/queue`
+
+บอกจำนวนเอกสารที่ค้างอยู่ใน Active Queue (job ที่ `queued` หรือ `running`) ของทั้งระบบ
+และของ Knowledge Base นี้ รวมทั้งบอกว่าระบบหยุดประมวลผลชั่วคราวหรือไม่ ใช้เพื่อชะลอหรือหยุดส่งเมื่อคิวยาว
+แทนการส่งต่อเรื่อย ๆ แล้ว poll รายเอกสาร
+
+```json
+{
+  "knowledge_base_id": "b17a...",
+  "generated_at": "2026-10-22T08:30:00Z",
+  "processing": "paused",
+  "holds": [{"reason_code": "LLM_CREDITS_EXHAUSTED", "held_since": "2026-10-22T08:10:02Z", "next_check_at": "2026-10-22T08:32:02Z"}],
+  "active_queue": {
+    "documents": 148,
+    "jobs": {"queued": 160, "running": 3, "waiting_to_retry": 12}
+  },
+  "knowledge_base": {
+    "active_documents": 24,
+    "jobs": {"queued": 25, "running": 1, "waiting_to_retry": 2},
+    "oldest_active_job_at": "2026-10-22T07:58:41Z",
+    "documents_by_status": {"completed": 310, "queued": 23, "extracting": 1, "failed": 2},
+    "in_flight_documents": 24
+  }
+}
+```
+
+| Field | ความหมาย |
+|---|---|
+| `processing` | `running` หรือ `paused` เมื่อ AI provider หมดเครดิตหรือ key ใช้ไม่ได้ งานที่ส่งเข้ามายังได้ `202` และอยู่ในคิวถาวร แต่จะเริ่มเมื่อ hold ถูกยกเลิก ซึ่งระบบตรวจเองทุก 1–10 นาที |
+| `holds[]` | สาเหตุที่หยุด (`reason_code` ตามแค็ตตาล็อก) เวลาที่เริ่มหยุด และเวลาที่จะตรวจอีกครั้ง |
+| `active_queue.documents` | จำนวนเอกสาร (ไม่ซ้ำ) ที่มีงานค้างใน Active Queue ของทุก Knowledge Base แสดงเป็นตัวเลขเท่านั้น ไม่มีชื่อหรือ id ของ Knowledge Base อื่น |
+| `active_queue.jobs` | จำนวน job ที่ `queued` และ `running` โดย `waiting_to_retry` คือ job ที่อยู่ในคิวแต่รอถึง `next_attempt_at` (เช่นรอ LightRAG ว่าง) |
+| `knowledge_base.active_documents` | จำนวนเอกสารของ Knowledge Base นี้ที่มีงานค้างในคิว รวมงานต่อเนื่องเช่นสกัด metadata ของเอกสารที่ `completed` แล้ว |
+| `knowledge_base.in_flight_documents` | จำนวนเอกสารที่ยังไม่ถึงสถานะสุดท้าย (`completed`, `failed`, `ocr_required`) |
+| `knowledge_base.oldest_active_job_at` | เวลาที่ job เก่าที่สุดที่ยังค้างของ Knowledge Base นี้ถูกสร้าง ถ้าห่างจากปัจจุบันมาก แปลว่าคิวเดินช้า |
 
 ### ประวัติ job ของเอกสาร
 
@@ -304,6 +445,10 @@ curl -X DELETE "https://knowledge.example.com/api/v1/ingest/documents/$DOCUMENT_
 ถ้าส่งเป็น batch ให้ใช้ `GET .../knowledge-bases/{kb_id}/documents` (ไม่ส่ง `status`) เพื่อ poll
 ครั้งเดียวต่อรอบแล้วกรองที่ client แทนการยิงรายเอกสาร เพราะทุก request ถูกหักจาก rate limit ของ
 token ใบเดียวกัน
+
+ระหว่างนำเข้าชุดใหญ่ ให้เรียก `GET .../knowledge-bases/{kb_id}/queue` ก่อนส่งแต่ละรอบ ถ้า `processing` เป็น `paused`
+ให้หยุดส่งชั่วคราวจนกว่าจะกลับเป็น `running` และถ้า `knowledge_base.in_flight_documents` สูง ให้ชะลอการส่ง
+เอกสารที่มี `waiting_for` ไม่ต้องส่งซ้ำ ระบบทำต่อเอง
 
 ## ตัวอย่าง Python
 
@@ -405,7 +550,10 @@ if (documentId) console.log(await waitFor(documentId));
 | 404 | `KNOWLEDGE_BASE_NOT_FOUND` | ไม่พบ Knowledge Base **หรืออยู่นอกสิทธิ์ของ token** | false |
 | 404 | `DOCUMENT_NOT_FOUND` | ไม่พบเอกสาร **หรืออยู่นอกสิทธิ์ของ token** | false |
 | 409 | `KNOWLEDGE_BASE_DISABLED` | Knowledge Base ยังไม่ถูก activate | false |
-| 409 | `FILE_DUPLICATE` | ไฟล์เนื้อหาเดียวกันมีอยู่ใน Knowledge Base แล้ว | false |
+| 409 | `FILE_DUPLICATE` | ไฟล์เนื้อหาเดียวกันมีอยู่ใน Knowledge Base แล้ว (`error.document_id` คือฉบับเดิม) | false |
+| 409 | `EXTERNAL_ID_EXISTS` | มีเอกสาร `external_id` เดียวกันอยู่แล้ว (`error.document_id` คือฉบับเดิม) | false |
+| 400 | `EXTERNAL_ID_INVALID` | `external_id` ยาวเกิน 200 ตัวอักษร | false |
+| 400 | `LOOKUP_INVALID` | lookup ไม่มีค่า มีเกิน 100 ค่า หรือ checksum ไม่ใช่เลขฐานสิบหก 64 ตัว | false |
 | 400 | `FILE_TYPE_NOT_SUPPORTED` | นามสกุลไฟล์ไม่รองรับ | false |
 | 400 | `FILE_MIME_TYPE_NOT_SUPPORTED` | MIME type ไม่ตรงกับนามสกุลไฟล์ | false |
 | 400 | `DOCUMENT_TYPE_INVALID` | `document_type` ไม่ถูกต้อง | false |
@@ -426,7 +574,10 @@ if (documentId) console.log(await waitFor(documentId));
 เพื่อไม่ให้ token ใบหนึ่งใช้ผลลัพธ์ต่างกันมาไล่เดา (enumerate) ทรัพยากรของคนอื่น
 
 `FILE_DUPLICATE` ตอบ `409` (ต่างจากหน้าอัปโหลดใน UI ที่ใช้ `400`) เพื่อให้ client ที่ retry แยกได้ว่า
-"ส่งซ้ำ" ไม่ใช่ "ส่งผิด" — กรณีนี้ปลอดภัยที่จะข้ามไป ไม่ต้องส่งใหม่
+"ส่งซ้ำ" ไม่ใช่ "ส่งผิด" — กรณีนี้ปลอดภัยที่จะข้ามไป ไม่ต้องส่งใหม่ ใช้ `error.document_id` ผูกไฟล์ในระบบต้นทางกับเอกสารเดิมได้
+ใน batch รายการที่ซ้ำจะมี `document_id` ใน `results[]` เช่นกัน
+
+ตารางนี้คือรหัสที่ตอบตอนส่ง รหัสทั้งหมดรวมรหัสระหว่างประมวลผลพร้อม `client_action` อ่านได้จาก `GET /api/v1/ingest/error-codes`
 
 เฉพาะ error ที่ `retryable: true` ควร retry ให้หน่วงแบบ exponential backoff อย่าวน retry ทันที
 

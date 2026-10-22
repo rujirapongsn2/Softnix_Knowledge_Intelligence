@@ -31,10 +31,9 @@ for arg in "$@"; do
   case "$arg" in --no-worker) NO_WORKER=1 ;; --force) FORCE=1 ;; -*) echo "unknown option $arg" >&2; exit 2 ;; *) BACKUP=$arg ;; esac
 done
 [ -n "$BACKUP" ] && [ -f "$BACKUP/manifest.json" ] || { echo "usage: bash deploy/restore.sh BACKUP_DIR [--no-worker] [--force]" >&2; exit 2; }
-PROJECT=$(docker compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')
-log() { printf '[%s] %s: %s\n' "$(date +%T)" "$PROJECT" "$*"; }
+log() { printf '[%s] %s: %s\n' "$(date +%T)" "${PROJECT:-restore}" "$*"; }
 quiet() { local output; output=$("$@" 2>&1) || { printf '%s\n' "$output" | tail -20; return 1; }; }
-env_value() { grep -E "^$1=" "$2" | tail -1 | cut -d= -f2-; }
+env_value() { grep -E "^$1=" "$2" | tail -1 | cut -d= -f2- || true; }
 
 log "verify $BACKUP"
 python3 - "$BACKUP" <<'EOF'
@@ -56,15 +55,18 @@ else
       || { log ".env has a different $name from the backup; sessions and API tokens would stop working"; exit 1; }
   done
 fi
+# docker compose reads .env, so on a new machine the project is known only once .env came from the backup.
+PROJECT=$(docker compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')
 
 log "postgres"
-docker compose stop worker api lightrag neo4j >/dev/null 2>&1 || true
 quiet docker compose up -d postgres
 for _ in $(seq 60); do docker compose exec -T postgres pg_isready -U skip -d skip >/dev/null 2>&1 && break; sleep 2; done
 existing=$(sql "select count(*) from information_schema.tables where table_name = 'documents'")
 if [ "$existing" != 0 ] && [ "$(sql "select count(*) from documents")" != 0 ] && [ "$FORCE" = 0 ]; then
   log "this project already holds documents; pass --force to replace them"; exit 1
 fi
+# Stopped only now, so a refused restore leaves a running installation as it was.
+docker compose stop worker api lightrag neo4j >/dev/null 2>&1 || true
 sql "set client_min_messages = warning; drop schema public cascade; create schema public;" >/dev/null
 docker compose exec -T postgres pg_restore -U skip -d skip --no-owner --exit-on-error < "$BACKUP/postgres.dump"
 

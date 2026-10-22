@@ -333,7 +333,9 @@ class LightRAGRetrievalEngine(RetrievalEngine):
     def query(self, query: str, knowledge_base_ids: list[str], limit: int) -> RetrievalEvidence:
         if len(knowledge_base_ids) != 1:
             raise RuntimeError("MULTI_KNOWLEDGE_BASE_ENGINE_QUERY_UNSUPPORTED")
-        data = self._request("POST", "/query", json={
+        # /query/data returns what LightRAG retrieved without having its LLM write an answer. /query wrote one on
+        # every call and this adapter discarded it: on dev that answer took about 10 of a fresh query's 14 seconds.
+        data = self._request("POST", "/query/data", json={
             "query": protect_query_text(query),
             "mode": "mix",
             "include_references": True,
@@ -341,9 +343,16 @@ class LightRAGRetrievalEngine(RetrievalEngine):
             "enable_rerank": self.reranker_enabled,
             "top_k": limit,
         })
+        retrieved = data.get("data") or {}
+        # Each reference is one source document; its chunks carry the reference_id, in LightRAG's order.
+        contents: dict[str, list[str]] = {}
+        for chunk in retrieved.get("chunks", []):
+            contents.setdefault(str(chunk.get("reference_id")), []).append(chunk.get("content") or "")
+        references = [{**reference, "content": contents.get(str(reference.get("reference_id")), [])}
+                      for reference in retrieved.get("references", [])]
         sources: list[dict] = []
         requested_knowledge_base_id = knowledge_base_ids[0]
-        for index, reference in enumerate(data.get("references", [])[:limit], 1):
+        for index, reference in enumerate(references[:limit], 1):
             file_path = reference.get("file_path", "")
             source_identity = self._decode_source_label(file_path)
             # The configured development LightRAG server shares one index and
@@ -363,8 +372,6 @@ class LightRAGRetrievalEngine(RetrievalEngine):
                 "excerpt": content or "",
                 "relevance": reference.get("score", 0.0),
             })
-        # The current development LightRAG deployment has a shared index. Its
-        # generated response may synthesize content from references outside the
-        # selected KB, so only return identity-checked evidence. The platform
-        # generates the final answer from these scoped excerpts.
+        # LightRAG shares one index across Knowledge Bases, so only identity-checked
+        # evidence is returned; the platform writes the answer from these excerpts.
         return RetrievalEvidence(sources, [], [], [], None)

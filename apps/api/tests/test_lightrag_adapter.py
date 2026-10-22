@@ -14,9 +14,17 @@ def test_lightrag_adapter_ingests_and_maps_citations():
             payload = json.loads(request.content)
             assert payload == {"text": "[softnix-kb:kb-1]\nCustomer Portal is hosted on APP-01.", "file_source": "skip/kb-1/softnix-kb=kb-1__doc=doc-1__Architecture"}
             return httpx.Response(202, json={"track_id": "track-1"})
-        return httpx.Response(200, json={"response": "Customer Portal is hosted on APP-01.", "references": [{
-            "reference_id": "chunk-7", "file_path": "softnix-kb=kb-1__doc=doc-1__Architecture", "content": ["Customer Portal is hosted on APP-01."], "score": 0.94,
-        }, {"reference_id": "other", "file_path": "softnix-kb=other-kb__doc=other-doc__Other", "content": ["must be filtered"], "score": 1.0}]})
+        assert request.url.path == "/query/data", "retrieval only: LightRAG must not write an answer the platform discards"
+        return httpx.Response(200, json={"status": "success", "data": {
+            "entities": [], "relationships": [],
+            "chunks": [
+                {"reference_id": "1", "content": "Customer Portal is hosted on APP-01.", "file_path": "softnix-kb=kb-1__doc=doc-1__Architecture", "chunk_id": "c-1"},
+                {"reference_id": "2", "content": "must be filtered", "file_path": "softnix-kb=other-kb__doc=other-doc__Other", "chunk_id": "c-9"},
+                {"reference_id": "1", "content": "APP-01 runs in the primary data centre.", "file_path": "softnix-kb=kb-1__doc=doc-1__Architecture", "chunk_id": "c-2"},
+            ],
+            "references": [{"reference_id": "1", "file_path": "softnix-kb=kb-1__doc=doc-1__Architecture"},
+                           {"reference_id": "2", "file_path": "softnix-kb=other-kb__doc=other-doc__Other"}],
+        }, "metadata": {"query_mode": "mix"}})
 
     engine = LightRAGRetrievalEngine(base_url="http://lightrag.test", api_key="key", client=httpx.Client(transport=httpx.MockTransport(handler)))
     assert engine.ingest("doc-1", "kb-1", "Customer Portal is hosted on APP-01.", "Architecture") == "track-1"
@@ -25,7 +33,8 @@ def test_lightrag_adapter_ingests_and_maps_citations():
     assert evidence.sources[0]["citation_id"] == "S1"
     assert evidence.sources[0]["document_id"] == "doc-1"
     assert evidence.sources[0]["title"] == "Architecture"
-    assert len(evidence.sources) == 1
+    assert len(evidence.sources) == 1, "another Knowledge Base's reference is filtered out"
+    assert evidence.sources[0]["excerpt"] == "Customer Portal is hosted on APP-01.\n\nAPP-01 runs in the primary data centre.", "a document's chunks are joined in order"
     assert requests[0].headers["X-API-Key"] == "key"
 
 

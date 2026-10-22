@@ -104,10 +104,22 @@ _THAI_MONTHS = {
     "กรกฎาคม": 7, "สิงหาคม": 8, "กันยายน": 9, "ตุลาคม": 10, "พฤศจิกายน": 11, "ธันวาคม": 12,
 }
 _THAI_DATE_PATTERN = re.compile(r"([0-9๐-๙]{1,2})\s*(" + "|".join(_THAI_MONTHS) + r")\s*([0-9๐-๙]{4})")
+_ISO_DATE_PATTERN = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
+
+
+def gregorian_year(year: int, month: int) -> int:
+    """The Common Era year of a Thai date; a year above 2400 is Buddhist Era.
+
+    Until พ.ศ. 2483 the Thai year began on 1 April, so January to March of those years fall in the next
+    Common Era year: 10 มีนาคม 2476 is 1934-03-10.
+    """
+    if year <= 2400:
+        return year
+    return year - 542 if year <= 2483 and month <= 3 else year - 543
 
 
 def parse_thai_date(value) -> date | None:
-    """Parse a Buddhist- or Christian-era Thai date, an ISO date, or pass a date through."""
+    """Parse a Buddhist- or Christian-era Thai date, an ISO date in either era, or pass a date through."""
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -122,14 +134,17 @@ def parse_thai_date(value) -> date | None:
         day = int(_to_arabic_digits(match.group(1)))
         month = _THAI_MONTHS[match.group(2)]
         year = int(_to_arabic_digits(match.group(3)))
-        if year > 2400:
-            year -= 543
         try:
-            return date(year, month, day)
+            return date(gregorian_year(year, month), month, day)
         except ValueError:
             return None
+    # Models write ISO dates with the Buddhist year too ("2550-10-01"), sometimes inside other text ("พ.ศ. 2562-10-01").
+    iso = _ISO_DATE_PATTERN.search(_to_arabic_digits(text))
+    if not iso:
+        return None
+    year, month, day = (int(part) for part in iso.groups())
     try:
-        return date.fromisoformat(_to_arabic_digits(text)[:10])
+        return date(gregorian_year(year, month), month, day)
     except ValueError:
         return None
 

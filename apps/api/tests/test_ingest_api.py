@@ -706,3 +706,142 @@ def test_new_tokens_get_the_default_limits_of_their_kind():
     assert (ingest["requests_per_minute"], ingest["max_concurrent_requests"]) == (600, 10)
     assert (mcp["requests_per_minute"], mcp["max_concurrent_requests"]) == (60, 5)
     assert (chosen["requests_per_minute"], chosen["max_concurrent_requests"]) == (30, 2), "an explicit limit is kept"
+
+
+def test_limits_tell_a_sender_what_an_upload_may_be():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-limits-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id], requests_per_minute=120, max_concurrent_requests=3)
+    from app.config import get_settings
+    limits = test_client.get("/api/v1/ingest/limits", headers=_headers(secret)).json()
+    assert limits["file"]["max_bytes"] == get_settings().max_file_size_mb * 1024 * 1024
+    assert ".md" in limits["file"]["extensions"] and ".pdf" in limits["reference_file"]["extensions"]
+    assert limits["batch"]["max_files"] == 20
+    assert limits["token"] == {"knowledge_base_id": kb_id, "requests_per_minute": 120, "max_concurrent_requests": 3, "expires_at": None}
+
+
+def test_error_catalogue_covers_every_code_the_pipeline_retries_or_pauses_on():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-errors-{uuid.uuid4().hex[:8]}")
+    from app.provider_holds import HOLD_CODES
+    from app.retry_policy import PROCESSING_RETRY_POLICIES
+    items = {item["code"]: item for item in test_client.get("/api/v1/ingest/error-codes", headers=_headers(_token(test_client, [kb_id]))).json()["items"]}
+    missing = (set(PROCESSING_RETRY_POLICIES) | set(HOLD_CODES)) - set(items)
+    assert not missing, f"codes a document can wait on but the catalogue does not explain: {missing}"
+    assert all(items[code]["retryable"] and items[code]["client_action"] == "wait" for code in PROCESSING_RETRY_POLICIES)
+    assert items["FILE_DUPLICATE"] == {"code": "FILE_DUPLICATE", "stage": "request", "http_status": 409, "retryable": False,
+                                       "client_action": "skip", "description": items["FILE_DUPLICATE"]["description"]}
+
+
+def test_a_resent_document_is_refused_with_the_id_of_the_one_already_there():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-idempotent-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    first = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents", headers=_headers(secret),
+                             files={"file": ("a.md", b"# First", "text/markdown")}, data={"external_id": "dms-42"}).json()
+    assert first["external_id"] == "dms-42"
+
+    same_content = _upload(test_client, secret, kb_id, "copy.md", b"# First")
+    assert same_content.status_code == 409
+    assert same_content.json()["error"] == {"code": "FILE_DUPLICATE", "message": "Upload rejected", "retryable": False, "document_id": first["document_id"]}
+
+    same_key = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents", headers=_headers(secret),
+                                files={"file": ("b.md", b"# Changed", "text/markdown")}, data={"external_id": "dms-42"})
+    assert (same_key.status_code, same_key.json()["error"]["code"], same_key.json()["error"]["document_id"]) == (409, "EXTERNAL_ID_EXISTS", first["document_id"])
+    as_text = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents/text", headers=_headers(secret),
+                               json={"title": "t", "text": "# Other", "external_id": "dms-42"})
+    assert (as_text.status_code, as_text.json()["error"]["document_id"]) == (409, first["document_id"]), "the text endpoint honours external_id too"
+    too_long = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents/text", headers=_headers(secret),
+                                json={"title": "t", "text": "# Other", "external_id": "x" * 201})
+    assert (too_long.status_code, too_long.json()["error"]["code"]) == (400, "EXTERNAL_ID_INVALID")
+
+    assert test_client.delete(f"/api/v1/ingest/documents/{first['document_id']}", headers=_headers(secret)).status_code == 200
+    again = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents", headers=_headers(secret),
+                             files={"file": ("b.md", b"# Changed", "text/markdown")}, data={"external_id": "dms-42"})
+    assert again.status_code == 202, "a deleted document frees its external_id"
+
+
+def test_lookup_finds_live_documents_by_checksum_or_external_id_within_the_token_scope():
+    import hashlib
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-lookup-{uuid.uuid4().hex[:8]}")
+    other_kb = _knowledge_base(test_client, f"ingest-lookup-other-{uuid.uuid4().hex[:8]}")
+    secret, other_secret = _token(test_client, [kb_id]), _token(test_client, [other_kb])
+    body = f"lookup {uuid.uuid4()}".encode()
+    mine = test_client.post(f"/api/v1/ingest/knowledge-bases/{kb_id}/documents", headers=_headers(secret),
+                            files={"file": ("a.txt", body, "text/plain")}, data={"external_id": "erp-7"}).json()
+    foreign = f"foreign {uuid.uuid4()}".encode()
+    _upload(test_client, other_secret, other_kb, "f.txt", foreign)
+
+    url = f"/api/v1/ingest/knowledge-bases/{kb_id}/documents/lookup"
+    items = test_client.post(url, headers=_headers(secret), json={
+        "checksums_sha256": [hashlib.sha256(body).hexdigest().upper(), hashlib.sha256(foreign).hexdigest()],
+        "external_ids": ["erp-7", "erp-missing"]}).json()["items"]
+    assert [(item.get("checksum_sha256") or item.get("external_id"), (item["document"] or {}).get("document_id")) for item in items] == [
+        (hashlib.sha256(body).hexdigest(), mine["document_id"]), (hashlib.sha256(foreign).hexdigest(), None),
+        ("erp-7", mine["document_id"]), ("erp-missing", None)], "another Knowledge Base's document is not found"
+    assert items[0]["document"]["checksum_sha256"] == hashlib.sha256(body).hexdigest()
+    for bad in ({}, {"checksums_sha256": ["not-hex"]}, {"external_ids": ["x"] * 101}):
+        response = test_client.post(url, headers=_headers(secret), json=bad)
+        assert (response.status_code, response.json()["error"]["code"]) == (400, "LOOKUP_INVALID"), bad
+
+
+def test_queue_counts_the_active_queue_and_says_when_processing_is_paused():
+    from datetime import datetime, timedelta
+    from app.models import ProviderHold
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-queue-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    ids = [_upload(test_client, secret, kb_id, f"q{i}.txt", f"queue {uuid.uuid4()}".encode()).json()["document_id"] for i in range(2)]
+    with SessionLocal() as db:
+        job = db.query(ProcessingJob).filter_by(document_id=ids[1]).one()
+        job.error_code, job.next_attempt_at = "RETRIEVAL_ENGINE_BUSY", datetime.utcnow() + timedelta(minutes=5)
+        db.add(ProviderHold(provider="llm", reason_code="LLM_CREDITS_EXHAUSTED"))
+        db.commit()
+    try:
+        queue = test_client.get(f"/api/v1/ingest/knowledge-bases/{kb_id}/queue", headers=_headers(secret)).json()
+        own = queue["knowledge_base"]
+        assert (own["active_documents"], own["in_flight_documents"], own["jobs"]) == (2, 2, {"queued": 2, "running": 0, "waiting_to_retry": 1})
+        assert queue["active_queue"]["documents"] >= 2, "the Active Queue counts every Knowledge Base"
+        assert queue["processing"] == "paused" and queue["holds"][0]["reason_code"] == "LLM_CREDITS_EXHAUSTED"
+        waiting = test_client.get(f"/api/v1/ingest/documents/{ids[1]}", headers=_headers(secret)).json()
+        assert waiting["waiting_for"] == "RETRIEVAL_ENGINE_BUSY" and waiting["next_attempt_at"].endswith("Z")
+    finally:
+        with SessionLocal() as db:
+            db.query(ProviderHold).filter_by(provider="llm").delete()
+            db.query(ProcessingJob).filter(ProcessingJob.document_id.in_(ids)).update({"status": "cancelled"}, synchronize_session=False)
+            db.commit()
+    assert test_client.get(f"/api/v1/ingest/knowledge-bases/{kb_id}/queue", headers=_headers(secret)).json()["processing"] == "running"
+
+
+def test_a_failed_document_says_whether_it_can_succeed_later_and_what_to_do():
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-failed-{uuid.uuid4().hex[:8]}")
+    secret = _token(test_client, [kb_id])
+    document_id = _upload(test_client, secret, kb_id, "f.txt", f"failed {uuid.uuid4()}".encode()).json()["document_id"]
+    assert test_client.get(f"/api/v1/ingest/documents/{document_id}", headers=_headers(secret)).json()["retryable"] is None, "only a failed document gets a verdict"
+    with SessionLocal() as db:
+        doc = db.get(Document, document_id)
+        doc.status, doc.error_code = "failed", "TEXT_EXTRACTION_FAILED"
+        db.query(ProcessingJob).filter_by(document_id=document_id).update({"status": "failed"})
+        db.commit()
+    view = test_client.get(f"/api/v1/ingest/documents/{document_id}", headers=_headers(secret)).json()
+    assert (view["retryable"], view["client_action"], view["waiting_for"]) == (False, "fix_file", None)
+
+
+def test_a_concurrent_resend_that_slips_past_the_check_still_names_the_document():
+    from sqlalchemy.exc import IntegrityError
+    from app.services import DocumentExists, document_exists_error
+    test_client = next(client())
+    kb_id = _knowledge_base(test_client, f"ingest-race-{uuid.uuid4().hex[:8]}")
+    first = _upload(test_client, _token(test_client, [kb_id]), kb_id, "r.txt", f"race {uuid.uuid4()}".encode()).json()["document_id"]
+    with SessionLocal() as db:
+        db.get(Document, first).external_id = "race-1"
+        db.commit()
+        db.add(Document(knowledge_base_id=kb_id, external_id="race-1", original_filename="r2.txt", stored_filename="r2.txt",
+                        storage_path="/nowhere", mime_type="text/plain", file_size=1, checksum_sha256=uuid.uuid4().hex))
+        with pytest.raises(IntegrityError) as raised:
+            db.flush()
+        db.rollback()
+        exists = document_exists_error(db, kb_id, str(raised.value), "unused", "race-1")
+    assert isinstance(exists, DocumentExists) and (str(exists), exists.document_id) == ("EXTERNAL_ID_EXISTS", first)

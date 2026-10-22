@@ -42,7 +42,8 @@ from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, D
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
 from .job_queue import lock_knowledge_base_graph, release_if_stale
-from .services import DEFAULT_RETRIEVAL_CONFIG, analyze_impact, apply_answer_reference_contract, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, enrich_sources_with_file_links, entity_graph, process_next_job, public_document_base_url, queue_embedding_reindex, reference_file_available, reference_pdf_available, refresh_saved_answer_citations, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
+from .ingest_contract import INGEST_MAX_BATCH_FILES, LIST_MAX_LIMIT, LOOKUP_MAX_ITEMS, error_catalog, error_code_info, limits_view, queue_view, waiting_view
+from .services import DEFAULT_RETRIEVAL_CONFIG, DocumentExists, analyze_impact, apply_answer_reference_contract, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, enrich_sources_with_file_links, entity_graph, process_next_job, public_document_base_url, queue_embedding_reindex, reference_file_available, reference_pdf_available, refresh_saved_answer_citations, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
 app = FastAPI(title="Softnix Knowledge Intelligence Platform", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:8080", "http://localhost:8081"], allow_credentials=True,
@@ -1028,7 +1029,8 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
             db.commit()
             result.update({"status": "queued", "document_id": doc.id, "job_id": job.id, "legal_extraction_automatic": profile in {"legal", "regulation", "contract"}})
         except ValueError as exc:
-            result.update({"error_code": str(exc), "message": "Upload rejected"})
+            result.update({"error_code": str(exc), "message": "Upload rejected",
+                           **({"document_id": exc.document_id} if isinstance(exc, DocumentExists) else {})})
         except Exception:
             db.rollback()
             result.update({"error_code": "UPLOAD_FAILED", "message": "Upload could not be queued"})
@@ -1903,7 +1905,7 @@ def legal_graph_rebuild_status(kb_id: str, user: User = Depends(current_admin), 
     if not job:
         return {"status": "not_started", "job_id": None}
     return {"status": job.status, "job_id": job.id, "stage": job.current_stage, "progress_percent": job.progress_percent,
-            "error_code": job.error_code, "error_message": job.error_message}
+            "error_code": job.error_code, "error_message": job.error_message, **waiting_view(job)}
 
 
 @app.patch("/api/v1/relationships/{relationship_id}/legal-review", response_model=RelationshipOut)
@@ -2988,9 +2990,6 @@ async def mcp(request: Request, db: Session = Depends(get_db)):
         if acquired and token is not None: mcp_limiter.release(token)
 
 
-INGEST_MAX_BATCH_FILES = 20
-
-
 def ingest_budget(token: TokenKey = Depends(ingest_token)):
     """Charge an ingest call against the token's shared rate and concurrency budget.
 
@@ -3040,10 +3039,16 @@ def ingest_job_view(job: ProcessingJob) -> dict:
 
 def ingest_document_view(db: Session, doc: Document) -> dict:
     job = db.query(ProcessingJob).filter_by(document_id=doc.id).order_by(ProcessingJob.created_at.desc()).first()
-    return {"document_id": doc.id, "knowledge_base_id": doc.knowledge_base_id, "title": doc.title,
-            "filename": doc.original_filename, "status": doc.status, "document_type": doc.document_type,
+    info = error_code_info(doc.error_code) if doc.status == "failed" else None
+    return {"document_id": doc.id, "knowledge_base_id": doc.knowledge_base_id, "external_id": doc.external_id,
+            "title": doc.title, "filename": doc.original_filename, "checksum_sha256": doc.checksum_sha256,
+            "status": doc.status, "document_type": doc.document_type,
             "document_type_id": doc.metadata_template_id,
-            "error_code": doc.error_code, "created_at": doc.created_at,
+            "error_code": doc.error_code, "error_message": doc.error_message,
+            # Only for a failed document: whether it can succeed later unchanged, and what the sender should do.
+            "retryable": info.retryable if info else None, "client_action": info.client_action if info else None,
+            "created_at": doc.created_at, "updated_at": doc.updated_at, "indexed_at": doc.indexed_at,
+            **waiting_view(job),
             "latest_job": ingest_job_view(job) if job else None,
             "reference_file": reference_file_view(doc, ingest=True),
             "reference_pdf": reference_pdf_view(doc, ingest=True)}
@@ -3052,9 +3057,13 @@ def ingest_document_view(db: Session, doc: Document) -> dict:
 def ingest_upload_error(exc: ValueError) -> HTTPException:
     code = str(exc)
     # A duplicate is a conflict rather than a bad request so a retrying client can
-    # tell "already sent this" apart from "sent something invalid".
-    status_code = 413 if code == "FILE_TOO_LARGE" else 409 if code == "FILE_DUPLICATE" else 400
-    return HTTPException(status_code, {"code": code, "message": "Upload rejected", "retryable": False})
+    # tell "already sent this" apart from "sent something invalid", and it names
+    # the document already there.
+    status_code = 413 if code == "FILE_TOO_LARGE" else 409 if isinstance(exc, DocumentExists) else 400
+    body = {"code": code, "message": "Upload rejected", "retryable": False}
+    if isinstance(exc, DocumentExists):
+        body["document_id"] = exc.document_id
+    return HTTPException(status_code, body)
 
 
 def record_ingest_audit(db: Session, token: TokenKey, doc: Document, kb_id: str, *, batch: bool = False) -> None:
@@ -3101,14 +3110,14 @@ def ingest_upload_document(kb_id: str, file: UploadFile = File(...), title: str 
                            document_type_id: str | None = Form(None),
                            metadata_json: str | None = Form(None), published_at: date | None = Form(None),
                            reference_pdf: UploadFile | None = File(None),
-                           reference_file: UploadFile | None = File(None),
+                           reference_file: UploadFile | None = File(None), external_id: str | None = Form(None),
                            token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
     ingest_knowledge_base(db, token, kb_id)
     try:
         selected_type_id = ingest_document_type_id(document_type_id, template_id)
         template, profile, metadata = _upload_metadata(selected_type_id, document_type, metadata_json, db, kb_id)
         doc, job = create_document_job(db, kb_id, file, title, profile, published_at, template, metadata,
-                                       reference_pdf=reference_pdf, reference_file=reference_file)
+                                       reference_pdf=reference_pdf, reference_file=reference_file, external_id=external_id)
     except ValueError as exc:
         record_ingest_rejection(db, token, kb_id, file.filename, str(exc))
         raise ingest_upload_error(exc)
@@ -3120,7 +3129,7 @@ def ingest_upload_document(kb_id: str, file: UploadFile = File(...), title: str 
         db.commit()
     except Exception:
         db.rollback()
-    return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type,
+    return {"status": "queued", "document_id": doc.id, "job_id": job.id, "external_id": doc.external_id, "document_type": doc.document_type,
             "document_type_id": doc.metadata_template_id, "template_id": doc.metadata_template_id,
             "reference_file": reference_file_view(doc, ingest=True),
             "reference_pdf": reference_pdf_view(doc, ingest=True)}
@@ -3180,6 +3189,7 @@ class IngestTextRequest(BaseModel):
     template_id: str | None = None
     metadata_json: str | None = None
     published_at: date | None = None
+    external_id: str | None = None
 
 
 @app.post("/api/v1/ingest/knowledge-bases/{kb_id}/documents/text", status_code=202)
@@ -3197,7 +3207,7 @@ def ingest_upload_document_text(kb_id: str, body: IngestTextRequest,
         selected_type_id = ingest_document_type_id(body.document_type_id, body.template_id)
         template, profile, metadata = _upload_metadata(selected_type_id, body.document_type, body.metadata_json, db, kb_id)
         doc, job = create_text_document_job(db, kb_id, body.title, body.text, profile, body.published_at,
-                                            template, metadata)
+                                            template, metadata, external_id=body.external_id)
     except ValueError as exc:
         record_ingest_rejection(db, token, kb_id, body.title, str(exc))
         raise ingest_upload_error(exc)
@@ -3206,7 +3216,7 @@ def ingest_upload_document_text(kb_id: str, body: IngestTextRequest,
         db.commit()
     except Exception:
         db.rollback()
-    return {"status": "queued", "document_id": doc.id, "job_id": job.id, "document_type": doc.document_type,
+    return {"status": "queued", "document_id": doc.id, "job_id": job.id, "external_id": doc.external_id, "document_type": doc.document_type,
             "document_type_id": doc.metadata_template_id, "template_id": doc.metadata_template_id}
 
 
@@ -3266,8 +3276,8 @@ def ingest_upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...
 def ingest_list_documents(kb_id: str, status: str | None = None, limit: int = 50, offset: int = 0,
                           token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
     ingest_knowledge_base(db, token, kb_id)
-    if limit < 1 or limit > 100 or offset < 0:
-        raise HTTPException(400, {"code": "DOCUMENT_PAGE_INVALID", "message": "limit must be 1-100 and offset must be non-negative.", "retryable": False})
+    if limit < 1 or limit > LIST_MAX_LIMIT or offset < 0:
+        raise HTTPException(400, {"code": "DOCUMENT_PAGE_INVALID", "message": f"limit must be 1-{LIST_MAX_LIMIT} and offset must be non-negative.", "retryable": False})
     rows = db.query(Document).filter(Document.knowledge_base_id == kb_id, Document.live())
     if status:
         rows = rows.filter(Document.status == status)
@@ -3281,6 +3291,45 @@ def ingest_list_document_types(kb_id: str, token: TokenKey = Depends(ingest_budg
     """List active built-in and custom document types available for ingestion."""
     ingest_knowledge_base(db, token, kb_id)
     return {"items": list_templates(db, kb_id)}
+
+
+@app.get("/api/v1/ingest/limits")
+def ingest_limits(token: TokenKey = Depends(ingest_budget)):
+    """What this platform accepts and this token's budget, to check a file before sending it."""
+    return limits_view(token)
+
+
+@app.get("/api/v1/ingest/error-codes")
+def ingest_error_codes(_: TokenKey = Depends(ingest_budget)):
+    """Every error code a sender can meet, with whether it can succeed later and what to do about it."""
+    return {"items": error_catalog()}
+
+
+@app.get("/api/v1/ingest/knowledge-bases/{kb_id}/queue")
+def ingest_queue(kb_id: str, token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    """The Active Queue in numbers, this Knowledge Base's share of it, and whether processing is paused."""
+    ingest_knowledge_base(db, token, kb_id)
+    return queue_view(db, kb_id)
+
+
+class IngestLookupRequest(BaseModel):
+    checksums_sha256: list[str] = Field(default_factory=list)
+    external_ids: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/v1/ingest/knowledge-bases/{kb_id}/documents/lookup")
+def ingest_lookup_documents(kb_id: str, body: IngestLookupRequest, token: TokenKey = Depends(ingest_budget), db: Session = Depends(get_db)):
+    """Find live documents by content checksum or external_id before uploading, or after a lost response."""
+    ingest_knowledge_base(db, token, kb_id)
+    checksums = [value.strip().lower() for value in body.checksums_sha256]
+    if not 0 < len(checksums) + len(body.external_ids) <= LOOKUP_MAX_ITEMS or not all(re.fullmatch(r"[0-9a-f]{64}", value) for value in checksums):
+        raise HTTPException(400, {"code": "LOOKUP_INVALID", "message": f"Send 1-{LOOKUP_MAX_ITEMS} values; a checksum is 64 hex characters.", "retryable": False})
+    live = db.query(Document).filter(Document.knowledge_base_id == kb_id, Document.live())
+    by_checksum = {doc.checksum_sha256: doc for doc in live.filter(Document.checksum_sha256.in_(checksums))} if checksums else {}
+    by_external = {doc.external_id: doc for doc in live.filter(Document.external_id.in_(body.external_ids))} if body.external_ids else {}
+    view = lambda doc: ingest_document_view(db, doc) if doc else None
+    return {"items": [{"checksum_sha256": value, "document": view(by_checksum.get(value))} for value in checksums]
+                     + [{"external_id": value, "document": view(by_external.get(value))} for value in body.external_ids]}
 
 
 @app.get("/api/v1/ingest/documents/{document_id}")

@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from docx import Document as WordDocument
 import httpx
 from markitdown import MarkItDown
-from sqlalchemy import Text, and_, cast, func, or_
+from sqlalchemy import Text, and_, cast, func, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
@@ -3380,6 +3380,12 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
         _append_retrieval_trace(trace, channel="semantic_vector", system="Embedding server → PostgreSQL + pgvector",
                                 status="unavailable", started_at=started_at, detail=str(exc))
         return RetrievalEvidence([], [], [], [])
+    # The HNSW index returns the ef_search nearest chunks of every Knowledge Base, and the Knowledge Base filter
+    # runs after it: a small Knowledge Base whose chunks were not among them got no vector results at all (84 of
+    # 430 real queries on dev). An iterative scan keeps reading the index until the filtered limit is met.
+    # relaxed_order may return rows slightly out of distance order, so they are sorted again below.
+    db.execute(text("SET LOCAL hnsw.iterative_scan = relaxed_order"))
+    db.execute(text("SET LOCAL hnsw.ef_search = 100"))
     distance = DocumentChunk.embedding.cosine_distance(query_vector)
     rows = db.query(DocumentChunk, Document, distance.label("distance")).join(
         Document, Document.id == DocumentChunk.document_id
@@ -3390,7 +3396,7 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
     rows = _apply_metadata_filter(rows, plan)
     rows = _apply_legal_filter(rows, plan)
     rows = _apply_provision_filter(rows, plan)
-    records = rows.order_by(distance).limit(limit).all()
+    records = sorted(rows.order_by(distance).limit(limit).all(), key=lambda record: record[2])
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
                 "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": max(0.0, 1.0 - float(item_distance)),
                 "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}

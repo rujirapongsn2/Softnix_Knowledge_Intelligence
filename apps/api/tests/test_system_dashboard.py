@@ -251,13 +251,14 @@ def test_error_timeline_stacks_each_day_by_group_and_splits_failed_from_retried(
         seed_job(db, kb["id"], None, status="failed", error_code="METADATA_EXTRACTION_INVALID_RESPONSE", updated_at=now - timedelta(days=40))
         db.commit()
 
-    timeline = tc.get("/api/v1/system/dashboard?days=7").json()["ingest_metrics"]["error_timeline"]
-    assert (timeline["days"], timeline["timezone"], timeline["groups"]) == (7, "Asia/Bangkok", list(GROUPS))
+    timeline = tc.get("/api/v1/system/dashboard?range=7d").json()["ingest_metrics"]["error_timeline"]
+    assert (timeline["range"], timeline["bucket"], timeline["timezone"], timeline["groups"]) == ("7d", "day", "Asia/Bangkok", list(GROUPS))
     assert len(timeline["series"]) == 7
-    by_day = {day["date"]: day for day in timeline["series"]}
+    by_day = {day["start"]: day for day in timeline["series"]}
     from zoneinfo import ZoneInfo
-    from datetime import timezone
-    local = lambda moment: moment.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Bangkok")).date().isoformat()
+    from datetime import time, timezone
+    bangkok = ZoneInfo("Asia/Bangkok")
+    local = lambda moment: datetime.combine(moment.replace(tzinfo=timezone.utc).astimezone(bangkok).date(), time.min, bangkok).isoformat()
     first, second = by_day[local(early)], by_day[local(late_yesterday)]
     assert first is not second, "the Bangkok day boundary splits 16:00 and 18:00 UTC"
     assert (first["failed"]["retrieval_engine"], first["retried"]["retrieval_engine"]) == (1, 1)
@@ -267,7 +268,35 @@ def test_error_timeline_stacks_each_day_by_group_and_splits_failed_from_retried(
     assert "DOCUMENT_DELETED" not in totals, "a job cancelled by a delete is not an error"
     assert "METADATA_EXTRACTION_INVALID_RESPONSE" not in totals, "a job outside the range is not counted"
     assert {row["error_code"] for row in timeline["totals"]} == {"RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "OCR_CHAIN_FAILED"}
-    longer = tc.get("/api/v1/system/dashboard?days=90").json()["ingest_metrics"]["error_timeline"]
+    longer = tc.get("/api/v1/system/dashboard?range=90d").json()["ingest_metrics"]["error_timeline"]
     assert "METADATA_EXTRACTION_INVALID_RESPONSE" in {row["error_code"] for row in longer["totals"]}
-    bad = tc.get("/api/v1/system/dashboard?days=12")
+    bad = tc.get("/api/v1/system/dashboard?range=12d")
     assert (bad.status_code, bad.json()["error"]["code"]) == (400, "DASHBOARD_RANGE_INVALID")
+
+
+def test_error_timeline_over_24_hours_has_one_bar_per_local_hour():
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    from app.db import SessionLocal
+    tc = next(client())
+    group = make_group(tc, "DashHourly")
+    make_user(tc, "hourlymgr", role="manager", group_id=group["id"])
+    make_user(tc, "hourlyowner", group_id=group["id"])
+    login_as(tc, "hourlyowner")
+    kb = tc.post("/api/v1/knowledge-bases", json={"name": "Hourly KB", "code": "hourly-kb"}).json()
+    login_as(tc, "hourlymgr")
+    now = datetime.utcnow()
+    with SessionLocal() as db:
+        seed_job(db, kb["id"], None, status="failed", error_code="OCR_CHAIN_FAILED", updated_at=now - timedelta(minutes=1))
+        seed_job(db, kb["id"], None, status="failed", error_code="RETRIEVAL_ENGINE_REJECTED", updated_at=now - timedelta(hours=3))
+        seed_job(db, kb["id"], None, status="failed", error_code="LLM_UNAVAILABLE", updated_at=now - timedelta(hours=25))
+        db.commit()
+
+    timeline = tc.get("/api/v1/system/dashboard?range=24h").json()["ingest_metrics"]["error_timeline"]
+    assert (timeline["range"], timeline["bucket"], len(timeline["series"])) == ("24h", "hour", 24)
+    hour = lambda moment: moment.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Bangkok")).replace(minute=0, second=0, microsecond=0).isoformat()
+    by_hour = {bar["start"]: bar for bar in timeline["series"]}
+    assert timeline["series"][-1]["start"] in {hour(now), hour(datetime.utcnow())}, "the last bar is the current hour"
+    assert by_hour[hour(now - timedelta(minutes=1))]["failed"]["ocr_extraction"] == 1
+    assert by_hour[hour(now - timedelta(hours=3))]["failed"]["retrieval_engine"] == 1
+    assert {row["error_code"] for row in timeline["totals"]} == {"OCR_CHAIN_FAILED", "RETRIEVAL_ENGINE_REJECTED"}, "25 hours ago is outside the range"

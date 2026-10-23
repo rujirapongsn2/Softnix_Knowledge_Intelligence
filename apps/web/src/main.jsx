@@ -797,7 +797,7 @@ function SystemStatusView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [timelineDays, setTimelineDays] = useState(30);
+  const [timelineRange, setTimelineRange] = useState("30d");
   const [includeRetried, setIncludeRetried] = useState(false);
   const inFlightRef = useRef(null);
 
@@ -805,7 +805,7 @@ function SystemStatusView() {
     if (inFlightRef.current) return; // a slow poll must not overlap requests
     inFlightRef.current = true;
     try {
-      const res = await api(`/v1/system/dashboard?days=${timelineDays}`);
+      const res = await api(`/v1/system/dashboard?range=${timelineRange}`);
       setData(res);
       setError("");
     } catch (err) {
@@ -814,7 +814,7 @@ function SystemStatusView() {
       inFlightRef.current = false;
       setLoading(false);
     }
-  }, [t, timelineDays]);
+  }, [t, timelineRange]);
 
   useEffect(() => {
     loadStatus();
@@ -949,7 +949,7 @@ function SystemStatusView() {
           </div>
           <div className="error-timeline-controls">
             <div className="error-timeline-range" role="group" aria-label={t("systemStatus.timeline.range")}>
-              {[7, 30, 90].map(days => <button key={days} type="button" className={timelineDays === days ? "selected" : ""} aria-pressed={timelineDays === days} onClick={() => setTimelineDays(days)}>{t("systemStatus.timeline.days", {count: days})}</button>)}
+              {["24h", "7d", "30d", "90d"].map(range => <button key={range} type="button" className={timelineRange === range ? "selected" : ""} aria-pressed={timelineRange === range} onClick={() => setTimelineRange(range)}>{t(`systemStatus.timeline.range.${range}`)}</button>)}
             </div>
             <DesignSystemCheckbox label={t("systemStatus.timeline.includeRetried")} checked={includeRetried} onChange={() => setIncludeRetried(value => !value)}/>
           </div>
@@ -963,7 +963,7 @@ function SystemStatusView() {
         <div className="section-title">
           <div>
             <h2>{t("systemStatus.errorsTableTitle")}</h2>
-            <p className="section-copy">{t("systemStatus.errorsTableHelp", {count: timelineDays})}</p>
+            <p className="section-copy">{t("systemStatus.errorsTableHelp", {period: t(`systemStatus.timeline.range.${timelineRange}`)})}</p>
           </div>
         </div>
         {timelineRows.length ? (

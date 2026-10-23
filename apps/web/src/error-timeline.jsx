@@ -1,16 +1,14 @@
 import React from "react";
-import {ERROR_GROUP_COLORS, groupTotals, labelEvery, stackDays} from "./error-timeline.mjs";
+import {ERROR_GROUP_COLORS, barLabel, barTitle, groupTotals, labelEvery, stackBars} from "./error-timeline.mjs";
 
 const WIDTH = 720, HEIGHT = 220, LEFT = 34, RIGHT = 8, TOP = 10, BOTTOM = 26;
 
-const dayLabel = date => { const [, month, day] = date.split("-"); return `${day}/${month}`; };
-
 export function ErrorTimelineChart({timeline, includeRetried, t}) {
-  const {days, max} = stackDays(timeline, includeRetried);
+  const {bars, max} = stackBars(timeline, includeRetried);
   const plotWidth = WIDTH - LEFT - RIGHT, plotHeight = HEIGHT - TOP - BOTTOM;
-  const slot = plotWidth / Math.max(days.length, 1), barWidth = Math.max(2, slot * 0.7);
+  const slot = plotWidth / Math.max(bars.length, 1), barWidth = Math.max(2, slot * 0.7);
   const y = value => TOP + plotHeight - (value / max) * plotHeight;
-  const every = labelEvery(days.length);
+  const every = labelEvery(bars.length);
   const totals = groupTotals(timeline, includeRetried);
   const ticks = max % 2 === 0 ? [0, max / 2, max] : [0, max];
   return <div className="error-timeline">
@@ -19,14 +17,14 @@ export function ErrorTimelineChart({timeline, includeRetried, t}) {
         <line className="error-timeline-grid" x1={LEFT} x2={WIDTH - RIGHT} y1={y(value)} y2={y(value)}/>
         <text className="error-timeline-axis" x={LEFT - 6} y={y(value) + 4} textAnchor="end">{value}</text>
       </g>)}
-      {days.map((day, index) => {
+      {bars.map((bar, index) => {
         const x = LEFT + index * slot + (slot - barWidth) / 2;
-        return <g key={day.date}>
-          {day.segments.map(segment => <rect key={`${segment.outcome}-${segment.group}`} x={x} width={barWidth} y={y(segment.to)}
+        return <g key={bar.start}>
+          {bar.segments.map(segment => <rect key={`${segment.outcome}-${segment.group}`} x={x} width={barWidth} y={y(segment.to)}
             height={y(segment.from) - y(segment.to)} fill={ERROR_GROUP_COLORS[segment.group]} opacity={segment.outcome === "retried" ? 0.4 : 1}>
-            <title>{`${dayLabel(day.date)} · ${t(`systemStatus.errorGroup.${segment.group}`)} · ${t(`systemStatus.timeline.${segment.outcome}`)}: ${segment.value}`}</title>
+            <title>{`${barTitle(bar.start, timeline.bucket)} · ${t(`systemStatus.errorGroup.${segment.group}`)} · ${t(`systemStatus.timeline.${segment.outcome}`)}: ${segment.value}`}</title>
           </rect>)}
-          {index % every === 0 && <text className="error-timeline-axis" x={x + barWidth / 2} y={HEIGHT - 8} textAnchor="middle">{dayLabel(day.date)}</text>}
+          {index % every === 0 && <text className="error-timeline-axis" x={x + barWidth / 2} y={HEIGHT - 8} textAnchor="middle">{barLabel(bar.start, timeline.bucket)}</text>}
         </g>;
       })}
     </svg>

@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     redis_url: str = ""
     file_storage_path: str = "./data/files"
     max_file_size_mb: int = 100
+    # The local day the status page's error chart counts in.
+    dashboard_timezone: str = "Asia/Bangkok"
     token_prefix: str = "skik_live_"
     token_hash_secret: str = "development-only-token-secret"
     initial_admin_username: str = "admin"

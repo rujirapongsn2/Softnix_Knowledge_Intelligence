@@ -24,6 +24,8 @@ import "./knowledge-base-cards.css";
 import {connectionHandles} from "./graph-geometry.mjs";
 import {buildFilePreviewSections, isFilePreviewEmptyValue, mapFilePreviewClassLabel, pickDocumentMetadataValue, pickFilePreviewValue} from "./file-preview.mjs";
 import {Hint} from "./hint.jsx";
+import {ErrorTimelineChart} from "./error-timeline.jsx";
+import "./error-timeline.css";
 import {ListTextArea} from "./list-text-area.jsx";
 import {jobTip, kbStatusTip, legalStatusTip, metadataReviewTip, reviewStatusTip, roleTip, serviceTip, statusFilterTip, statusTip, userStatusTip, errorGuide} from "./hints.mjs";
 import {LanguageProvider, useLanguage} from "./language.jsx";
@@ -795,13 +797,15 @@ function SystemStatusView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [timelineDays, setTimelineDays] = useState(30);
+  const [includeRetried, setIncludeRetried] = useState(false);
   const inFlightRef = useRef(null);
 
   const loadStatus = useCallback(async () => {
     if (inFlightRef.current) return; // a slow poll must not overlap requests
     inFlightRef.current = true;
     try {
-      const res = await api("/v1/system/dashboard");
+      const res = await api(`/v1/system/dashboard?days=${timelineDays}`);
       setData(res);
       setError("");
     } catch (err) {
@@ -810,7 +814,7 @@ function SystemStatusView() {
       inFlightRef.current = false;
       setLoading(false);
     }
-  }, [t]);
+  }, [t, timelineDays]);
 
   useEffect(() => {
     loadStatus();
@@ -828,6 +832,8 @@ function SystemStatusView() {
   const isAllReady = data?.status === "ready";
   const credits = data?.services?.llm_credits;
   const holds = data?.services?.provider_holds || [];
+  const timeline = metrics.error_timeline;
+  const timelineRows = (timeline?.totals || []).filter(row => row.failed || (includeRetried && row.retried));
 
   // Service cards are derived from what the backend actually probed, so a new
   // dependency appears automatically and an unconfigured one (absent from both
@@ -934,28 +940,50 @@ function SystemStatusView() {
       </div>
     </section>
 
-    <section className="content-section two-column">
+    <section className="content-section">
       <Card padding={4}>
-        <div className="section-title">
+        <div className="section-title error-timeline-heading">
           <div>
             <h2>{t("systemStatus.errorsTitle")}</h2>
             <p className="section-copy">{t("systemStatus.errorsHelp")}</p>
           </div>
+          <div className="error-timeline-controls">
+            <div className="error-timeline-range" role="group" aria-label={t("systemStatus.timeline.range")}>
+              {[7, 30, 90].map(days => <button key={days} type="button" className={timelineDays === days ? "selected" : ""} aria-pressed={timelineDays === days} onClick={() => setTimelineDays(days)}>{t("systemStatus.timeline.days", {count: days})}</button>)}
+            </div>
+            <DesignSystemCheckbox label={t("systemStatus.timeline.includeRetried")} checked={includeRetried} onChange={() => setIncludeRetried(value => !value)}/>
+          </div>
         </div>
-        {metrics.error_breakdown?.length ? (
+        {timelineRows.length ? <ErrorTimelineChart timeline={timeline} includeRetried={includeRetried} t={t}/> : <EmptyState isCompact title={t("systemStatus.timeline.empty")} description=""/>}
+      </Card>
+    </section>
+
+    <section className="content-section two-column">
+      <Card padding={4}>
+        <div className="section-title">
+          <div>
+            <h2>{t("systemStatus.errorsTableTitle")}</h2>
+            <p className="section-copy">{t("systemStatus.errorsTableHelp", {count: timelineDays})}</p>
+          </div>
+        </div>
+        {timelineRows.length ? (
           <div className="table-scroll">
             <table className="data-table">
               <thead>
                 <tr>
                   <th>{t("systemStatus.errorCol")}</th>
-                  <th>{t("systemStatus.countCol")}</th>
+                  <th>{t("systemStatus.groupCol")}</th>
+                  <th>{t("systemStatus.failedCol")}</th>
+                  {includeRetried && <th>{t("systemStatus.retriedCol")}</th>}
                 </tr>
               </thead>
               <tbody>
-                {metrics.error_breakdown.map(err => (
-                  <tr key={err.error_code}>
-                    <td><code>{err.error_code}</code></td>
-                    <td><b>{err.count}</b></td>
+                {timelineRows.map(row => (
+                  <tr key={row.error_code}>
+                    <td><code>{row.error_code}</code></td>
+                    <td>{t(`systemStatus.errorGroup.${row.group}`)}</td>
+                    <td><b>{row.failed}</b></td>
+                    {includeRetried && <td>{row.retried}</td>}
                   </tr>
                 ))}
               </tbody>

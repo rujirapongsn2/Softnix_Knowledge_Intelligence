@@ -87,10 +87,10 @@ def seed_document(db, kb_id: str, *, status: str = "completed", error_code: str 
 
 
 def seed_job(db, kb_id: str, document_id: str | None, *, status: str = "queued",
-             error_code: str | None = None) -> str:
+             error_code: str | None = None, updated_at=None) -> str:
     job_id = str(uuid.uuid4())
     db.add(ProcessingJob(id=job_id, document_id=document_id, knowledge_base_id=kb_id,
-                         status=status, error_code=error_code))
+                         status=status, error_code=error_code, **({"updated_at": updated_at} if updated_at else {})))
     return job_id
 
 
@@ -148,7 +148,7 @@ def test_dashboard_manager_scope_excludes_other_tenants():
         seed_document(db, foreign["id"], status="completed", title="outside")
         seed_document(db, foreign["id"], status="failed", error_code="OCR_CHAIN_FAILED", title="outside-failed")
         seed_job(db, scoped["id"], None, status="queued")
-        # error_breakdown reads ProcessingJob.error_code (the worker records the
+        # error_timeline reads ProcessingJob.error_code (the worker records the
         # terminal error on the job row), so failures need failed jobs seeded too
         failed_doc = seed_document(db, scoped["id"], status="failed", error_code="RETRIEVAL_ENGINE_REJECTED", title="inside-failed-job")
         seed_job(db, scoped["id"], failed_doc, status="failed", error_code="RETRIEVAL_ENGINE_REJECTED")
@@ -176,10 +176,9 @@ def test_dashboard_manager_scope_excludes_other_tenants():
     rejection_files = {r["filename"] for r in metrics["rejections"]}
     assert rejection_files == {"inside-rejected.pdf"}, rejection_files
 
-    # error breakdown only counts the scoped failure
-    breakdown = {row["error_code"]: row["count"] for row in metrics["error_breakdown"]}
-    assert breakdown.get("RETRIEVAL_ENGINE_REJECTED") == 1
-    assert "OCR_CHAIN_FAILED" not in breakdown
+    # the error chart only counts the scoped failure
+    totals = {row["error_code"]: row["failed"] for row in metrics["error_timeline"]["totals"]}
+    assert totals == {"RETRIEVAL_ENGINE_REJECTED": 1}
 
 
 def test_dashboard_admin_sees_all_and_groups_degraded_status():
@@ -224,4 +223,51 @@ def test_dashboard_manager_with_no_visible_kbs_gets_zeros():
     assert metrics["total_documents"] == 0
     assert metrics["knowledge_bases"] == {}
     assert metrics["rejections"] == []
-    assert metrics["error_breakdown"] == []
+    assert metrics["error_timeline"]["totals"] == []
+
+
+def test_error_timeline_stacks_each_day_by_group_and_splits_failed_from_retried():
+    from datetime import datetime, timedelta
+    from app.db import SessionLocal
+    from app.error_timeline import GROUPS
+    tc = next(client())
+    # A manager of its own group sees only this test's jobs in a database every test file shares.
+    group = make_group(tc, "DashTimeline")
+    make_user(tc, "timelinemgr", role="manager", group_id=group["id"])
+    make_user(tc, "timelineowner", group_id=group["id"])
+    login_as(tc, "timelineowner")
+    kb = tc.post("/api/v1/knowledge-bases", json={"name": "Timeline KB", "code": "timeline-kb"}).json()
+    login_as(tc, "timelinemgr")
+    now = datetime.utcnow()
+    # 18:00 UTC is 01:00 the next day in Bangkok, so these two land on different local days.
+    late_yesterday = (now - timedelta(days=1)).replace(hour=18, minute=0)
+    early = late_yesterday.replace(hour=16)
+    with SessionLocal() as db:
+        seed_job(db, kb["id"], None, status="failed", error_code="RETRIEVAL_ENGINE_REJECTED", updated_at=early)
+        seed_job(db, kb["id"], None, status="completed", error_code="RETRIEVAL_ENGINE_BUSY", updated_at=early)
+        seed_job(db, kb["id"], None, status="failed", error_code="RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", updated_at=late_yesterday)
+        seed_job(db, kb["id"], None, status="queued", error_code="OCR_CHAIN_FAILED", updated_at=late_yesterday)
+        seed_job(db, kb["id"], None, status="cancelled", error_code="DOCUMENT_DELETED", updated_at=late_yesterday)
+        seed_job(db, kb["id"], None, status="failed", error_code="METADATA_EXTRACTION_INVALID_RESPONSE", updated_at=now - timedelta(days=40))
+        db.commit()
+
+    timeline = tc.get("/api/v1/system/dashboard?days=7").json()["ingest_metrics"]["error_timeline"]
+    assert (timeline["days"], timeline["timezone"], timeline["groups"]) == (7, "Asia/Bangkok", list(GROUPS))
+    assert len(timeline["series"]) == 7
+    by_day = {day["date"]: day for day in timeline["series"]}
+    from zoneinfo import ZoneInfo
+    from datetime import timezone
+    local = lambda moment: moment.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Bangkok")).date().isoformat()
+    first, second = by_day[local(early)], by_day[local(late_yesterday)]
+    assert first is not second, "the Bangkok day boundary splits 16:00 and 18:00 UTC"
+    assert (first["failed"]["retrieval_engine"], first["retried"]["retrieval_engine"]) == (1, 1)
+    assert second["failed"]["ai_provider"] == 1, "a credit failure relayed by LightRAG counts as the AI provider's"
+    assert second["retried"]["ocr_extraction"] == 1, "a job still retrying is not counted as failed"
+    totals = {row["error_code"]: row for row in timeline["totals"]}
+    assert "DOCUMENT_DELETED" not in totals, "a job cancelled by a delete is not an error"
+    assert "METADATA_EXTRACTION_INVALID_RESPONSE" not in totals, "a job outside the range is not counted"
+    assert {row["error_code"] for row in timeline["totals"]} == {"RETRIEVAL_ENGINE_REJECTED", "RETRIEVAL_ENGINE_BUSY", "RETRIEVAL_ENGINE_BUDGET_EXHAUSTED", "OCR_CHAIN_FAILED"}
+    longer = tc.get("/api/v1/system/dashboard?days=90").json()["ingest_metrics"]["error_timeline"]
+    assert "METADATA_EXTRACTION_INVALID_RESPONSE" in {row["error_code"] for row in longer["totals"]}
+    bad = tc.get("/api/v1/system/dashboard?days=12")
+    assert (bad.status_code, bad.json()["error"]["code"]) == (400, "DASHBOARD_RANGE_INVALID")

@@ -42,6 +42,7 @@ from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, D
 from pydantic import BaseModel, Field
 from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
 from .job_queue import lock_knowledge_base_graph, release_if_stale
+from .error_timeline import TIMELINE_DAYS, error_timeline
 from .ingest_contract import INGEST_MAX_BATCH_FILES, LIST_MAX_LIMIT, LOOKUP_MAX_ITEMS, error_catalog, error_code_info, limits_view, queue_view, waiting_view
 from .services import DEFAULT_RETRIEVAL_CONFIG, DocumentExists, analyze_impact, apply_answer_reference_contract, build_document_inventory_result, build_query_result, build_retrieval_plan, create_document_job, create_entity, create_relationship, enrich_sources_with_file_links, entity_graph, process_next_job, public_document_base_url, queue_embedding_reindex, reference_file_available, reference_pdf_available, refresh_saved_answer_citations, resolve_entity, sanitize_source_reference_urls, sync_document_metadata_graph, sync_document_metadata_values, sync_legal_document_graph, sync_legal_instrument_relation_review, sync_lightrag_document_graph
 
@@ -269,13 +270,15 @@ def system_status(_: User = Depends(current_admin), db: Session = Depends(get_db
 
 
 @app.get("/api/v1/system/dashboard")
-def system_dashboard(user: User = Depends(require_manager), db: Session = Depends(get_db)):
+def system_dashboard(days: int = 30, user: User = Depends(require_manager), db: Session = Depends(get_db)):
     """Comprehensive system status, service health, and ingestion metrics.
 
     Every aggregate is scoped to the caller's visible Knowledge Bases (admin
     sees every non-deleted KB) so a manager never observes another group's
-    documents, jobs, or ingest activity.
+    documents, jobs, or ingest activity. ``days`` is the error chart's range.
     """
+    if days not in TIMELINE_DAYS:
+        raise HTTPException(400, {"code": "DASHBOARD_RANGE_INVALID", "message": f"days must be one of {list(TIMELINE_DAYS)}.", "retryable": False})
     dependencies, failures = _probe_dependencies(db)
 
     visible_kb_ids = kb_ids_visible_to(db, user)
@@ -295,15 +298,6 @@ def system_dashboard(user: User = Depends(require_manager), db: Session = Depend
         for row in job_q.with_entities(ProcessingJob.status, func.count(ProcessingJob.id)).group_by(ProcessingJob.status).all()
     }
 
-    error_breakdown_raw = (
-        job_q.filter(ProcessingJob.error_code.isnot(None))
-        .with_entities(ProcessingJob.error_code, func.count(ProcessingJob.id))
-        .group_by(ProcessingJob.error_code)
-        .order_by(func.count(ProcessingJob.id).desc())
-        .limit(10)
-        .all()
-    )
-    error_breakdown = [{"error_code": code, "count": count} for code, count in error_breakdown_raw]
 
     rej_q = db.query(AuditLog).filter(AuditLog.action == "document.ingest.rejected")
     rej_q = rej_q.filter(AuditLog.metadata_json["knowledge_base_id"].as_string().in_(visible_kb_ids))
@@ -382,7 +376,7 @@ def system_dashboard(user: User = Depends(require_manager), db: Session = Depend
             "in_queue_count": job_status_counts.get("queued", 0) + job_status_counts.get("running", 0),
             "completed_count": doc_status_counts.get("completed", 0),
             "failed_count": doc_status_counts.get("failed", 0),
-            "error_breakdown": error_breakdown,
+            "error_timeline": error_timeline(job_q, days, get_settings().dashboard_timezone),
             "rejections": rejections,
             "active_jobs": active_jobs,
             "recent_jobs": recent_jobs,

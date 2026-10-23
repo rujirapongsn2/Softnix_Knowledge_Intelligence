@@ -27,7 +27,8 @@ class RetrievalPolicy(BaseModel):
     enable_graph: bool = True
     enable_lightrag: bool = True
     enable_reranker: bool = True
-    planner_llm_fallback: bool = True
+    # Off by default: with GPT-6 Luna as the planner model, LLM plans dropped LightRAG from every query.
+    planner_llm_fallback: bool = False
     default_top_k: int = Field(default=12, ge=1, le=30)
     maximum_top_k: int = Field(default=30, ge=1, le=50)
     maximum_graph_depth: int = Field(default=3, ge=1, le=3)

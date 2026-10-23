@@ -69,7 +69,7 @@ ALLOWED_MIME_TYPES = {
 DEFAULT_RETRIEVAL_CONFIG = {
     "version": 1, "retrieval_mode": "auto", "enable_vector": True, "enable_graph": True,
     "enable_fulltext": True, "enable_lightrag": True, "enable_reranker": True,
-    "planner_llm_fallback": True, "default_top_k": 12, "maximum_top_k": 30,
+    "planner_llm_fallback": False, "default_top_k": 12, "maximum_top_k": 30,
     "maximum_graph_depth": 3, "citation_required": True,
 }
 # Cap on how many documents one worker may push into the remote indexing

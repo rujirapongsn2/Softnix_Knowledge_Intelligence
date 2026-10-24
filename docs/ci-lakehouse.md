@@ -16,4 +16,4 @@ SKI follows the same corporate identity as EDC1 / Servio. Tokens live in
 - Radius: 6px controls, 12px cards. Shadow `0 1px 2px rgba(16,27,42,.04)`.
 - Lockup: Softnix mark + "Knowledge Intelligence" + "by Softnix".
 - Floors: no text under 11px; text contrast ≥ 4.5:1 (3:1 for ≥ 24px). No side-stripe borders over 1px, no decorative gradients, no eyebrows above page titles.
-- Admin-only (role `admin`, enforced by the API with `require_admin`): KB create / rename / disable / activate / delete, Retrieval Policy, Reindex embeddings, MCP Tokens, Ingest API. Manager+: system status and logs. Admin: users and groups.
+- Permissions: every signed-in user reads, searches and chats on every KB and may create KBs (the creator owns it). The owner or an admin edits a KB (rename, activate/disable, delete, icon/cover, documents, document types, metadata, graph). Admin-only: Retrieval Policy, Reindex embeddings, MCP Tokens, Ingest API, users and groups. Manager+: system status and logs.

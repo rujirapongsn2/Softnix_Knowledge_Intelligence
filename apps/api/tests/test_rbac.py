@@ -78,19 +78,11 @@ def make_user(tc: TestClient, username: str, *, role: str = "user", group_id: st
     return response.json()
 
 
-def user_id(tc: TestClient, username: str) -> str:
-    """Look a user up by username (needs an admin session)."""
-    return next(row["id"] for row in tc.get("/api/v1/users").json() if row["username"] == username)
-
-
-def make_kb(tc: TestClient, name: str, code: str | None = None, owner: str | None = None) -> dict:
-    """Create a KB.  KB creation is admin-only, so tc must hold an admin session;
-    `owner` hands ownership to that username (default: the admin owns it)."""
+def make_kb(tc: TestClient, name: str, code: str | None = None) -> dict:
+    """Create a KB as whoever tc is signed in as; the creator owns it."""
     body = {"name": name}
     if code:
         body["code"] = code
-    if owner:
-        body["owner_user_id"] = user_id(tc, owner)
     response = tc.post("/api/v1/knowledge-bases", json=body)
     assert response.status_code == 200, response.text
     return response.json()
@@ -231,129 +223,137 @@ def test_change_password_self():
 
 
 # ---------------------------------------------------------------------------
-# KB visibility matrix
+# Every user reads every KB; the creator (owner) and admins edit it
 # ---------------------------------------------------------------------------
 
-def test_kb_visibility_matrix():
+def _upload(tc: TestClient, kb_id: str, name: str = "note.txt"):
+    return tc.post(f"/api/v1/knowledge-bases/{kb_id}/documents", files={"file": (name, b"Land transfer must be registered.", "text/plain")})
+
+
+def test_every_user_reads_and_searches_every_kb():
     tc = next(client())
     group = make_group(tc, "Legal")
-    make_user(tc, "nee", group_id=group["id"])          # role user
+    make_user(tc, "nee", group_id=group["id"])
     make_user(tc, "somchai", role="manager", group_id=group["id"])
-    make_user(tc, "pong")                                # role user, no group
-
-    # admin creates a KB -> admin-owned
+    make_user(tc, "pong")                                # no group
     admin_kb = make_kb(tc, "Admin KB", "admin-kb")
+    tc.post(f"/api/v1/knowledge-bases/{admin_kb['id']}/activate")
+    doc = _upload(tc, admin_kb["id"]).json()
 
-    # admin creates a KB owned by nee (user, Legal)
-    nee_kb = make_kb(tc, "Nee KB", "nee-kb", owner="nee")
     login_as(tc, "nee", "UserPass123!")
-    visible = {kb["code"] for kb in tc.get("/api/v1/knowledge-bases").json()}
-    assert visible == {"nee-kb"}, visible
+    nee_kb = make_kb(tc, "Nee KB", "nee-kb")
 
-    # nee cannot touch admin's KB (404 anti-enumeration)
-    assert tc.patch(f"/api/v1/knowledge-bases/{admin_kb['id']}/icon", json={"icon": "auto"}).status_code == 404
-    # activate is admin-only, so the role check answers before visibility
-    assert tc.post(f"/api/v1/knowledge-bases/{admin_kb['id']}/activate").status_code == 403
-    # and cannot see its documents
-    assert tc.get(f"/api/v1/knowledge-bases/{admin_kb['id']}/documents").status_code == 404
+    for username in ("pong", "somchai", "nee"):
+        login_as(tc, username, "UserPass123!")
+        visible = {kb["code"] for kb in tc.get("/api/v1/knowledge-bases").json()}
+        assert visible == {"admin-kb", "nee-kb"}, (username, visible)
+        assert tc.get(f"/api/v1/knowledge-bases/{admin_kb['id']}/documents").status_code == 200
+        assert tc.get(f"/api/v1/knowledge-bases/{admin_kb['id']}/documents/page").status_code == 200
+        assert tc.get(f"/api/v1/documents/{doc['document_id']}/text").status_code == 200
+        assert tc.get(f"/api/v1/documents/{doc['document_id']}/file").status_code == 200
+        assert tc.get(f"/api/v1/knowledge-bases/{admin_kb['id']}/document-templates").status_code == 200
+        assert tc.get(f"/api/v1/knowledge-bases/{admin_kb['id']}/entities").status_code == 200
+        assert tc.get(f"/api/v1/knowledge-bases/{admin_kb['id']}/graph-layout").status_code == 200
+        assert tc.post("/api/v1/query", json={"query": "land transfer", "knowledge_base_ids": [admin_kb["id"]]}).status_code == 200
+        assert tc.post("/api/v1/query", json={"query": "land transfer", "knowledge_base_ids": []}).status_code == 200
 
-    # pong (user, no group) sees nothing
-    login_as(tc, "pong", "UserPass123!")
-    assert tc.get("/api/v1/knowledge-bases").json() == []
-
-    # somchai (manager, Legal) sees every KB with an owner in Legal (nee's KB)
-    login_as(tc, "somchai", "UserPass123!")
-    manager_visible = {kb["code"] for kb in tc.get("/api/v1/knowledge-bases").json()}
-    assert manager_visible == {"nee-kb"}, manager_visible
-    # seeing a KB does not grant managing it: activate/disable are admin-only
-    assert tc.post(f"/api/v1/knowledge-bases/{nee_kb['id']}/activate").status_code == 403
-
-    # admin sees everything
+    # deleted / unknown KBs still answer 404
     login_as(tc, "admin", ADMIN["password"])
-    admin_visible = {kb["code"] for kb in tc.get("/api/v1/knowledge-bases").json()}
-    assert admin_visible == {"admin-kb", "nee-kb"}, admin_visible
+    assert tc.delete(f"/api/v1/knowledge-bases/{nee_kb['id']}").status_code == 200
+    login_as(tc, "pong", "UserPass123!")
+    assert tc.get(f"/api/v1/knowledge-bases/{nee_kb['id']}/documents").status_code == 404
+    assert tc.get("/api/v1/knowledge-bases/no-such-kb/documents").status_code == 404
 
 
-def test_kb_ownership_written_on_create():
+def test_any_user_creates_a_kb_and_owns_it():
     tc = next(client())
     make_user(tc, "owner1")
-    kb = make_kb(tc, "Owned KB", "owned-kb", owner="owner1")
-    admin_kb = make_kb(tc, "Admin-owned KB", "admin-owned-kb")
+    login_as(tc, "owner1", "UserPass123!")
+    kb = make_kb(tc, "Owned KB", "owned-kb")
     from app.db import SessionLocal
     with SessionLocal() as db:
-        row = db.query(KbOwner).filter_by(kb_id=kb["id"]).one()
-        assert row.user_id == db.query(User).filter_by(username="owner1").one().id
-        row = db.query(KbOwner).filter_by(kb_id=admin_kb["id"]).one()
-        assert row.user_id == db.query(User).filter_by(username="admin").one().id
+        owner_id = db.query(User).filter_by(username="owner1").one().id
+        assert db.query(KbOwner).filter_by(kb_id=kb["id"]).one().user_id == owner_id
+    assert kb["owner_user_ids"] == [owner_id]
+    listed = next(row for row in tc.get("/api/v1/knowledge-bases").json() if row["id"] == kb["id"])
+    assert listed["owner_user_ids"] == [owner_id]
 
 
-def test_kb_create_rejects_unknown_or_inactive_owner():
+def _edit_calls(kb_id: str, doc_id: str):
+    """Every KB edit action, as (label, method, path, kwargs)."""
+    return [
+        ("rename", "patch", f"/api/v1/knowledge-bases/{kb_id}/rename", {"json": {"name": "Renamed"}}),
+        ("icon", "patch", f"/api/v1/knowledge-bases/{kb_id}/icon", {"json": {"icon": "legal"}}),
+        ("cover upload", "post", f"/api/v1/knowledge-bases/{kb_id}/cover", {"files": {"file": ("c.png", b"x", "image/png")}}),
+        ("cover delete", "delete", f"/api/v1/knowledge-bases/{kb_id}/cover", {}),
+        ("activate", "post", f"/api/v1/knowledge-bases/{kb_id}/activate", {}),
+        ("disable", "post", f"/api/v1/knowledge-bases/{kb_id}/disable", {}),
+        ("upload", "post", f"/api/v1/knowledge-bases/{kb_id}/documents", {"files": {"file": ("n.txt", b"new", "text/plain")}}),
+        ("batch upload", "post", f"/api/v1/knowledge-bases/{kb_id}/documents/batch", {"files": [("files", ("b.txt", b"b", "text/plain"))]}),
+        ("metadata edit", "patch", f"/api/v1/documents/{doc_id}/metadata", {"json": {"published_at": "2024-01-01"}}),
+        ("legal metadata replace", "put", f"/api/v1/documents/{doc_id}/legal-metadata", {"json": {"metadata": {}}}),
+        ("metadata reevaluate", "post", f"/api/v1/knowledge-bases/{kb_id}/metadata-reevaluate", {}),
+        ("template create", "post", f"/api/v1/knowledge-bases/{kb_id}/document-templates", {"json": {"name": "Type", "fields": [{"key": "issuer", "label": "Issuer"}]}}),
+        ("entity add", "post", f"/api/v1/knowledge-bases/{kb_id}/entities", {"json": {"name": "APP-01", "entity_type": "system"}}),
+        ("graph layout", "put", f"/api/v1/knowledge-bases/{kb_id}/graph-layout", {"json": {"items": []}}),
+        ("reprocess", "post", f"/api/v1/documents/{doc_id}/reprocess", {}),
+        ("document delete", "delete", f"/api/v1/documents/{doc_id}", {}),
+        ("document restore", "post", f"/api/v1/documents/{doc_id}/restore", {}),
+        ("kb delete", "delete", f"/api/v1/knowledge-bases/{kb_id}", {}),
+    ]
+
+
+def test_non_owner_cannot_edit_a_kb():
     tc = next(client())
-    assert tc.post("/api/v1/knowledge-bases", json={"name": "Ghost", "owner_user_id": "no-such-user"}).status_code == 422
-    sleeper = make_user(tc, "sleeper")
-    assert tc.patch(f"/api/v1/users/{sleeper['id']}", json={"is_active": False}).status_code == 200
-    assert tc.post("/api/v1/knowledge-bases", json={"name": "Asleep", "owner_user_id": sleeper["id"]}).status_code == 422
+    group = make_group(tc, "EditGroup")
+    make_user(tc, "kbowner", group_id=group["id"])
+    make_user(tc, "colleague", group_id=group["id"])
+    make_user(tc, "groupmgr", role="manager", group_id=group["id"])
+    login_as(tc, "kbowner", "UserPass123!")
+    kb = make_kb(tc, "Owner KB", "owner-kb")
+    doc = _upload(tc, kb["id"]).json()
 
-
-# ---------------------------------------------------------------------------
-# KB management + retrieval policy + reindex are admin-only
-# ---------------------------------------------------------------------------
-
-def test_kb_management_is_admin_only():
-    tc = next(client())
-    group = make_group(tc, "MgmtGroup")
-    make_user(tc, "mgmtuser", group_id=group["id"])
-    make_user(tc, "mgmtmgr", role="manager", group_id=group["id"])
-    kb = make_kb(tc, "Owned by user", "owned-by-user", owner="mgmtuser")
-    kid = kb["id"]
-
-    for username in ("mgmtuser", "mgmtmgr"):
+    for username in ("colleague", "groupmgr"):
         login_as(tc, username, "UserPass123!")
-        # the KB is visible to its owner and the owner's group manager ...
-        assert kid in {row["id"] for row in tc.get("/api/v1/knowledge-bases").json()}
-        assert tc.get(f"/api/v1/knowledge-bases/{kid}/documents").status_code == 200
-        # ... but every management action is refused with 403
-        assert tc.post("/api/v1/knowledge-bases", json={"name": f"{username} KB"}).status_code == 403
-        assert tc.patch(f"/api/v1/knowledge-bases/{kid}/rename", json={"name": "Renamed"}).status_code == 403
-        assert tc.post(f"/api/v1/knowledge-bases/{kid}/activate").status_code == 403
-        assert tc.post(f"/api/v1/knowledge-bases/{kid}/disable").status_code == 403
-        assert tc.patch(f"/api/v1/knowledge-bases/{kid}/retrieval-config", json={"enable_graph": False}).status_code == 403
-        assert tc.post(f"/api/v1/knowledge-bases/{kid}/documents/reindex").status_code == 403
-        assert tc.delete(f"/api/v1/knowledge-bases/{kid}").status_code == 403
-        denied = tc.post(f"/api/v1/knowledge-bases/{kid}/disable")
-        assert denied.json()["error"]["code"] == "ROLE_FORBIDDEN"
-
-    login_as(tc, "admin", ADMIN["password"])
-    assert tc.patch(f"/api/v1/knowledge-bases/{kid}/rename", json={"name": "Renamed"}).json()["name"] == "Renamed"
-    assert tc.post(f"/api/v1/knowledge-bases/{kid}/activate").status_code == 200
-    assert tc.patch(f"/api/v1/knowledge-bases/{kid}/retrieval-config", json={"enable_graph": False}).status_code == 200
-    reindex = tc.post(f"/api/v1/knowledge-bases/{kid}/documents/reindex")
-    assert reindex.status_code == 200 and "count" in reindex.json()
-    assert tc.post(f"/api/v1/knowledge-bases/{kid}/disable").status_code == 200
-    assert tc.delete(f"/api/v1/knowledge-bases/{kid}").status_code == 200
+        for label, method, path, kwargs in _edit_calls(kb["id"], doc["document_id"]):
+            response = getattr(tc, method)(path, **kwargs)
+            assert response.status_code == 403, (username, label, response.status_code, response.text)
+            assert response.json()["error"]["code"] == "KB_EDIT_FORBIDDEN", (username, label)
 
 
-# ---------------------------------------------------------------------------
-# Query scoping
-# ---------------------------------------------------------------------------
-
-def test_query_respects_kb_visibility():
+def test_owner_and_admin_can_edit_a_kb():
     tc = next(client())
-    group = make_group(tc, "QGroup")
-    make_user(tc, "quser", group_id=group["id"])
-    make_user(tc, "outsider")
+    make_user(tc, "kbowner2")
+    for actor, password in (("kbowner2", "UserPass123!"), ("admin", ADMIN["password"])):
+        login_as(tc, "kbowner2", "UserPass123!")
+        kb = make_kb(tc, f"KB for {actor}")
+        doc = _upload(tc, kb["id"]).json()
+        login_as(tc, actor, password)
+        for label, method, path, kwargs in _edit_calls(kb["id"], doc["document_id"]):
+            response = getattr(tc, method)(path, **kwargs)
+            # A few actions have their own preconditions (e.g. a cover must be a real
+            # image); what matters here is that ownership never refuses them.
+            assert response.status_code not in (401, 403, 404), (actor, label, response.status_code, response.text)
+            assert response.status_code < 500, (actor, label, response.text)
 
-    kb = make_kb(tc, "Q KB", "q-kb", owner="quser")
-    tc.post(f"/api/v1/knowledge-bases/{kb['id']}/activate")
 
-    login_as(tc, "outsider", "UserPass123!")
-    response = tc.post("/api/v1/query", json={"query": "anything", "knowledge_base_ids": [kb["id"]]})
-    assert response.status_code == 404
-    # empty list stays within the caller's visible KBs — outsider has none,
-    # so the request is rejected instead of silently searching other people's KBs
-    response = tc.post("/api/v1/query", json={"query": "anything", "knowledge_base_ids": []})
-    assert response.status_code == 404
-    assert response.json()["error"]["code"] == "KNOWLEDGE_BASE_NOT_VISIBLE"
+def test_admin_only_endpoints_refuse_owners():
+    tc = next(client())
+    make_user(tc, "plainowner")
+    make_user(tc, "plainmgr", role="manager")
+    login_as(tc, "plainowner", "UserPass123!")
+    kb = make_kb(tc, "Plain KB", "plain-kb")
+    for username in ("plainowner", "plainmgr"):
+        login_as(tc, username, "UserPass123!")
+        assert tc.patch(f"/api/v1/knowledge-bases/{kb['id']}/retrieval-config", json={"enable_graph": False}).status_code == 403
+        assert tc.post(f"/api/v1/knowledge-bases/{kb['id']}/documents/reindex").status_code == 403
+        assert tc.get("/api/v1/mcp/activity").status_code == 403
+        assert tc.get("/api/v1/tokens").status_code == 403
+    login_as(tc, "admin", ADMIN["password"])
+    assert tc.patch(f"/api/v1/knowledge-bases/{kb['id']}/retrieval-config", json={"enable_graph": False}).status_code == 200
+    reindex = tc.post(f"/api/v1/knowledge-bases/{kb['id']}/documents/reindex")
+    assert reindex.status_code == 200 and "count" in reindex.json()
+    assert tc.get("/api/v1/mcp/activity").status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +367,7 @@ def test_token_management_is_admin_only():
     group = make_group(tc, "TokenGroup")
     make_user(tc, "tokenuser", group_id=group["id"])
     make_user(tc, "tokenmgr", role="manager", group_id=group["id"])
-    kb = make_kb(tc, "Token KB", "token-kb", owner="tokenuser")
+    kb = make_kb(tc, "Token KB", "token-kb")
     tc.post(f"/api/v1/knowledge-bases/{kb['id']}/activate")
 
     created = tc.post("/api/v1/tokens", json={"name": "admin-mcp", "allowed_knowledge_base_ids": [kb["id"]],
@@ -424,7 +424,7 @@ def test_token_scope_cannot_exceed_visibility():
 def test_delete_kb_revokes_scoped_tokens():
     tc = next(client())
     make_user(tc, "kbdeleter")
-    kb = make_kb(tc, "Doomed KB", "doomed-kb", owner="kbdeleter")
+    kb = make_kb(tc, "Doomed KB", "doomed-kb")
     tc.post(f"/api/v1/knowledge-bases/{kb['id']}/activate")
     token = tc.post("/api/v1/tokens", json={"name": "bound", "allowed_knowledge_base_ids": [kb["id"]],
                                             "allowed_tools": ["search_knowledge"]}).json()
@@ -437,7 +437,7 @@ def test_delete_kb_revokes_scoped_tokens():
     assert listed[ingest["id"]] == "revoked"
 
 
-def test_document_template_mutations_require_knowledge_base_access():
+def test_document_template_mutations_require_kb_owner():
     tc = next(client())
     protected_kb = make_kb(tc, "Protected templates", "protected-templates")
     template = tc.post(f"/api/v1/knowledge-bases/{protected_kb['id']}/document-templates", json={
@@ -446,12 +446,12 @@ def test_document_template_mutations_require_knowledge_base_access():
     make_user(tc, "templateoutsider")
     login_as(tc, "templateoutsider", "UserPass123!")
 
-    assert tc.patch(f"/api/v1/document-templates/{template['id']}", json={"description": "unauthorized"}).status_code == 404
-    assert tc.patch(f"/api/v1/document-templates/{template['id']}/rename", json={"name": "Unauthorized rename"}).status_code == 404
-    assert tc.post(f"/api/v1/document-templates/{template['id']}/duplicate").status_code == 404
-    assert tc.delete(f"/api/v1/document-templates/{template['id']}").status_code == 404
-    assert tc.post(f"/api/v1/document-templates/{template['id']}/activate").status_code == 404
-    assert tc.delete(f"/api/v1/document-templates/{template['id']}/purge").status_code == 404
+    assert tc.patch(f"/api/v1/document-templates/{template['id']}", json={"description": "unauthorized"}).status_code == 403
+    assert tc.patch(f"/api/v1/document-templates/{template['id']}/rename", json={"name": "Unauthorized rename"}).status_code == 403
+    assert tc.post(f"/api/v1/document-templates/{template['id']}/duplicate").status_code == 403
+    assert tc.delete(f"/api/v1/document-templates/{template['id']}").status_code == 403
+    assert tc.post(f"/api/v1/document-templates/{template['id']}/activate").status_code == 403
+    assert tc.delete(f"/api/v1/document-templates/{template['id']}/purge").status_code == 403
 
 
 # ---------------------------------------------------------------------------

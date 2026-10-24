@@ -42,7 +42,7 @@ from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
 from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenLimitsUpdate, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
-from .security import INGEST_SCOPE, assert_kb_access, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
+from .security import INGEST_SCOPE, assert_kb_access, assert_kb_edit, kb_ids_in_group_scope, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
 from .job_queue import lock_knowledge_base_graph, release_if_stale
 from .error_timeline import RANGES as TIMELINE_RANGES, error_timeline
 from .ingest_contract import INGEST_MAX_BATCH_FILES, LIST_MAX_LIMIT, LOOKUP_MAX_ITEMS, error_catalog, error_code_info, limits_view, queue_view, waiting_view
@@ -283,7 +283,7 @@ def system_dashboard(timeline_range: str = Query("30d", alias="range"), user: Us
         raise HTTPException(400, {"code": "DASHBOARD_RANGE_INVALID", "message": f"range must be one of {list(TIMELINE_RANGES)}.", "retryable": False})
     dependencies, failures = _probe_dependencies(db)
 
-    visible_kb_ids = kb_ids_visible_to(db, user)
+    visible_kb_ids = kb_ids_in_group_scope(db, user)
 
     doc_q = db.query(Document).filter(Document.knowledge_base_id.in_(visible_kb_ids))
     doc_status_counts = {
@@ -550,7 +550,7 @@ def delete_group(group_id: str, user: User = Depends(require_admin), db: Session
 
 
 @app.post("/api/v1/knowledge-bases", response_model=KnowledgeBaseOut)
-def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     requested_code = payload.code
     if requested_code:
         existing = db.query(KnowledgeBase).filter_by(code=requested_code).first()
@@ -575,20 +575,14 @@ def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(require_admin),
             suffix_text = f"-{suffix}"
             code = f"{base[:120 - len(suffix_text)].rstrip('-')}{suffix_text}"
             suffix += 1
-    owner = user
-    if payload.owner_user_id:
-        owner = db.get(User, payload.owner_user_id)
-        if not owner or not owner.is_active:
-            raise HTTPException(422, {"code": "KNOWLEDGE_BASE_OWNER_INVALID",
-                                      "message": "Owner must be an active user.", "retryable": False})
-    values = payload.model_dump(exclude={"code", "owner_user_id"})
+    values = payload.model_dump(exclude={"code"})
     kb = KnowledgeBase(**values, code=code, retrieval_config=DEFAULT_RETRIEVAL_CONFIG.copy())
     db.add(kb); db.flush()
-    # Only admins create KBs; ownership goes to the chosen owner (default: the
-    # admin).  v1 writes a single owner row; the table is already many-to-many
-    # so sharing later is an INSERT, not a migration.
-    db.add(KbOwner(kb_id=kb.id, user_id=owner.id))
-    record_audit(db, "knowledge_base.create", user.id, "knowledge_base", kb.id, {"code": kb.code, "owner_user_id": owner.id}); db.commit(); db.refresh(kb); return kb
+    # Any signed-in user may create a KB; the creator owns it and, with admins,
+    # is the only one who may edit it.  v1 writes a single owner row; the table
+    # is already many-to-many so sharing later is an INSERT, not a migration.
+    db.add(KbOwner(kb_id=kb.id, user_id=user.id))
+    record_audit(db, "knowledge_base.create", user.id, "knowledge_base", kb.id, {"code": kb.code}); db.commit(); db.refresh(kb); return kb
 
 
 @app.get("/api/v1/knowledge-bases", response_model=list[KnowledgeBaseOut])
@@ -618,7 +612,7 @@ def update_kb_icon(kb_id: str, payload: KnowledgeBaseIconUpdate, user: User = De
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     kb.icon = payload.icon
     record_audit(db, "knowledge_base.icon.update", user.id, "knowledge_base", kb.id, {"icon": kb.icon})
     db.commit(); db.refresh(kb)
@@ -663,7 +657,7 @@ async def upload_kb_cover(kb_id: str, file: UploadFile = File(...), user: User =
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     mime_type = (file.content_type or "").lower()
     format_config = KB_COVER_FORMATS.get(mime_type)
     if not format_config:
@@ -712,7 +706,7 @@ def delete_kb_cover(kb_id: str, user: User = Depends(current_admin), db: Session
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     previous_path = kb.cover_image_path
     kb.cover_image_path = None
     kb.cover_image_mime_type = None
@@ -724,7 +718,7 @@ def delete_kb_cover(kb_id: str, user: User = Depends(current_admin), db: Session
 
 
 @app.patch("/api/v1/knowledge-bases/{kb_id}/rename", response_model=KnowledgeBaseOut)
-def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     """Rename a Knowledge Base without touching its stable code.
 
     The code is the immutable identifier external systems and ingest tokens
@@ -734,7 +728,7 @@ def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(req
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     values = payload.model_dump(exclude_unset=True)
     kb.name = values["name"]
     if "description" in values:
@@ -746,19 +740,19 @@ def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(req
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/activate")
-def activate_kb(kb_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+def activate_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at: raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     kb.status = "active"; record_audit(db, "knowledge_base.activate", user.id, "knowledge_base", kb.id); db.commit(); return {"status": "success"}
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/disable")
-def disable_kb(kb_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+def disable_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     kb.status = "disabled"
     record_audit(db, "knowledge_base.disable", user.id, "knowledge_base", kb.id)
     db.commit()
@@ -766,11 +760,11 @@ def disable_kb(kb_id: str, user: User = Depends(require_admin), db: Session = De
 
 
 @app.delete("/api/v1/knowledge-bases/{kb_id}")
-def delete_kb(kb_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
+def delete_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     if db.query(Document.id).filter_by(knowledge_base_id=kb.id).filter(Document.live()).first():
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_NOT_EMPTY", "message": "Delete or move all documents before deleting this Knowledge Base.", "retryable": False})
     cover_path = kb.cover_image_path
@@ -824,7 +818,7 @@ def export_kb_metadata(kb_id: str, user: User = Depends(current_admin), db: Sess
 def create_document_template(kb_id: str, payload: DocumentMetadataTemplateCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     code = payload.code or template_code(payload.name)
     if code.casefold() in SYSTEM_TEMPLATE_CODES or db.query(DocumentMetadataTemplate.id).filter(
         DocumentMetadataTemplate.knowledge_base_id == kb_id,
@@ -850,7 +844,7 @@ def update_document_template(template_id: str, payload: DocumentMetadataTemplate
     row = db.get(DocumentMetadataTemplate, template_id)
     if not row:
         raise HTTPException(404, "Document template not found")
-    assert_kb_access(db, user, row.knowledge_base_id)
+    assert_kb_edit(db, user, row.knowledge_base_id)
     values = payload.model_dump(exclude_unset=True)
     if "name" in values and (values["name"].casefold() in SYSTEM_TEMPLATE_NAMES or any(
         other.id != row.id and other.name.casefold() == values["name"].casefold()
@@ -881,7 +875,7 @@ def deactivate_document_template(template_id: str, user: User = Depends(current_
     row = db.get(DocumentMetadataTemplate, template_id)
     if not row:
         raise HTTPException(404, "Document template not found")
-    assert_kb_access(db, user, row.knowledge_base_id)
+    assert_kb_edit(db, user, row.knowledge_base_id)
     row.is_active = False
     record_audit(db, "document_template.deactivate", user.id, "document_template", row.id)
     db.commit()
@@ -898,7 +892,7 @@ def rename_document_template(template_id: str, payload: DocumentTemplateRename, 
     row = db.get(DocumentMetadataTemplate, template_id)
     if not row:
         raise HTTPException(404, "Document template not found")
-    assert_kb_access(db, user, row.knowledge_base_id)
+    assert_kb_edit(db, user, row.knowledge_base_id)
     new_name = payload.name.strip()
     if new_name.casefold() in SYSTEM_TEMPLATE_NAMES or any(
         other.id != row.id and other.name.casefold() == new_name.casefold()
@@ -921,7 +915,7 @@ def duplicate_document_template(template_id: str, user: User = Depends(current_a
     source = db.get(DocumentMetadataTemplate, template_id)
     if not source:
         raise HTTPException(404, "Document template not found")
-    assert_kb_access(db, user, source.knowledge_base_id)
+    assert_kb_edit(db, user, source.knowledge_base_id)
     existing = db.query(DocumentMetadataTemplate.name, DocumentMetadataTemplate.code).filter_by(
         knowledge_base_id=source.knowledge_base_id,
     ).all()
@@ -968,7 +962,7 @@ def purge_document_template(template_id: str, user: User = Depends(current_admin
     row = db.get(DocumentMetadataTemplate, template_id)
     if not row:
         raise HTTPException(404, "Document template not found")
-    assert_kb_access(db, user, row.knowledge_base_id)
+    assert_kb_edit(db, user, row.knowledge_base_id)
     live_documents = db.query(func.count(Document.id)).filter(Document.metadata_template_id == row.id, Document.live()).scalar() or 0
     if live_documents:
         raise HTTPException(409, {"code": "DOCUMENT_TEMPLATE_IN_USE", "message": f"{live_documents} document(s) still use this type. Archive it instead.", "retryable": False, "usage_count": live_documents})
@@ -984,7 +978,7 @@ def activate_document_template(template_id: str, user: User = Depends(current_ad
     row = db.get(DocumentMetadataTemplate, template_id)
     if not row:
         raise HTTPException(404, "Document template not found")
-    assert_kb_access(db, user, row.knowledge_base_id)
+    assert_kb_edit(db, user, row.knowledge_base_id)
     row.is_active = True
     record_audit(db, "document_template.activate", user.id, "document_template", row.id)
     db.commit()
@@ -1004,7 +998,7 @@ def _upload_metadata(template_id: str | None, document_type: str, metadata_json:
 def upload_document(kb_id: str, file: UploadFile = File(...), title: str | None = Form(None), document_type: str = Form("general"), template_id: str | None = Form(None), metadata_json: str | None = Form(None), published_at: date | None = Form(None), user: User = Depends(current_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at: raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     if kb.status == "disabled":
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_DISABLED", "message": "Activate this Knowledge Base before uploading documents.", "retryable": False})
     try:
@@ -1029,7 +1023,7 @@ def upload_documents_batch(kb_id: str, files: list[UploadFile] = File(...), titl
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     if kb.status == "disabled":
         raise HTTPException(409, {"code": "KNOWLEDGE_BASE_DISABLED", "message": "Activate this Knowledge Base before uploading documents.", "retryable": False})
     if not files:
@@ -1337,7 +1331,7 @@ def extract_legal_metadata(document_id: str, user: User = Depends(current_admin)
     doc = db.get(Document, document_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
-    assert_kb_access(db, user, doc.knowledge_base_id)
+    assert_kb_edit(db, user, doc.knowledge_base_id)
     if doc.status != "completed" or not doc.extracted_text:
         raise HTTPException(409, {"code": "DOCUMENT_NOT_READY", "message": "Process the document before legal extraction.", "retryable": False})
     active = db.query(ProcessingJob.id).filter(ProcessingJob.document_id == doc.id, ProcessingJob.job_type == JobType.EXTRACT_LEGAL_METADATA, ProcessingJob.status.in_(["queued", "running"])).first()
@@ -1353,7 +1347,7 @@ def extract_legal_metadata(document_id: str, user: User = Depends(current_admin)
 @app.patch("/api/v1/documents/{document_id}/legal-metadata")
 def update_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
-    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
+    if doc: assert_kb_edit(db, user, doc.knowledge_base_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     doc.legal_metadata = with_manual_edits(doc.legal_metadata, {**(doc.legal_metadata or {}), **payload.metadata})
@@ -1365,7 +1359,7 @@ def update_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user: 
 @app.patch("/api/v1/documents/{document_id}/metadata")
 def update_document_metadata(document_id: str, payload: DocumentMetadataUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
-    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
+    if doc: assert_kb_edit(db, user, doc.knowledge_base_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     if payload.values is not None:
@@ -1429,7 +1423,7 @@ def extract_custom_metadata(document_id: str, payload: MetadataExtractionRequest
     doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
-    assert_kb_access(db, user, doc.knowledge_base_id)
+    assert_kb_edit(db, user, doc.knowledge_base_id)
     if not doc.extracted_text:
         raise HTTPException(409, "Document text is not ready")
     # ``enable_missing_fields`` predates per-field fill modes.  It means
@@ -1448,7 +1442,7 @@ def reevaluate_custom_metadata(kb_id: str, user: User = Depends(current_admin), 
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     # Lock order Knowledge Base -> document: take the KB graph lock before the row locks.
     lock_knowledge_base_graph(db, kb_id)
     changed_documents = changed_fields = 0
@@ -1479,7 +1473,7 @@ def review_custom_metadata(document_id: str, payload: MetadataReviewRequest, use
     doc = db.query(Document).filter_by(id=document_id).with_for_update().first()
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
-    assert_kb_access(db, user, doc.knowledge_base_id)
+    assert_kb_edit(db, user, doc.knowledge_base_id)
     if payload.revision != doc.metadata_revision:
         raise HTTPException(409, "Metadata changed. Refresh before reviewing.")
     field = next((f for f in doc.metadata_template_fields or [] if f["key"] == payload.field_key), None)
@@ -1525,6 +1519,7 @@ def replace_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user:
     doc = db.get(Document, document_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
+    assert_kb_edit(db, user, doc.knowledge_base_id)
     doc.legal_metadata = with_manual_edits(doc.legal_metadata, payload.metadata)
     record_audit(db, "document.legal_metadata.replace", user.id, "document", doc.id)
     db.commit()
@@ -1534,7 +1529,7 @@ def replace_legal_metadata(document_id: str, payload: LegalMetadataUpdate, user:
 @app.delete("/api/v1/documents/{document_id}/legal-metadata")
 def delete_legal_metadata(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
-    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
+    if doc: assert_kb_edit(db, user, doc.knowledge_base_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     doc.legal_metadata = None
@@ -1546,7 +1541,7 @@ def delete_legal_metadata(document_id: str, user: User = Depends(current_admin),
 @app.post("/api/v1/documents/{document_id}/reprocess")
 def reprocess_document(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
-    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
+    if doc: assert_kb_edit(db, user, doc.knowledge_base_id)
     if not doc:
         raise HTTPException(404, "Document not found")
     active = db.query(ProcessingJob).filter(
@@ -1601,7 +1596,7 @@ def soft_delete_document(db: Session, doc: Document) -> ProcessingJob:
 @app.delete("/api/v1/documents/{document_id}")
 def delete_document(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
-    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
+    if doc: assert_kb_edit(db, user, doc.knowledge_base_id)
     if not doc or not doc.is_live:
         raise HTTPException(404, "Document not found")
     purge = soft_delete_document(db, doc)
@@ -1613,7 +1608,7 @@ def delete_document(document_id: str, user: User = Depends(current_admin), db: S
 @app.post("/api/v1/documents/{document_id}/restore")
 def restore_document(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     doc = db.get(Document, document_id)
-    if doc: assert_kb_access(db, user, doc.knowledge_base_id)
+    if doc: assert_kb_edit(db, user, doc.knowledge_base_id)
     if not doc or doc.is_live:
         raise HTTPException(404, "Deleted document not found")
     if doc.lifecycle is DocumentLifecycle.PURGED:
@@ -1643,7 +1638,7 @@ def process_one(_: User = Depends(current_admin), db: Session = Depends(get_db))
 def add_entity(kb_id: str, payload: EntityCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     if payload.document_id:
         document = db.get(Document, payload.document_id)
         if not document or document.knowledge_base_id != kb_id:
@@ -1665,7 +1660,7 @@ def list_entities(kb_id: str, search: str = "", user: User = Depends(current_adm
 @app.patch("/api/v1/entities/{entity_id}", response_model=EntityOut)
 def update_entity(entity_id: str, payload: EntityUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     entity = db.get(Entity, entity_id)
-    if entity: assert_kb_access(db, user, entity.knowledge_base_id)
+    if entity: assert_kb_edit(db, user, entity.knowledge_base_id)
     if not entity or entity.deleted_at:
         raise HTTPException(404, "Entity not found")
     values = payload.model_dump(exclude_unset=True)
@@ -1680,7 +1675,7 @@ def update_entity(entity_id: str, payload: EntityUpdate, user: User = Depends(cu
 @app.delete("/api/v1/entities/{entity_id}")
 def delete_entity(entity_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     entity = db.get(Entity, entity_id)
-    if entity: assert_kb_access(db, user, entity.knowledge_base_id)
+    if entity: assert_kb_edit(db, user, entity.knowledge_base_id)
     if not entity or entity.deleted_at:
         raise HTTPException(404, "Entity not found")
     delete_entity_with_edges(db, entity)
@@ -1690,7 +1685,7 @@ def delete_entity(entity_id: str, user: User = Depends(current_admin), db: Sessi
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/relationships", response_model=RelationshipOut)
 def add_relationship(kb_id: str, payload: RelationshipCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     try:
         relationship = create_relationship(db, kb_id, payload)
         record_audit(db, "relationship.create", user.id, "relationship", relationship.id, {"knowledge_base_id": kb_id}); db.commit()
@@ -1920,7 +1915,7 @@ def get_legal_map(kb_id: str, view: str = "verified", instrument_id: str | None 
 def queue_legal_graph_rebuild(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     active = db.query(ProcessingJob).filter(
         ProcessingJob.knowledge_base_id == kb_id, ProcessingJob.job_type == JobType.REBUILD_LEGAL_GRAPH,
         ProcessingJob.status.in_(["queued", "running"]),
@@ -1947,7 +1942,7 @@ def legal_graph_rebuild_status(kb_id: str, user: User = Depends(current_admin), 
 @app.patch("/api/v1/relationships/{relationship_id}/legal-review", response_model=RelationshipOut)
 def review_legal_relationship(relationship_id: str, payload: LegalRelationshipReview, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     relationship = db.get(Relationship, relationship_id)
-    if relationship: assert_kb_access(db, user, relationship.knowledge_base_id)
+    if relationship: assert_kb_edit(db, user, relationship.knowledge_base_id)
     if not relationship or relationship.deleted_at or not relationship.is_legal or relationship.origin != "ai_suggestion":
         raise HTTPException(404, "Suggested legal relationship not found")
     if relationship.review_status != "suggested":
@@ -2008,7 +2003,7 @@ def get_legal_instrument(instrument_id: str, user: User = Depends(current_admin)
 @app.patch("/api/v1/legal-instruments/{instrument_id}", response_model=LegalInstrumentOut)
 def update_legal_instrument(instrument_id: str, payload: LegalInstrumentUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     instrument = db.get(LegalInstrument, instrument_id)
-    if instrument: assert_kb_access(db, user, instrument.knowledge_base_id)
+    if instrument: assert_kb_edit(db, user, instrument.knowledge_base_id)
     if not instrument:
         raise HTTPException(404, "Legal instrument not found")
     if payload.family_id:
@@ -2081,7 +2076,7 @@ def legal_registry_worklist(kb_id: str, user: User = Depends(current_admin), db:
 def resolve_legal_registry(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     lock_knowledge_base_graph(db, kb_id)
     result = resolve_instrument_statuses(db, kb_id)
     record_audit(db, "legal_registry.resolve", user.id, "knowledge_base", kb_id, result)
@@ -2093,7 +2088,7 @@ def resolve_legal_registry(kb_id: str, user: User = Depends(current_admin), db: 
 def sync_knowledge_base_graph(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     totals = {"entities": 0, "relationships": 0}
     documents = db.query(Document).filter_by(knowledge_base_id=kb_id, status="completed").filter(Document.live()).all()
     for document in documents:
@@ -2114,7 +2109,7 @@ def sync_knowledge_base_graph(kb_id: str, user: User = Depends(current_admin), d
 @app.patch("/api/v1/relationships/{relationship_id}", response_model=RelationshipOut)
 def update_relationship(relationship_id: str, payload: RelationshipUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     relationship = db.get(Relationship, relationship_id)
-    if relationship: assert_kb_access(db, user, relationship.knowledge_base_id)
+    if relationship: assert_kb_edit(db, user, relationship.knowledge_base_id)
     if not relationship or relationship.deleted_at:
         raise HTTPException(404, "Relationship not found")
     values = payload.model_dump(exclude_unset=True)
@@ -2126,7 +2121,7 @@ def update_relationship(relationship_id: str, payload: RelationshipUpdate, user:
 @app.delete("/api/v1/relationships/{relationship_id}")
 def delete_relationship(relationship_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     relationship = db.get(Relationship, relationship_id)
-    if relationship: assert_kb_access(db, user, relationship.knowledge_base_id)
+    if relationship: assert_kb_edit(db, user, relationship.knowledge_base_id)
     if not relationship or relationship.deleted_at:
         raise HTTPException(404, "Relationship not found")
     retire_relationship(db, relationship); record_audit(db, "relationship.delete", user.id, "relationship", relationship.id); db.commit()
@@ -2142,7 +2137,7 @@ def graph_layout(kb_id: str, user: User = Depends(current_admin), db: Session = 
 
 @app.put("/api/v1/knowledge-bases/{kb_id}/graph-layout")
 def save_graph_layout(kb_id: str, payload: GraphLayoutUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
-    assert_kb_access(db, user, kb_id)
+    assert_kb_edit(db, user, kb_id)
     valid = {row[0] for row in db.query(Entity.id).filter_by(knowledge_base_id=kb_id).filter(Entity.deleted_at.is_(None)).all()}
     if any(item.entity_id not in valid for item in payload.items):
         raise HTTPException(400, "Layout contains an entity outside this knowledge base")
@@ -2609,7 +2604,7 @@ def list_audit_logs(limit: int = 100, user: User = Depends(require_manager), db:
     # Managers see group-relevant rows only (target KB in their group, or their
     # own actions); admins see everything.
     if user.role != ROLE_ADMIN:
-        group_kbs = kb_ids_visible_to(db, user)
+        group_kbs = kb_ids_in_group_scope(db, user)
         rows = [row for row in rows if (row.target_type == "knowledge_base" and row.target_id in group_kbs) or row.actor_user_id == user.id]
     return [{"id": row.id, "action": row.action, "actor_user_id": row.actor_user_id, "target_type": row.target_type,
              "target_id": row.target_id, "metadata": row.metadata_json, "created_at": row.created_at} for row in rows]

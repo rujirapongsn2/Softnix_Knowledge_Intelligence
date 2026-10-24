@@ -77,9 +77,6 @@ class KnowledgeBaseCreate(BaseModel):
     default_language: str = "auto"
     entity_schema: dict[str, Any] = Field(default_factory=dict)
     relationship_schema: dict[str, Any] = Field(default_factory=dict)
-    # KB creation is admin-only; the admin can hand ownership to the user
-    # (and so that user's group managers) who will work in it. Omitted = admin owns it.
-    owner_user_id: str | None = None
 
 
 class KnowledgeBaseOut(ORMModel):
@@ -92,6 +89,8 @@ class KnowledgeBaseOut(ORMModel):
     default_language: str
     status: str
     retrieval_config: dict[str, Any]
+    # Who may edit the KB besides admins.  The UI hides edit actions for everyone else.
+    owner_user_ids: list[str] = []
 
 
 class KnowledgeBaseIconUpdate(BaseModel):

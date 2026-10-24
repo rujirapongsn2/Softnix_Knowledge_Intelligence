@@ -7,7 +7,7 @@ import {latestRequest} from "./latest-request.mjs";
 const COUNTS = ["verified", "auto_verified", "unverified", "blocked", "missing"];
 const display = value => value === undefined || value === null ? null : Array.isArray(value) ? value.join(", ") : String(value);
 
-export function MetadataQualityTab({knowledgeBaseId, api, refreshKey, onOpenDocument}) {
+export function MetadataQualityTab({canEdit = false, knowledgeBaseId, api, refreshKey, onOpenDocument}) {
   const {t} = useLanguage();
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -37,7 +37,7 @@ export function MetadataQualityTab({knowledgeBaseId, api, refreshKey, onOpenDocu
   const accuracy = row => row.ai_accuracy === null ? t("metadataQuality.accuracyNone") : `${Math.round(row.ai_accuracy * 100)}%`;
   return <section className="content-section metadata-quality">
     <div className="section-title"><div><h2>{t("metadataQuality.title")}</h2><p>{t("metadataQuality.description")}</p></div>
-      <div className="page-actions"><Button label={t("metadataQuality.refresh")} size="sm" variant="ghost" isDisabled={loading} onClick={load}/><Button label={t("metadataQuality.reevaluate")} size="sm" variant="secondary" isLoading={loading && Boolean(report)} isDisabled={loading} onClick={reevaluate}/></div>
+      <div className="page-actions"><Button label={t("metadataQuality.refresh")} size="sm" variant="ghost" isDisabled={loading} onClick={load}/>{canEdit && <Button label={t("metadataQuality.reevaluate")} size="sm" variant="secondary" isLoading={loading && Boolean(report)} isDisabled={loading} onClick={reevaluate}/>}</div>
     </div>
     {error && <p className="inline-error" role="alert">{error}</p>}
     {notice && <p className="section-copy" role="status">{notice}</p>}

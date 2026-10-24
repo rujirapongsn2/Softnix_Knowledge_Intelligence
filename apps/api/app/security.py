@@ -155,12 +155,21 @@ require_admin = require_role("admin")
 
 
 def kb_ids_visible_to(db: Session, user: User) -> set[str]:
-    """Knowledge Base ids the user may see and manage.
+    """Knowledge Base ids the user may read: every non-deleted KB.
+
+    Every signed-in user may open, read, search and chat on every KB.  Editing
+    is narrower — see can_edit_kb / assert_kb_edit.
+    """
+    return {row.id for row in db.query(KnowledgeBase.id).filter(KnowledgeBase.deleted_at.is_(None)).all()}
+
+
+def kb_ids_in_group_scope(db: Session, user: User) -> set[str]:
+    """KBs a manager oversees on the operations dashboard and in audit logs.
 
     admin    -> every non-deleted KB
     manager  -> every KB with at least one owner in the manager's group
-                (own KBs included, since the manager is a group member)
-    user     -> only KBs they own via kb_owners
+    user     -> KBs they own
+    This scopes operational views only; it does not limit reading or search.
     """
     query = db.query(KnowledgeBase.id).filter(KnowledgeBase.deleted_at.is_(None))
     if user.role == ROLE_ADMIN:
@@ -174,13 +183,28 @@ def kb_ids_visible_to(db: Session, user: User) -> set[str]:
 
 
 def assert_kb_access(db: Session, user: User, kb_id: str) -> None:
-    """Raise 404 unless kb_id is visible to the user (anti-enumeration).
+    """Raise 404 unless kb_id is a live (non-deleted) Knowledge Base.
 
-    Uses the same not-found wording as the rest of the KB surface so an
-    unauthorized caller learns nothing about the KB's existence.
+    Every signed-in user may read every live KB, so this only rejects ids that
+    do not exist or were deleted.
     """
-    if kb_id not in kb_ids_visible_to(db, user):
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at is not None:
         raise HTTPException(404, "Knowledge base not found")
+
+
+def can_edit_kb(db: Session, user: User, kb_id: str) -> bool:
+    """Owners (the creator) and admins may edit a KB and manage its documents."""
+    if user.role == ROLE_ADMIN:
+        return True
+    return db.query(KbOwner).filter(KbOwner.kb_id == kb_id, KbOwner.user_id == user.id).first() is not None
+
+
+def assert_kb_edit(db: Session, user: User, kb_id: str) -> None:
+    """404 for a missing KB, 403 unless the caller owns the KB or is an admin."""
+    assert_kb_access(db, user, kb_id)
+    if not can_edit_kb(db, user, kb_id):
+        error("KB_EDIT_FORBIDDEN", "Only the Knowledge Base owner or an admin can change this Knowledge Base.", status.HTTP_403_FORBIDDEN)
 
 
 def token_visible_to(db: Session, user: User, token: TokenKey) -> bool:

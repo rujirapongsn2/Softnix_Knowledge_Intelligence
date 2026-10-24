@@ -3,7 +3,7 @@ from enum import StrEnum
 from datetime import date, datetime
 
 from sqlalchemy import and_, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 from pgvector.sqlalchemy import Vector
 
@@ -79,6 +79,12 @@ class KnowledgeBase(Timestamped, Base):
     entity_schema: Mapped[dict] = mapped_column(JSON, default=dict)
     relationship_schema: Mapped[dict] = mapped_column(JSON, default=dict)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Owners may edit the KB (admins may edit every KB); every signed-in user may read it.
+    owners: Mapped[list[KbOwner]] = relationship(KbOwner, lazy="selectin", viewonly=True)
+
+    @property
+    def owner_user_ids(self) -> list[str]:
+        return [row.user_id for row in self.owners]
 
     @property
     def cover_image_url(self) -> str | None:

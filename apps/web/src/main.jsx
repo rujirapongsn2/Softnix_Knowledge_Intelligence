@@ -195,7 +195,7 @@ function App() {
   // Retrieval policy, embedding reindex and the MCP / Ingest token pages are admin tools.
   const isAdmin = userRoleLevel >= ROLE_LEVEL.admin;
   // Everyone reads every KB; only its owner (creator) or an admin may edit it.
-  const canEditKb = kb => Boolean(kb) && (isAdmin || (kb.owner_user_ids || []).includes(user?.id));
+  const canEditKb = kb => Boolean(kb) && (isAdmin || Boolean(kb.can_edit));
   const loadUsers = useCallback(async () => setUsers(await api("/v1/users")), []);
   const loadGroups = useCallback(async () => setGroups(await api("/v1/groups")), []);
 

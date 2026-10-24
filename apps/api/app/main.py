@@ -42,7 +42,7 @@ from .request_budget import reset_deadline, set_deadline
 from .retention import prune_observability
 from .schemas import DocumentInventoryRequest, DocumentMetadataTemplateCreate, DocumentMetadataTemplateOut, DocumentMetadataTemplateUpdate, DocumentMetadataUpdate, DocumentOut, DocumentPageOut, DocumentTemplateRename, EntityCreate, EntityOut, EntityUpdate, GraphLayoutUpdate, GroupCreate, GroupOut, GroupUpdate, ImpactRequest, KnowledgeBaseCreate, KnowledgeBaseIconUpdate, KnowledgeBaseOut, KnowledgeBaseRename, LegalInstrumentOut, LegalInstrumentUpdate, LegalMetadataUpdate, LegalRelationshipReview, LoginRequest, PasswordChange, PasswordReset, QueryFeedbackCreate, QueryRequest, RelationshipCreate, RelationshipOut, RelationshipUpdate, RetrievalConfigUpdate, TokenCreate, TokenCreated, TokenLimitsUpdate, TokenOut, UserCreate, UserOut, UserUpdate
 from pydantic import BaseModel, Field
-from .security import INGEST_SCOPE, assert_kb_access, assert_kb_edit, kb_ids_in_group_scope, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
+from .security import INGEST_SCOPE, assert_kb_access, assert_kb_edit, can_edit_kb, kb_ids_editable_by, kb_ids_in_group_scope, authorize, bearer_token, create_session_token, create_token_secret, current_admin, ingest_token, kb_ids_visible_to, kb_ids_visible_to_group, password_hash, refresh_admin, require_admin, require_manager, token_digest, token_visible_to, verify_password
 from .job_queue import lock_knowledge_base_graph, release_if_stale
 from .error_timeline import RANGES as TIMELINE_RANGES, error_timeline
 from .ingest_contract import INGEST_MAX_BATCH_FILES, LIST_MAX_LIMIT, LOOKUP_MAX_ITEMS, error_catalog, error_code_info, limits_view, queue_view, waiting_view
@@ -549,6 +549,12 @@ def delete_group(group_id: str, user: User = Depends(require_admin), db: Session
     return {"status": "deleted", "group_id": group_id}
 
 
+def _kb_out(db: Session, user: User, kb: KnowledgeBase) -> KnowledgeBase:
+    """Annotate a KB response with whether the caller may edit it (drives the UI)."""
+    kb.can_edit = can_edit_kb(db, user, kb.id)
+    return kb
+
+
 @app.post("/api/v1/knowledge-bases", response_model=KnowledgeBaseOut)
 def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     requested_code = payload.code
@@ -582,13 +588,17 @@ def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(current_admin),
     # is the only one who may edit it.  v1 writes a single owner row; the table
     # is already many-to-many so sharing later is an INSERT, not a migration.
     db.add(KbOwner(kb_id=kb.id, user_id=user.id))
-    record_audit(db, "knowledge_base.create", user.id, "knowledge_base", kb.id, {"code": kb.code}); db.commit(); db.refresh(kb); return kb
+    record_audit(db, "knowledge_base.create", user.id, "knowledge_base", kb.id, {"code": kb.code}); db.commit(); db.refresh(kb); return _kb_out(db, user, kb)
 
 
 @app.get("/api/v1/knowledge-bases", response_model=list[KnowledgeBaseOut])
 def list_kbs(user: User = Depends(current_admin), db: Session = Depends(get_db)):
     visible = kb_ids_visible_to(db, user)
-    return db.query(KnowledgeBase).filter(KnowledgeBase.deleted_at.is_(None), KnowledgeBase.id.in_(visible)).all()
+    editable = kb_ids_editable_by(db, user)
+    rows = db.query(KnowledgeBase).filter(KnowledgeBase.deleted_at.is_(None), KnowledgeBase.id.in_(visible)).all()
+    for row in rows:
+        row.can_edit = row.id in editable
+    return rows
 
 
 @app.patch("/api/v1/knowledge-bases/{kb_id}/retrieval-config", response_model=KnowledgeBaseOut)
@@ -604,7 +614,7 @@ def update_retrieval_config(kb_id: str, payload: RetrievalConfigUpdate, user: Us
     record_audit(db, "knowledge_base.retrieval_config.update", user.id, "knowledge_base", kb.id,
                  {"config": kb.retrieval_config})
     db.commit(); db.refresh(kb)
-    return kb
+    return _kb_out(db, user, kb)
 
 
 @app.patch("/api/v1/knowledge-bases/{kb_id}/icon", response_model=KnowledgeBaseOut)
@@ -616,7 +626,7 @@ def update_kb_icon(kb_id: str, payload: KnowledgeBaseIconUpdate, user: User = De
     kb.icon = payload.icon
     record_audit(db, "knowledge_base.icon.update", user.id, "knowledge_base", kb.id, {"icon": kb.icon})
     db.commit(); db.refresh(kb)
-    return kb
+    return _kb_out(db, user, kb)
 
 
 KB_COVER_MAX_BYTES = 5 * 1024 * 1024
@@ -685,7 +695,7 @@ async def upload_kb_cover(kb_id: str, file: UploadFile = File(...), user: User =
         raise
     if previous_path:
         _knowledge_base_cover_path(previous_path).unlink(missing_ok=True)
-    return kb
+    return _kb_out(db, user, kb)
 
 
 @app.get("/api/v1/knowledge-bases/{kb_id}/cover")
@@ -714,7 +724,7 @@ def delete_kb_cover(kb_id: str, user: User = Depends(current_admin), db: Session
     db.commit(); db.refresh(kb)
     if previous_path:
         _knowledge_base_cover_path(previous_path).unlink(missing_ok=True)
-    return kb
+    return _kb_out(db, user, kb)
 
 
 @app.patch("/api/v1/knowledge-bases/{kb_id}/rename", response_model=KnowledgeBaseOut)
@@ -736,7 +746,7 @@ def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(cur
     record_audit(db, "knowledge_base.rename", user.id, "knowledge_base", kb.id,
                  {"name": kb.name, "previous_name": None, "description_changed": "description" in values})
     db.commit(); db.refresh(kb)
-    return kb
+    return _kb_out(db, user, kb)
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/activate")
@@ -1630,7 +1640,7 @@ def get_job(job_id: str, _: User = Depends(current_admin), db: Session = Depends
 
 
 @app.post("/api/v1/internal/process-next")
-def process_one(_: User = Depends(current_admin), db: Session = Depends(get_db)):
+def process_one(_: User = Depends(require_admin), db: Session = Depends(get_db)):
     return {"processed": process_next_job(db)}
 
 
@@ -2574,7 +2584,7 @@ def query_feedback(result_id: str, payload: QueryFeedbackCreate, user: User = De
 
 
 @app.post("/api/v1/system/test-llm")
-def test_llm(_: User = Depends(current_admin)):
+def test_llm(_: User = Depends(require_admin)):
     embedding = EmbeddingClient().check()
     try:
         llm = LLMClient().check()
@@ -2590,7 +2600,7 @@ def graph_projection_status(_: User = Depends(current_admin), db: Session = Depe
 
 
 @app.post("/api/v1/system/observability/cleanup")
-def observability_cleanup(user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def observability_cleanup(user: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Run the bounded observability retention job on demand."""
     result = prune_observability(db)
     record_audit(db, "observability.cleanup", user.id, "system", "observability", result)

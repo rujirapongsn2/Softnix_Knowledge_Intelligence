@@ -303,22 +303,159 @@ def _edit_calls(kb_id: str, doc_id: str):
     ]
 
 
+def _assert_all_edits(tc: TestClient, kb_id: str, doc_id: str, expected: str, who: str):
+    for label, method, path, kwargs in _edit_calls(kb_id, doc_id):
+        response = getattr(tc, method)(path, **kwargs)
+        if expected == "forbidden":
+            assert response.status_code == 403, (who, label, response.status_code, response.text)
+            assert response.json()["error"]["code"] == "KB_EDIT_FORBIDDEN", (who, label)
+        else:
+            # A few actions have their own preconditions (e.g. a cover must be a real
+            # image); what matters is that permission never refuses them.
+            assert response.status_code not in (401, 403, 404), (who, label, response.status_code, response.text)
+            assert response.status_code < 500, (who, label, response.text)
+
+
 def test_non_owner_cannot_edit_a_kb():
     tc = next(client())
-    group = make_group(tc, "EditGroup")
-    make_user(tc, "kbowner", group_id=group["id"])
-    make_user(tc, "colleague", group_id=group["id"])
-    make_user(tc, "groupmgr", role="manager", group_id=group["id"])
+    team = make_group(tc, "EditGroup")
+    other_team = make_group(tc, "OtherGroup")
+    make_user(tc, "kbowner", group_id=team["id"])
+    make_user(tc, "colleague", group_id=team["id"])                       # same group, plain user
+    make_user(tc, "othermgr", role="manager", group_id=other_team["id"])  # manager of another group
+    make_user(tc, "loosemgr", role="manager")                             # manager without a group
     login_as(tc, "kbowner", "UserPass123!")
     kb = make_kb(tc, "Owner KB", "owner-kb")
     doc = _upload(tc, kb["id"]).json()
-
-    for username in ("colleague", "groupmgr"):
+    for username in ("colleague", "othermgr", "loosemgr"):
         login_as(tc, username, "UserPass123!")
-        for label, method, path, kwargs in _edit_calls(kb["id"], doc["document_id"]):
-            response = getattr(tc, method)(path, **kwargs)
-            assert response.status_code == 403, (username, label, response.status_code, response.text)
-            assert response.json()["error"]["code"] == "KB_EDIT_FORBIDDEN", (username, label)
+        listed = next(row for row in tc.get("/api/v1/knowledge-bases").json() if row["id"] == kb["id"])
+        assert listed["can_edit"] is False, username
+        _assert_all_edits(tc, kb["id"], doc["document_id"], "forbidden", username)
+
+
+def test_manager_of_owners_group_can_edit_a_kb():
+    tc = next(client())
+    team = make_group(tc, "MgrTeam")
+    make_user(tc, "teamowner", group_id=team["id"])
+    make_user(tc, "teammgr", role="manager", group_id=team["id"])
+    login_as(tc, "teamowner", "UserPass123!")
+    kb = make_kb(tc, "Team KB", "team-kb")
+    doc = _upload(tc, kb["id"]).json()
+    login_as(tc, "teammgr", "UserPass123!")
+    listed = next(row for row in tc.get("/api/v1/knowledge-bases").json() if row["id"] == kb["id"])
+    assert listed["can_edit"] is True
+    _assert_all_edits(tc, kb["id"], doc["document_id"], "allowed", "teammgr")
+    # ... but still none of the admin-only actions
+    other = make_kb(tc, "Mgr own KB")
+    assert tc.patch(f"/api/v1/knowledge-bases/{other['id']}/retrieval-config", json={"enable_graph": False}).status_code == 403
+    assert tc.post(f"/api/v1/knowledge-bases/{other['id']}/documents/reindex").status_code == 403
+    assert tc.get("/api/v1/tokens").status_code == 403
+    assert tc.get("/api/v1/mcp/activity").status_code == 403
+
+
+def test_disabled_kb_is_hidden_from_non_editors():
+    tc = next(client())
+    team = make_group(tc, "DisTeam")
+    other_team = make_group(tc, "DisOther")
+    make_user(tc, "disowner", group_id=team["id"])
+    make_user(tc, "dismgr", role="manager", group_id=team["id"])
+    make_user(tc, "disreader", group_id=team["id"])
+    make_user(tc, "disothermgr", role="manager", group_id=other_team["id"])
+    login_as(tc, "disowner", "UserPass123!")
+    kb = make_kb(tc, "Disabled KB", "disabled-kb")
+    doc = _upload(tc, kb["id"]).json()
+    assert tc.post(f"/api/v1/knowledge-bases/{kb['id']}/disable").status_code == 200
+    kid, did = kb["id"], doc["document_id"]
+
+    for username, password in (("disowner", "UserPass123!"), ("dismgr", "UserPass123!"), ("admin", ADMIN["password"])):
+        login_as(tc, username, password)
+        assert kid in {row["id"] for row in tc.get("/api/v1/knowledge-bases").json()}, username
+        assert tc.get(f"/api/v1/knowledge-bases/{kid}/documents").status_code == 200, username
+        assert tc.get(f"/api/v1/documents/{did}/text").status_code == 200, username
+
+    for username in ("disreader", "disothermgr"):
+        login_as(tc, username, "UserPass123!")
+        assert kid not in {row["id"] for row in tc.get("/api/v1/knowledge-bases").json()}, username
+        assert tc.get(f"/api/v1/knowledge-bases/{kid}/documents").status_code == 404, username
+        assert tc.get(f"/api/v1/knowledge-bases/{kid}/documents/page").status_code == 404, username
+        assert tc.get(f"/api/v1/documents/{did}/text").status_code == 404, username
+        assert tc.get(f"/api/v1/documents/{did}/file").status_code == 404, username
+        assert tc.get(f"/api/v1/knowledge-bases/{kid}/entities").status_code == 404, username
+        assert tc.post("/api/v1/query", json={"query": "land", "knowledge_base_ids": [kid]}).status_code == 404, username
+        # editing a hidden KB answers 404 too (it does not reveal that the KB exists)
+        assert tc.post(f"/api/v1/knowledge-bases/{kid}/activate").status_code == 404, username
+
+    # re-enabled -> everyone sees it again
+    login_as(tc, "dismgr", "UserPass123!")
+    assert tc.post(f"/api/v1/knowledge-bases/{kid}/activate").status_code == 200
+    login_as(tc, "disothermgr", "UserPass123!")
+    assert kid in {row["id"] for row in tc.get("/api/v1/knowledge-bases").json()}
+
+
+def test_deleted_owner_kb_stays_and_is_editable_by_admin_and_managers():
+    tc = next(client())
+    team = make_group(tc, "GoneTeam")
+    other_team = make_group(tc, "StayTeam")
+    gone = make_user(tc, "goneowner", group_id=team["id"])
+    make_user(tc, "gonemgr", role="manager", group_id=team["id"])
+    make_user(tc, "staymgr", role="manager", group_id=other_team["id"])
+    make_user(tc, "stayuser", group_id=team["id"])
+    login_as(tc, "goneowner", "UserPass123!")
+    kb = make_kb(tc, "Orphan KB", "orphan-kb")
+    doc = _upload(tc, kb["id"]).json()
+    kid, did = kb["id"], doc["document_id"]
+
+    login_as(tc, "admin", ADMIN["password"])
+    assert tc.delete(f"/api/v1/users/{gone['id']}").status_code == 200
+    # the KB and its documents survive the owner's deletion
+    assert kid in {row["id"] for row in tc.get("/api/v1/knowledge-bases").json()}
+    assert len(tc.get(f"/api/v1/knowledge-bases/{kid}/documents").json()) == 1
+    assert tc.patch(f"/api/v1/knowledge-bases/{kid}/rename", json={"name": "Orphan KB (admin)"}).status_code == 200
+
+    # the deleted owner's group can no longer be resolved -> every manager may look after it
+    for username in ("gonemgr", "staymgr"):
+        login_as(tc, username, "UserPass123!")
+        listed = next(row for row in tc.get("/api/v1/knowledge-bases").json() if row["id"] == kid)
+        assert listed["can_edit"] is True, username
+        assert tc.patch(f"/api/v1/knowledge-bases/{kid}/rename", json={"name": f"Orphan KB ({username})"}).status_code == 200, username
+        assert tc.patch(f"/api/v1/documents/{did}/metadata", json={"published_at": "2024-01-01"}).status_code == 200, username
+    login_as(tc, "stayuser", "UserPass123!")
+    assert tc.patch(f"/api/v1/knowledge-bases/{kid}/rename", json={"name": "nope"}).status_code == 403
+
+
+def test_deactivated_owner_kb_is_editable_by_the_owners_group_manager():
+    tc = next(client())
+    team = make_group(tc, "SleepTeam")
+    other_team = make_group(tc, "AwakeTeam")
+    sleeper = make_user(tc, "sleepowner", group_id=team["id"])
+    make_user(tc, "sleepmgr", role="manager", group_id=team["id"])
+    make_user(tc, "awakemgr", role="manager", group_id=other_team["id"])
+    login_as(tc, "sleepowner", "UserPass123!")
+    kb = make_kb(tc, "Sleeper KB", "sleeper-kb")
+    login_as(tc, "admin", ADMIN["password"])
+    assert tc.patch(f"/api/v1/users/{sleeper['id']}", json={"is_active": False}).status_code == 200
+    assert tc.patch(f"/api/v1/knowledge-bases/{kb['id']}/rename", json={"name": "Sleeper KB (admin)"}).status_code == 200
+    login_as(tc, "sleepmgr", "UserPass123!")
+    assert tc.patch(f"/api/v1/knowledge-bases/{kb['id']}/rename", json={"name": "Sleeper KB (mgr)"}).status_code == 200
+    # the group is still known, so a manager of another group gets no fallback rights
+    login_as(tc, "awakemgr", "UserPass123!")
+    assert tc.patch(f"/api/v1/knowledge-bases/{kb['id']}/rename", json={"name": "nope"}).status_code == 403
+
+
+def test_system_maintenance_endpoints_are_admin_only():
+    tc = next(client())
+    make_user(tc, "sysuser")
+    make_user(tc, "sysmgr", role="manager")
+    for username in ("sysuser", "sysmgr"):
+        login_as(tc, username, "UserPass123!")
+        assert tc.post("/api/v1/internal/process-next").status_code == 403, username
+        assert tc.post("/api/v1/system/test-llm").status_code == 403, username
+        assert tc.post("/api/v1/system/observability/cleanup").status_code == 403, username
+    login_as(tc, "admin", ADMIN["password"])
+    assert tc.post("/api/v1/internal/process-next").status_code not in (401, 403)
+    assert tc.post("/api/v1/system/observability/cleanup").status_code not in (401, 403)
+    assert tc.post("/api/v1/system/test-llm").status_code not in (401, 403)
 
 
 def test_owner_and_admin_can_edit_a_kb():
@@ -327,14 +464,10 @@ def test_owner_and_admin_can_edit_a_kb():
     for actor, password in (("kbowner2", "UserPass123!"), ("admin", ADMIN["password"])):
         login_as(tc, "kbowner2", "UserPass123!")
         kb = make_kb(tc, f"KB for {actor}")
+        assert kb["can_edit"] is True
         doc = _upload(tc, kb["id"]).json()
         login_as(tc, actor, password)
-        for label, method, path, kwargs in _edit_calls(kb["id"], doc["document_id"]):
-            response = getattr(tc, method)(path, **kwargs)
-            # A few actions have their own preconditions (e.g. a cover must be a real
-            # image); what matters here is that ownership never refuses them.
-            assert response.status_code not in (401, 403, 404), (actor, label, response.status_code, response.text)
-            assert response.status_code < 500, (actor, label, response.text)
+        _assert_all_edits(tc, kb["id"], doc["document_id"], "allowed", actor)
 
 
 def test_admin_only_endpoints_refuse_owners():

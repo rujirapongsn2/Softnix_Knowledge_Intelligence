@@ -154,13 +154,48 @@ require_manager = require_role("manager")
 require_admin = require_role("admin")
 
 
-def kb_ids_visible_to(db: Session, user: User) -> set[str]:
-    """Knowledge Base ids the user may read: every non-deleted KB.
+def kb_ids_editable_by(db: Session, user: User) -> set[str]:
+    """Live KBs the user may edit (rename, (de)activate, delete, documents, metadata, graph).
 
-    Every signed-in user may open, read, search and chat on every KB.  Editing
-    is narrower — see can_edit_kb / assert_kb_edit.
+    admin    -> every live KB
+    manager  -> KBs owned by anyone in the manager's group, plus "unmanaged" KBs
+                whose owner group can no longer be resolved (see below)
+    everyone -> KBs they own (created)
+    A KB is unmanaged when it has no owner row left (the owner user was deleted,
+    which releases kb_owners) or when none of its owners is active and none has
+    a group.  Admins and every manager may edit unmanaged KBs, so a KB is never
+    stranded without someone who can look after it.
     """
-    return {row.id for row in db.query(KnowledgeBase.id).filter(KnowledgeBase.deleted_at.is_(None)).all()}
+    live = {row.id for row in db.query(KnowledgeBase.id).filter(KnowledgeBase.deleted_at.is_(None)).all()}
+    if user.role == ROLE_ADMIN:
+        return live
+    owners: dict[str, list[tuple[str, bool, str | None]]] = {}
+    for kb_id, owner_id, is_active, group_id in db.query(KbOwner.kb_id, User.id, User.is_active, User.group_id).join(User, User.id == KbOwner.user_id).all():
+        owners.setdefault(kb_id, []).append((owner_id, bool(is_active), group_id))
+    editable = set()
+    for kb_id in live:
+        rows = owners.get(kb_id, [])
+        if any(owner_id == user.id for owner_id, _, _ in rows):
+            editable.add(kb_id)
+        elif user.role == ROLE_MANAGER:
+            groups = {group_id for _, _, group_id in rows if group_id}
+            unmanaged = not rows or (not groups and not any(active for _, active, _ in rows))
+            if unmanaged or (user.group_id and user.group_id in groups):
+                editable.add(kb_id)
+    return editable
+
+
+def kb_ids_visible_to(db: Session, user: User) -> set[str]:
+    """Knowledge Base ids the user may read.
+
+    Every signed-in user may open, read, search and chat on every live KB except
+    disabled ones, which only the people who may edit them can still see.
+    """
+    rows = db.query(KnowledgeBase.id, KnowledgeBase.status).filter(KnowledgeBase.deleted_at.is_(None)).all()
+    visible = {row.id for row in rows if row.status != "disabled"}
+    if len(visible) < len(rows):
+        visible |= kb_ids_editable_by(db, user)
+    return visible
 
 
 def kb_ids_in_group_scope(db: Session, user: User) -> set[str]:
@@ -183,28 +218,28 @@ def kb_ids_in_group_scope(db: Session, user: User) -> set[str]:
 
 
 def assert_kb_access(db: Session, user: User, kb_id: str) -> None:
-    """Raise 404 unless kb_id is a live (non-deleted) Knowledge Base.
+    """Raise 404 unless the user may read kb_id.
 
-    Every signed-in user may read every live KB, so this only rejects ids that
-    do not exist or were deleted.
+    Missing and deleted KBs are 404 for everyone; a disabled KB is 404 for
+    anyone who may not edit it (same answer as deleted, so it leaks nothing).
     """
     kb = db.get(KnowledgeBase, kb_id)
-    if not kb or kb.deleted_at is not None:
+    if not kb or kb.deleted_at is not None or (kb.status == "disabled" and not can_edit_kb(db, user, kb_id)):
         raise HTTPException(404, "Knowledge base not found")
 
 
 def can_edit_kb(db: Session, user: User, kb_id: str) -> bool:
-    """Owners (the creator) and admins may edit a KB and manage its documents."""
+    """Owner, a manager of the owner's group (or any manager for an unmanaged KB), or an admin."""
     if user.role == ROLE_ADMIN:
         return True
-    return db.query(KbOwner).filter(KbOwner.kb_id == kb_id, KbOwner.user_id == user.id).first() is not None
+    return kb_id in kb_ids_editable_by(db, user)
 
 
 def assert_kb_edit(db: Session, user: User, kb_id: str) -> None:
-    """404 for a missing KB, 403 unless the caller owns the KB or is an admin."""
+    """404 when the user may not read the KB, 403 when they may read but not edit it."""
     assert_kb_access(db, user, kb_id)
     if not can_edit_kb(db, user, kb_id):
-        error("KB_EDIT_FORBIDDEN", "Only the Knowledge Base owner or an admin can change this Knowledge Base.", status.HTTP_403_FORBIDDEN)
+        error("KB_EDIT_FORBIDDEN", "Only the Knowledge Base owner, a manager of the owner's group, or an admin can change this Knowledge Base.", status.HTTP_403_FORBIDDEN)
 
 
 def token_visible_to(db: Session, user: User, token: TokenKey) -> bool:

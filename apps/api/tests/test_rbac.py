@@ -78,10 +78,19 @@ def make_user(tc: TestClient, username: str, *, role: str = "user", group_id: st
     return response.json()
 
 
-def make_kb(tc: TestClient, name: str, code: str | None = None) -> dict:
+def user_id(tc: TestClient, username: str) -> str:
+    """Look a user up by username (needs an admin session)."""
+    return next(row["id"] for row in tc.get("/api/v1/users").json() if row["username"] == username)
+
+
+def make_kb(tc: TestClient, name: str, code: str | None = None, owner: str | None = None) -> dict:
+    """Create a KB.  KB creation is admin-only, so tc must hold an admin session;
+    `owner` hands ownership to that username (default: the admin owns it)."""
     body = {"name": name}
     if code:
         body["code"] = code
+    if owner:
+        body["owner_user_id"] = user_id(tc, owner)
     response = tc.post("/api/v1/knowledge-bases", json=body)
     assert response.status_code == 200, response.text
     return response.json()
@@ -235,15 +244,16 @@ def test_kb_visibility_matrix():
     # admin creates a KB -> admin-owned
     admin_kb = make_kb(tc, "Admin KB", "admin-kb")
 
-    # nee (user, Legal) creates own KB
+    # admin creates a KB owned by nee (user, Legal)
+    nee_kb = make_kb(tc, "Nee KB", "nee-kb", owner="nee")
     login_as(tc, "nee", "UserPass123!")
-    nee_kb = make_kb(tc, "Nee KB", "nee-kb")
     visible = {kb["code"] for kb in tc.get("/api/v1/knowledge-bases").json()}
     assert visible == {"nee-kb"}, visible
 
     # nee cannot touch admin's KB (404 anti-enumeration)
     assert tc.patch(f"/api/v1/knowledge-bases/{admin_kb['id']}/icon", json={"icon": "auto"}).status_code == 404
-    assert tc.post(f"/api/v1/knowledge-bases/{admin_kb['id']}/activate").status_code == 404
+    # activate is admin-only, so the role check answers before visibility
+    assert tc.post(f"/api/v1/knowledge-bases/{admin_kb['id']}/activate").status_code == 403
     # and cannot see its documents
     assert tc.get(f"/api/v1/knowledge-bases/{admin_kb['id']}/documents").status_code == 404
 
@@ -255,7 +265,8 @@ def test_kb_visibility_matrix():
     login_as(tc, "somchai", "UserPass123!")
     manager_visible = {kb["code"] for kb in tc.get("/api/v1/knowledge-bases").json()}
     assert manager_visible == {"nee-kb"}, manager_visible
-    assert tc.post(f"/api/v1/knowledge-bases/{nee_kb['id']}/activate").status_code == 200
+    # seeing a KB does not grant managing it: activate/disable are admin-only
+    assert tc.post(f"/api/v1/knowledge-bases/{nee_kb['id']}/activate").status_code == 403
 
     # admin sees everything
     login_as(tc, "admin", ADMIN["password"])
@@ -266,12 +277,60 @@ def test_kb_visibility_matrix():
 def test_kb_ownership_written_on_create():
     tc = next(client())
     make_user(tc, "owner1")
-    login_as(tc, "owner1", "UserPass123!")
-    kb = make_kb(tc, "Owned KB", "owned-kb")
+    kb = make_kb(tc, "Owned KB", "owned-kb", owner="owner1")
+    admin_kb = make_kb(tc, "Admin-owned KB", "admin-owned-kb")
     from app.db import SessionLocal
     with SessionLocal() as db:
         row = db.query(KbOwner).filter_by(kb_id=kb["id"]).one()
         assert row.user_id == db.query(User).filter_by(username="owner1").one().id
+        row = db.query(KbOwner).filter_by(kb_id=admin_kb["id"]).one()
+        assert row.user_id == db.query(User).filter_by(username="admin").one().id
+
+
+def test_kb_create_rejects_unknown_or_inactive_owner():
+    tc = next(client())
+    assert tc.post("/api/v1/knowledge-bases", json={"name": "Ghost", "owner_user_id": "no-such-user"}).status_code == 422
+    sleeper = make_user(tc, "sleeper")
+    assert tc.patch(f"/api/v1/users/{sleeper['id']}", json={"is_active": False}).status_code == 200
+    assert tc.post("/api/v1/knowledge-bases", json={"name": "Asleep", "owner_user_id": sleeper["id"]}).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# KB management + retrieval policy + reindex are admin-only
+# ---------------------------------------------------------------------------
+
+def test_kb_management_is_admin_only():
+    tc = next(client())
+    group = make_group(tc, "MgmtGroup")
+    make_user(tc, "mgmtuser", group_id=group["id"])
+    make_user(tc, "mgmtmgr", role="manager", group_id=group["id"])
+    kb = make_kb(tc, "Owned by user", "owned-by-user", owner="mgmtuser")
+    kid = kb["id"]
+
+    for username in ("mgmtuser", "mgmtmgr"):
+        login_as(tc, username, "UserPass123!")
+        # the KB is visible to its owner and the owner's group manager ...
+        assert kid in {row["id"] for row in tc.get("/api/v1/knowledge-bases").json()}
+        assert tc.get(f"/api/v1/knowledge-bases/{kid}/documents").status_code == 200
+        # ... but every management action is refused with 403
+        assert tc.post("/api/v1/knowledge-bases", json={"name": f"{username} KB"}).status_code == 403
+        assert tc.patch(f"/api/v1/knowledge-bases/{kid}/rename", json={"name": "Renamed"}).status_code == 403
+        assert tc.post(f"/api/v1/knowledge-bases/{kid}/activate").status_code == 403
+        assert tc.post(f"/api/v1/knowledge-bases/{kid}/disable").status_code == 403
+        assert tc.patch(f"/api/v1/knowledge-bases/{kid}/retrieval-config", json={"enable_graph": False}).status_code == 403
+        assert tc.post(f"/api/v1/knowledge-bases/{kid}/documents/reindex").status_code == 403
+        assert tc.delete(f"/api/v1/knowledge-bases/{kid}").status_code == 403
+        denied = tc.post(f"/api/v1/knowledge-bases/{kid}/disable")
+        assert denied.json()["error"]["code"] == "ROLE_FORBIDDEN"
+
+    login_as(tc, "admin", ADMIN["password"])
+    assert tc.patch(f"/api/v1/knowledge-bases/{kid}/rename", json={"name": "Renamed"}).json()["name"] == "Renamed"
+    assert tc.post(f"/api/v1/knowledge-bases/{kid}/activate").status_code == 200
+    assert tc.patch(f"/api/v1/knowledge-bases/{kid}/retrieval-config", json={"enable_graph": False}).status_code == 200
+    reindex = tc.post(f"/api/v1/knowledge-bases/{kid}/documents/reindex")
+    assert reindex.status_code == 200 and "count" in reindex.json()
+    assert tc.post(f"/api/v1/knowledge-bases/{kid}/disable").status_code == 200
+    assert tc.delete(f"/api/v1/knowledge-bases/{kid}").status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +343,7 @@ def test_query_respects_kb_visibility():
     make_user(tc, "quser", group_id=group["id"])
     make_user(tc, "outsider")
 
-    login_as(tc, "quser", "UserPass123!")
-    kb = make_kb(tc, "Q KB", "q-kb")
+    kb = make_kb(tc, "Q KB", "q-kb", owner="quser")
     tc.post(f"/api/v1/knowledge-bases/{kb['id']}/activate")
 
     login_as(tc, "outsider", "UserPass123!")
@@ -302,38 +360,46 @@ def test_query_respects_kb_visibility():
 # Token scoping
 # ---------------------------------------------------------------------------
 
-def test_token_creator_scoping():
+def test_token_management_is_admin_only():
+    """MCP / Ingest token management (/api/v1/tokens*) is admin-only.  Users and
+    managers — even ones who own the KB the token would be scoped to — get 403."""
     tc = next(client())
     group = make_group(tc, "TokenGroup")
     make_user(tc, "tokenuser", group_id=group["id"])
     make_user(tc, "tokenmgr", role="manager", group_id=group["id"])
-
-    login_as(tc, "tokenuser", "UserPass123!")
-    kb = make_kb(tc, "Token KB", "token-kb")
+    kb = make_kb(tc, "Token KB", "token-kb", owner="tokenuser")
     tc.post(f"/api/v1/knowledge-bases/{kb['id']}/activate")
 
-    # own-KB token is fine
-    created = tc.post("/api/v1/tokens", json={"name": "mine", "allowed_knowledge_base_ids": [kb["id"]],
+    created = tc.post("/api/v1/tokens", json={"name": "admin-mcp", "allowed_knowledge_base_ids": [kb["id"]],
                                               "allowed_tools": ["search_knowledge"]})
     assert created.status_code == 200, created.text
-    mine = created.json()
+    mcp = created.json()
+    ingest = tc.post("/api/v1/tokens", json={"name": "admin-ingest", "allowed_scopes": ["documents:write"],
+                                             "allowed_ingest_knowledge_base_id": kb["id"]})
+    assert ingest.status_code == 200, ingest.text
+    tid = mcp["id"]
 
-    # listing shows only tokens you created
-    listed = tc.get("/api/v1/tokens").json()
-    assert {row["id"] for row in listed} == {mine["id"]}
+    for username in ("tokenuser", "tokenmgr"):
+        login_as(tc, username, "UserPass123!")
+        assert tc.get("/api/v1/tokens").status_code == 403
+        assert tc.post("/api/v1/tokens", json={"name": "mine", "allowed_knowledge_base_ids": [kb["id"]],
+                                               "allowed_tools": ["search_knowledge"]}).status_code == 403
+        assert tc.post("/api/v1/tokens", json={"name": "mine-ingest", "allowed_scopes": ["documents:write"],
+                                               "allowed_ingest_knowledge_base_id": kb["id"]}).status_code == 403
+        assert tc.post(f"/api/v1/tokens/{tid}/disable").status_code == 403
+        assert tc.post(f"/api/v1/tokens/{tid}/enable").status_code == 403
+        assert tc.patch(f"/api/v1/tokens/{tid}/limits", json={"requests_per_minute": 5}).status_code == 403
+        assert tc.post(f"/api/v1/tokens/{tid}/rotate").status_code == 403
+        assert tc.post(f"/api/v1/tokens/{tid}/revoke").status_code == 403
 
-    # manager (same group) sees it and can disable it
-    login_as(tc, "tokenmgr", "UserPass123!")
-    listed = tc.get("/api/v1/tokens").json()
-    assert {row["id"] for row in listed} == {mine["id"]}
-    assert tc.post(f"/api/v1/tokens/{mine['id']}/disable").status_code == 200
-
-    # an unrelated user sees nothing and cannot touch it
     login_as(tc, "admin", ADMIN["password"])
-    make_user(tc, "outsider2")
-    login_as(tc, "outsider2", "UserPass123!")
-    assert tc.get("/api/v1/tokens").json() == []
-    assert tc.post(f"/api/v1/tokens/{mine['id']}/enable").status_code == 404
+    assert {row["id"] for row in tc.get("/api/v1/tokens").json()} >= {tid, ingest.json()["id"]}
+    assert tc.post(f"/api/v1/tokens/{tid}/disable").status_code == 200
+    assert tc.post(f"/api/v1/tokens/{tid}/enable").status_code == 200
+    assert tc.patch(f"/api/v1/tokens/{tid}/limits", json={"requests_per_minute": 5}).status_code == 200
+    rotated = tc.post(f"/api/v1/tokens/{tid}/rotate")
+    assert rotated.status_code == 200, rotated.text
+    assert tc.post(f"/api/v1/tokens/{rotated.json()['id']}/revoke").status_code == 200
 
 
 def test_token_scope_cannot_exceed_visibility():
@@ -345,6 +411,7 @@ def test_token_scope_cannot_exceed_visibility():
     admin_kb = make_kb(tc, "Admin Secret KB", "admin-secret-kb")
     tc.post(f"/api/v1/knowledge-bases/{admin_kb['id']}/activate")
 
+    # a non-admin is refused outright (token management is admin-only)
     login_as(tc, "scopeuser", "UserPass123!")
     denied = tc.post("/api/v1/tokens", json={"name": "sneaky", "allowed_knowledge_base_ids": [admin_kb["id"]],
                                              "allowed_tools": ["search_knowledge"]})
@@ -357,8 +424,7 @@ def test_token_scope_cannot_exceed_visibility():
 def test_delete_kb_revokes_scoped_tokens():
     tc = next(client())
     make_user(tc, "kbdeleter")
-    login_as(tc, "kbdeleter", "UserPass123!")
-    kb = make_kb(tc, "Doomed KB", "doomed-kb")
+    kb = make_kb(tc, "Doomed KB", "doomed-kb", owner="kbdeleter")
     tc.post(f"/api/v1/knowledge-bases/{kb['id']}/activate")
     token = tc.post("/api/v1/tokens", json={"name": "bound", "allowed_knowledge_base_ids": [kb["id"]],
                                             "allowed_tools": ["search_knowledge"]}).json()

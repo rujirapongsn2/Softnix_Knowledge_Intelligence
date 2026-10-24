@@ -67,6 +67,11 @@ def make_user(tc: TestClient, username: str, *, role: str = "user", group_id: st
     return response.json()
 
 
+def owner_id(tc: TestClient, username: str) -> str:
+    """KB creation is admin-only: the admin creates the KB and assigns it to this user."""
+    return next(row["id"] for row in tc.get("/api/v1/users").json() if row["username"] == username)
+
+
 def login_as(tc: TestClient, username: str, password: str = "UserPass123!") -> TestClient:
     response = tc.post("/api/v1/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200, response.text
@@ -133,9 +138,8 @@ def test_dashboard_manager_scope_excludes_other_tenants():
     make_user(tc, "scopemgr", role="manager", group_id=group["id"])
     make_user(tc, "owner", group_id=group["id"])
 
-    # owner (in scope group) creates one KB; admin creates another
-    login_as(tc, "owner")
-    scoped = tc.post("/api/v1/knowledge-bases", json={"name": "Scoped KB", "code": "scoped-kb"}).json()
+    # admin creates one KB owned by `owner` (in scope group) and one it owns itself
+    scoped = tc.post("/api/v1/knowledge-bases", json={"name": "Scoped KB", "code": "scoped-kb", "owner_user_id": owner_id(tc, "owner")}).json()
     login_as(tc, "admin", ADMIN["password"])
     foreign = tc.post("/api/v1/knowledge-bases", json={"name": "Foreign KB", "code": "foreign-kb"}).json()
 
@@ -186,8 +190,7 @@ def test_dashboard_admin_sees_all_and_groups_degraded_status():
     group = make_group(tc, "DashAdmin")
     make_user(tc, "adminowner", group_id=group["id"])
 
-    login_as(tc, "adminowner")
-    kb = tc.post("/api/v1/knowledge-bases", json={"name": "User KB", "code": "user-kb"}).json()
+    kb = tc.post("/api/v1/knowledge-bases", json={"name": "User KB", "code": "user-kb", "owner_user_id": owner_id(tc, "adminowner")}).json()
     login_as(tc, "admin", ADMIN["password"])
     other = tc.post("/api/v1/knowledge-bases", json={"name": "Admin KB", "code": "admin-kb"}).json()
 
@@ -235,8 +238,7 @@ def test_error_timeline_stacks_each_day_by_group_and_splits_failed_from_retried(
     group = make_group(tc, "DashTimeline")
     make_user(tc, "timelinemgr", role="manager", group_id=group["id"])
     make_user(tc, "timelineowner", group_id=group["id"])
-    login_as(tc, "timelineowner")
-    kb = tc.post("/api/v1/knowledge-bases", json={"name": "Timeline KB", "code": "timeline-kb"}).json()
+    kb = tc.post("/api/v1/knowledge-bases", json={"name": "Timeline KB", "code": "timeline-kb", "owner_user_id": owner_id(tc, "timelineowner")}).json()
     login_as(tc, "timelinemgr")
     now = datetime.utcnow()
     # 18:00 UTC is 01:00 the next day in Bangkok, so these two land on different local days.
@@ -282,8 +284,7 @@ def test_error_timeline_over_24_hours_has_one_bar_per_local_hour():
     group = make_group(tc, "DashHourly")
     make_user(tc, "hourlymgr", role="manager", group_id=group["id"])
     make_user(tc, "hourlyowner", group_id=group["id"])
-    login_as(tc, "hourlyowner")
-    kb = tc.post("/api/v1/knowledge-bases", json={"name": "Hourly KB", "code": "hourly-kb"}).json()
+    kb = tc.post("/api/v1/knowledge-bases", json={"name": "Hourly KB", "code": "hourly-kb", "owner_user_id": owner_id(tc, "hourlyowner")}).json()
     login_as(tc, "hourlymgr")
     now = datetime.utcnow()
     with SessionLocal() as db:

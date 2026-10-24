@@ -4,7 +4,7 @@ import {DocumentTypeDrawer} from "./document-type-editor.jsx";
 import {useAnchoredMenu} from "./use-anchored-menu.js";
 import {DOCUMENT_TYPE_OPTIONS, documentTypeDescription, documentTypeLabel} from "./document-type-options.js";
 import {Theme, AppShell, Badge, Button, Card, CommandPalette, DesignSystemCheckbox, EmptyState, FileInput, ProgressBar, SideNav, SideNavHeading, SideNavItem, SideNavSection, Selector, TextArea, TextInput, Toast, TopNav, TopNavHeading, useDialogFocus} from "./ui.jsx";
-import {AppWindow, BookOpen, Buildings, ChartLineUp, CirclesThree, Cloud, Compass, Database, FileText, Gavel, GitBranch, HardDrives, ImageSquare, Key, Lightbulb, MagnifyingGlass, Rows, Scales, ShieldCheck, SquaresFour, Trash, UploadSimple, User, Users, UsersThree} from "@phosphor-icons/react";
+import {AppWindow, BookOpen, CaretDown, Buildings, ChartLineUp, CirclesThree, Cloud, Compass, Database, FileText, Gavel, GitBranch, HardDrives, ImageSquare, Key, Lightbulb, MagnifyingGlass, Rows, Scales, ShieldCheck, SquaresFour, Trash, UploadSimple, User, Users, UsersThree} from "@phosphor-icons/react";
 import {Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow, ReactFlowProvider, useEdgesState, useNodesState, useReactFlow} from "@xyflow/react";
 import "./kumo.css";
 import "@xyflow/react/dist/style.css";
@@ -26,6 +26,7 @@ import {buildFilePreviewSections, isFilePreviewEmptyValue, mapFilePreviewClassLa
 import {Hint} from "./hint.jsx";
 import {ErrorTimelineChart} from "./error-timeline.jsx";
 import "./error-timeline.css";
+import "./lakehouse-ci.css";
 import {ListTextArea} from "./list-text-area.jsx";
 import {jobTip, kbStatusTip, legalStatusTip, metadataReviewTip, reviewStatusTip, roleTip, serviceTip, statusFilterTip, statusTip, userStatusTip, errorGuide} from "./hints.mjs";
 import {LanguageProvider, useLanguage} from "./language.jsx";
@@ -108,8 +109,8 @@ function Login({onLogin}) {
   };
   return <main className="login-page"><section className="login-card">
     <Button className="login-language-toggle" label={language === "th" ? "EN" : "TH"} size="sm" variant="ghost" onClick={() => setLanguage(language === "th" ? "en" : "th")} aria-label={t("app.toggleLanguage")}/>
-    <img className="login-logo" src="/logo-softnix.png" alt="Softnix"/>
-    <p className="eyebrow">{t("login.brand")}</p><h1>{t("login.tagline")}</h1>
+    <div className="login-lockup"><img src="/softnix-mark.png" alt=""/><div><strong>Knowledge Intelligence</strong><span>{t("brand.by")}</span></div></div>
+    <h1>{t("login.tagline")}</h1>
     <p className="login-copy">{t("login.description")}</p>
     <form className="form-stack" onSubmit={submit}>
       <TextInput label={t("login.username")} value={username} onChange={setUsername} isRequired hasAutoFocus/>
@@ -163,6 +164,7 @@ function App() {
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [viewTrail, setViewTrail] = useState(() => [initialRoute.view]);
   const [newKbName, setNewKbName] = useState("");
+  const [newKbOwnerId, setNewKbOwnerId] = useState("");
   const [uploadFile, setUploadFile] = useState([]);
   const [uploadTitle, setUploadTitle] = useState("");
   const [uploadDocumentType, setUploadDocumentType] = useState("general");
@@ -191,6 +193,8 @@ function App() {
   const notify = (body, type = "info") => setMessage({body, type, id: Date.now()});
   const userRole = user?.role || "user";
   const userRoleLevel = ROLE_LEVEL[userRole] ?? 0;
+  // Retrieval policy, embedding reindex and the MCP / Ingest token pages are admin tools.
+  const isAdmin = userRoleLevel >= ROLE_LEVEL.admin;
   const loadUsers = useCallback(async () => setUsers(await api("/v1/users")), []);
   const loadGroups = useCallback(async () => setGroups(await api("/v1/groups")), []);
 
@@ -371,8 +375,8 @@ function App() {
     try {
       // The API owns code generation so Thai/non-Latin names and soft-deleted
       // codes cannot collapse into the same fallback slug.
-      const kb = await api("/v1/knowledge-bases", {method: "POST", body: JSON.stringify({name})});
-      setKbs(items => [...items, kb]); setSelectedKbId(kb.id); setNewKbName(""); switchView("documents"); notify(t("app.notify.kbCreated"));
+      const kb = await api("/v1/knowledge-bases", {method: "POST", body: JSON.stringify(newKbOwnerId ? {name, owner_user_id: newKbOwnerId} : {name})});
+      setKbs(items => [...items, kb]); setSelectedKbId(kb.id); setNewKbName(""); setNewKbOwnerId(""); switchView("documents"); notify(t("app.notify.kbCreated"));
     } catch (error) { showError(error); }
   };
   const manageKnowledgeBase = async (knowledgeBase, action) => {
@@ -657,6 +661,7 @@ function App() {
     }
   };
   const reindexEmbeddings = async () => {
+    if (!window.confirm(t("documents.reindexConfirm", {name: selectedKb?.name || "", total: documentTotal}))) return;
     try { const result = await api(`/v1/knowledge-bases/${selectedKbId}/documents/reindex`, {method: "POST"}); await reloadDocumentsAndQuality(); notify(t("app.notify.embeddingReindexQueued", {count: result.count})); }
     catch (error) { showError(error); }
   };
@@ -681,6 +686,8 @@ function App() {
   useEffect(() => {
     if (user && activeView === "logs") Promise.all([loadTransactionLogs(), loadTraceLogs()]).catch(showError);
     if (user && userRoleLevel >= ROLE_LEVEL.admin && (activeView === "users" || activeView === "groups")) Promise.all([loadUsers(), loadGroups()]).catch(showError);
+    // KB creation is admin-only and lets the admin pick the owner, so the hub needs the user list.
+    if (user && userRoleLevel >= ROLE_LEVEL.admin && activeView === "knowledge-bases") loadUsers().catch(showError);
   }, [user, activeView]);
   useEffect(() => {
     const onKeyDown = event => {
@@ -721,7 +728,7 @@ function App() {
     }
   };
 
-  if (isSessionLoading) return <main className="login-page"><section className="login-card session-loading"><img className="login-logo" src="/logo-softnix.png" alt="Softnix"/><p className="eyebrow">{t("login.brand")}</p><h1>{t("app.sessionLoading.title")}</h1><p className="login-copy">{t("app.sessionLoading.body")}</p></section></main>;
+  if (isSessionLoading) return <main className="login-page"><section className="login-card session-loading"><div className="login-lockup"><img src="/softnix-mark.png" alt=""/><div><strong>Knowledge Intelligence</strong><span>{t("brand.by")}</span></div></div><h1>{t("app.sessionLoading.title")}</h1><p className="login-copy">{t("app.sessionLoading.body")}</p></section></main>;
   if (!user) return <Login onLogin={data => setUser(data.user)}/>;
   const switchView = view => {
     setActiveView(view); setDocumentPreview(null); clearPdfPreview();
@@ -742,7 +749,7 @@ function App() {
     clearPdfPreview();
     writeWorkspaceRoute(view, selectedKbId, {replace: true});
   };
-  const sideNav = <SideNav header={<div className="brand-lockup"><img src="/logo-softnix.png" alt="Softnix"/><SideNavHeading superheading="SOFTNIX" heading="Knowledge Intelligence"/></div>} topContent={<Button label={t("sideNav.newKnowledgeBase")} variant="primary" onClick={() => switchView("knowledge-bases")}/>} collapsible ariaLabel={t("ui.primaryNavigation")} expandLabel={t("ui.expandNavigation")} collapseLabel={t("ui.collapseNavigation")}>
+  const sideNav = <SideNav header={<div className="brand-lockup"><img src="/softnix-mark.png" alt=""/><SideNavHeading superheading={t("brand.by")} heading="Knowledge Intelligence"/></div>} topContent={isAdmin ? <Button label={t("sideNav.newKnowledgeBase")} variant="primary" onClick={() => switchView("knowledge-bases")}/> : undefined} collapsible ariaLabel={t("ui.primaryNavigation")} expandLabel={t("ui.expandNavigation")} collapseLabel={t("ui.collapseNavigation")}>
     <SideNavSection title={t("sideNav.category.knowledge")} subtitle={t("sideNav.category.knowledge.subtitle")} className="side-nav-category">
       <SideNavItem icon={<Database weight="regular"/>} label={t("workflow.knowledgeBases")} isSelected={activeView === "knowledge-bases"} onClick={() => switchView("knowledge-bases")}/>
       <SideNavItem icon={<FileText weight="regular"/>} label={t("workflow.documents")} isSelected={activeView === "documents"} onClick={() => switchView("documents")}/>
@@ -751,11 +758,12 @@ function App() {
       <SideNavItem icon={<MagnifyingGlass weight="regular"/>} label={t("workflow.search")} isSelected={activeView === "search"} onClick={() => switchView("search")}/>
       <SideNavItem icon={<Compass weight="regular"/>} label={t("workflow.explore")} isSelected={activeView === "explore"} onClick={() => switchView("explore")}/>
     </SideNavSection>
-    <SideNavSection title={t("sideNav.category.administration")} subtitle={t("sideNav.category.administration.subtitle")} className="side-nav-category"><SideNavItem icon={<Key weight="regular"/>} label={t("workflow.mcpTokens")} isSelected={activeView === "mcp-tokens"} onClick={() => switchView("mcp-tokens")}/><SideNavItem icon={<BookOpen weight="regular"/>} label={t("workflow.ingestTokens")} isSelected={activeView === "ingest-tokens"} onClick={() => switchView("ingest-tokens")}/>{userRoleLevel >= ROLE_LEVEL.manager && <><SideNavItem icon={<HardDrives weight="regular"/>} label={t("workflow.systemStatus")} isSelected={activeView === "system-status"} onClick={() => switchView("system-status")}/><SideNavItem icon={<ChartLineUp weight="regular"/>} label={t("workflow.logs")} isSelected={activeView === "logs"} onClick={() => switchView("logs")}/></>}{userRoleLevel >= ROLE_LEVEL.admin && <><SideNavItem icon={<Users weight="regular"/>} label={t("workflow.users")} isSelected={activeView === "users"} onClick={() => switchView("users")}/><SideNavItem icon={<UsersThree weight="regular"/>} label={t("workflow.groups")} isSelected={activeView === "groups"} onClick={() => switchView("groups")}/></>}</SideNavSection>
+    {userRoleLevel >= ROLE_LEVEL.manager && <SideNavSection title={t("sideNav.category.administration")} subtitle={t("sideNav.category.administration.subtitle")} className="side-nav-category">{isAdmin && <><SideNavItem icon={<Key weight="regular"/>} label={t("workflow.mcpTokens")} isSelected={activeView === "mcp-tokens"} onClick={() => switchView("mcp-tokens")}/><SideNavItem icon={<BookOpen weight="regular"/>} label={t("workflow.ingestTokens")} isSelected={activeView === "ingest-tokens"} onClick={() => switchView("ingest-tokens")}/></>}{userRoleLevel >= ROLE_LEVEL.manager && <><SideNavItem icon={<HardDrives weight="regular"/>} label={t("workflow.systemStatus")} isSelected={activeView === "system-status"} onClick={() => switchView("system-status")}/><SideNavItem icon={<ChartLineUp weight="regular"/>} label={t("workflow.logs")} isSelected={activeView === "logs"} onClick={() => switchView("logs")}/></>}{userRoleLevel >= ROLE_LEVEL.admin && <><SideNavItem icon={<Users weight="regular"/>} label={t("workflow.users")} isSelected={activeView === "users"} onClick={() => switchView("users")}/><SideNavItem icon={<UsersThree weight="regular"/>} label={t("workflow.groups")} isSelected={activeView === "groups"} onClick={() => switchView("groups")}/></>}</SideNavSection>}
   </SideNav>;
   const topNav = <TopNav label={t("app.workspaceNavAriaLabel")} menuLabel={t("ui.openNavigation")} commandLabel={t("ui.openCommandPalette")} heading={<TopNavHeading heading={selectedKb?.name || t("app.workspaceTitle")}/>} endContent={<div className="topnav-user"><Button label={language === "th" ? "EN" : "TH"} size="sm" variant="ghost" onClick={() => setLanguage(language === "th" ? "en" : "th")} aria-label={t("app.toggleLanguage")}/><span className="status-indicator"/> <button type="button" className="topnav-profile-button" onClick={() => switchView("profile")} title={t("workflow.profile")}>{user.username}</button><Button label={t("app.logout")} size="sm" variant="ghost" onClick={logout} aria-label={t("app.logout")}/></div>}/>;
   const commandItems = [
-    ["knowledge-bases", Database, t("workflow.knowledgeBases")], ["documents", FileText, t("workflow.documents")], ["search", MagnifyingGlass, t("workflow.search")], ["explore", Compass, t("workflow.explore")], ["mcp-tokens", Key, t("workflow.mcpTokens")], ["ingest-tokens", BookOpen, t("workflow.ingestTokens")],
+    ["knowledge-bases", Database, t("workflow.knowledgeBases")], ["documents", FileText, t("workflow.documents")], ["search", MagnifyingGlass, t("workflow.search")], ["explore", Compass, t("workflow.explore")],
+    ...(isAdmin ? [["mcp-tokens", Key, t("workflow.mcpTokens")], ["ingest-tokens", BookOpen, t("workflow.ingestTokens")]] : []),
     ...(userRoleLevel >= ROLE_LEVEL.manager ? [["system-status", HardDrives, t("workflow.systemStatus")], ["logs", ChartLineUp, t("workflow.logs")]] : []),
     ...(userRoleLevel >= ROLE_LEVEL.admin ? [["users", Users, t("workflow.users")], ["groups", UsersThree, t("workflow.groups")]] : []),
     ["profile", User, t("workflow.profile")],
@@ -767,9 +775,9 @@ function App() {
       {message && <Toast body={message.body} type={message.type} isAutoHide={message.type !== "error"} autoHideDuration={5000} dismissLabel={t("ui.dismissNotification")} onDismiss={() => setMessage(null)}/>}
       <CommandPalette open={isCommandPaletteOpen} onClose={closeCommandPalette} items={commandItems} title={t("app.workspaceNavAriaLabel")} searchPlaceholder={t("ui.commandSearchPlaceholder")} searchLabel={t("ui.commandSearchLabel")} noMatchLabel={t("ui.commandNoMatch")}/>
       <WorkflowNavigation activeView={activeView} selectedKb={selectedKb} hasCompletedDocuments={hasCompletedDocuments} viewTrail={viewTrail} onNavigate={navigateToView} onBack={goBack} onNavigateNext={switchView}/>
-      {activeView === "knowledge-bases" && <KnowledgeBases kbs={kbs} selectedKbId={selectedKbId} setSelectedKbId={setSelectedKbId} newKbName={newKbName} setNewKbName={setNewKbName} createKb={createKb} manageKnowledgeBase={manageKnowledgeBase} updateRetrievalConfig={updateRetrievalConfig} updateKnowledgeBaseIcon={updateKnowledgeBaseIcon} renameKnowledgeBase={renameKnowledgeBase} uploadKnowledgeBaseCover={uploadKnowledgeBaseCover} deleteKnowledgeBaseCover={deleteKnowledgeBaseCover} onContinue={() => switchView("documents")}/>}
+      {activeView === "knowledge-bases" && <KnowledgeBases kbs={kbs} selectedKbId={selectedKbId} setSelectedKbId={setSelectedKbId} newKbName={newKbName} setNewKbName={setNewKbName} createKb={createKb} manageKnowledgeBase={manageKnowledgeBase} updateRetrievalConfig={updateRetrievalConfig} updateKnowledgeBaseIcon={updateKnowledgeBaseIcon} renameKnowledgeBase={renameKnowledgeBase} uploadKnowledgeBaseCover={uploadKnowledgeBaseCover} deleteKnowledgeBaseCover={deleteKnowledgeBaseCover} canManageRetrieval={isAdmin} canManageKbs={isAdmin} users={users} newKbOwnerId={newKbOwnerId} setNewKbOwnerId={setNewKbOwnerId} onContinue={() => switchView("documents")}/>}
       {activeView === "documents" && (
-        <Documents selectedKb={selectedKb} documents={documents} documentTotal={documentTotal} documentOffset={documentOffset} setDocumentOffset={setDocumentOffset} documentSearch={documentSearch} setDocumentSearch={setDocumentSearch} documentStatusFilter={documentStatusFilter} setDocumentStatusFilter={setDocumentStatusFilter} documentTypeFilter={documentTypeFilter} setDocumentTypeFilter={setDocumentTypeFilter} documentsLoading={documentsLoading} hasCompletedDocuments={hasCompletedDocuments} knowledgeBaseQuality={knowledgeBaseQuality} knowledgeBaseQualityLoading={knowledgeBaseQualityLoading} loadKnowledgeBaseQualityPage={offset => loadKnowledgeBaseQuality(selectedKbId, offset).catch(showError)} showDeletedDocuments={showDeletedDocuments} setShowDeletedDocuments={setShowDeletedDocuments} uploadFile={uploadFile} setUploadFile={setUploadFile} uploadTitle={uploadTitle} setUploadTitle={setUploadTitle} uploadDocumentType={uploadDocumentType} setUploadDocumentType={setUploadDocumentType} documentTemplates={documentTemplates} uploadTemplateId={uploadTemplateId} setUploadTemplateId={setUploadTemplateId} uploadMetadata={uploadMetadata} setUploadMetadata={setUploadMetadata} createDocumentTemplate={createDocumentTemplate} updateDocumentTemplate={updateDocumentTemplate} deactivateDocumentTemplate={deactivateDocumentTemplate} activateDocumentTemplate={activateDocumentTemplate} renameDocumentTemplate={renameDocumentTemplate} duplicateDocumentTemplate={duplicateDocumentTemplate} purgeDocumentTemplate={purgeDocumentTemplate} uploadDocument={uploadDocument} isUploading={isUploading} openDocument={openDocument} extractLegalMetadata={extractLegalMetadata} saveLegalMetadata={saveLegalMetadata} deleteLegalMetadata={deleteLegalMetadata} reprocessDocument={reprocessDocument} deleteDocument={deleteDocument} restoreDocument={restoreDocument} downloadOriginalDocument={downloadOriginalDocument} exportKnowledgeBaseMetadata={exportKnowledgeBaseMetadata} exportDocumentMetadata={exportDocumentMetadata} previewOriginalDocument={previewOriginalDocument} pdfPreview={pdfPreview} onClosePdfPreview={closePdfPreview} reindexEmbeddings={reindexEmbeddings} refreshDocuments={() => reloadDocumentsAndQuality().catch(showError)} documentPreview={documentPreview} documentJobs={documentJobs} documentJobPolling={documentJobPolling} documentJobPollError={documentJobPollError} legalInstruments={legalInstruments} resolveLegalRegistry={resolveLegalRegistry} updateLegalInstrument={updateLegalInstrument} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={() => loadKbData(selectedKbId).catch(showError)} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship} onClosePreview={closePreview} onCreateKb={() => switchView("knowledge-bases")} onSearch={() => switchView("search")} onExplore={() => switchView("explore")}/>
+        <Documents canReindex={isAdmin} selectedKb={selectedKb} documents={documents} documentTotal={documentTotal} documentOffset={documentOffset} setDocumentOffset={setDocumentOffset} documentSearch={documentSearch} setDocumentSearch={setDocumentSearch} documentStatusFilter={documentStatusFilter} setDocumentStatusFilter={setDocumentStatusFilter} documentTypeFilter={documentTypeFilter} setDocumentTypeFilter={setDocumentTypeFilter} documentsLoading={documentsLoading} hasCompletedDocuments={hasCompletedDocuments} knowledgeBaseQuality={knowledgeBaseQuality} knowledgeBaseQualityLoading={knowledgeBaseQualityLoading} loadKnowledgeBaseQualityPage={offset => loadKnowledgeBaseQuality(selectedKbId, offset).catch(showError)} showDeletedDocuments={showDeletedDocuments} setShowDeletedDocuments={setShowDeletedDocuments} uploadFile={uploadFile} setUploadFile={setUploadFile} uploadTitle={uploadTitle} setUploadTitle={setUploadTitle} uploadDocumentType={uploadDocumentType} setUploadDocumentType={setUploadDocumentType} documentTemplates={documentTemplates} uploadTemplateId={uploadTemplateId} setUploadTemplateId={setUploadTemplateId} uploadMetadata={uploadMetadata} setUploadMetadata={setUploadMetadata} createDocumentTemplate={createDocumentTemplate} updateDocumentTemplate={updateDocumentTemplate} deactivateDocumentTemplate={deactivateDocumentTemplate} activateDocumentTemplate={activateDocumentTemplate} renameDocumentTemplate={renameDocumentTemplate} duplicateDocumentTemplate={duplicateDocumentTemplate} purgeDocumentTemplate={purgeDocumentTemplate} uploadDocument={uploadDocument} isUploading={isUploading} openDocument={openDocument} extractLegalMetadata={extractLegalMetadata} saveLegalMetadata={saveLegalMetadata} deleteLegalMetadata={deleteLegalMetadata} reprocessDocument={reprocessDocument} deleteDocument={deleteDocument} restoreDocument={restoreDocument} downloadOriginalDocument={downloadOriginalDocument} exportKnowledgeBaseMetadata={exportKnowledgeBaseMetadata} exportDocumentMetadata={exportDocumentMetadata} previewOriginalDocument={previewOriginalDocument} pdfPreview={pdfPreview} onClosePdfPreview={closePdfPreview} reindexEmbeddings={reindexEmbeddings} refreshDocuments={() => reloadDocumentsAndQuality().catch(showError)} documentPreview={documentPreview} documentJobs={documentJobs} documentJobPolling={documentJobPolling} documentJobPollError={documentJobPollError} legalInstruments={legalInstruments} resolveLegalRegistry={resolveLegalRegistry} updateLegalInstrument={updateLegalInstrument} entities={entities} relationships={relationships} addEntity={addEntity} addRelationship={addRelationship} impact={impact} analyzeImpact={analyzeImpact} syncGraphFromDocuments={syncGraphFromDocuments} refreshGraph={() => loadKbData(selectedKbId).catch(showError)} isLegalGraph={isLegalGraph} legalGraphView={legalGraphView} setLegalGraphView={setLegalGraphView} queueLegalGraphRebuild={queueLegalGraphRebuild} legalRebuildStatus={legalRebuildStatus} reviewLegalRelationship={reviewLegalRelationship} onClosePreview={closePreview} onCreateKb={() => switchView("knowledge-bases")} onSearch={() => switchView("search")} onExplore={() => switchView("explore")}/>
       )}
       {activeView === "search" && (
         <SearchView selectedKb={selectedKb} documents={documents} completedDocuments={hasCompletedDocuments} query={query} setQuery={setQuery} queryAsOfDate={queryAsOfDate} setQueryAsOfDate={setQueryAsOfDate} queryIncludeHistorical={queryIncludeHistorical} setQueryIncludeHistorical={setQueryIncludeHistorical} runQuery={runQuery} isQuerying={isQuerying} queryResult={queryResult} submitFeedback={submitQueryFeedback} onDocuments={() => switchView("documents")} onOpenSource={document => { switchView("documents"); openDocument(document); }}/>
@@ -786,10 +794,10 @@ function App() {
       {activeView === "profile" && (
         <ProfileView me={user} notify={notify} showError={showError} onLogout={logout}/>
       )}
-      {activeView === "mcp-tokens" && <McpTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
-      {activeView === "ingest-tokens" && <IngestTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
+      {activeView === "mcp-tokens" && isAdmin && <McpTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
+      {activeView === "ingest-tokens" && isAdmin && <IngestTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
       {activeView === "system-status" && userRoleLevel >= ROLE_LEVEL.manager && <SystemStatusView />}
-      {activeView === "logs" && <LoggingView transactions={transactionLogs} traces={traceLogs} loadTransactions={loadTransactionLogs} loadTraces={loadTraceLogs} hasMoreTransactions={Boolean(transactionCursor)} hasMoreTraces={Boolean(traceCursor)}/>}
+      {activeView === "logs" && userRoleLevel >= ROLE_LEVEL.manager && <LoggingView transactions={transactionLogs} traces={traceLogs} loadTransactions={loadTransactionLogs} loadTraces={loadTraceLogs} hasMoreTransactions={Boolean(transactionCursor)} hasMoreTraces={Boolean(traceCursor)}/>}
     </div>
   </AppShell></Theme>;
 }
@@ -1245,7 +1253,7 @@ function TraceWaterfall({trace}) {
   </div>;
 }
 
-const PageHeading = ({eyebrow, title, description, actions}) => <div className="page-heading"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
+const PageHeading = ({title, description, actions}) => <div className="page-heading"><div><h1>{title}</h1><p>{description}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
 const Drawer = ({title, onClose, children}) => <div className="document-type-drawer-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><aside className="document-type-drawer" role="dialog" aria-modal="true" onMouseDown={event => event.stopPropagation()}><header className="document-type-drawer-header"><div><h2>{title}</h2></div><button type="button" className="document-type-drawer-close" onClick={onClose} aria-label="Close">✕</button></header><div className="drawer-body">{children}</div></aside></div>;
 
 const WORKFLOW_KEYS = {
@@ -1363,7 +1371,7 @@ function KnowledgeBaseIconPicker({knowledgeBase, onChange}) {
   return <details ref={pickerRef} className="kb-icon-picker"><summary><KnowledgeBaseIcon knowledgeBase={knowledgeBase} size={16}/><span>{t("kb.icon.change")}</span></summary><div className="kb-icon-palette" role="group" aria-label={t("kb.icon.pickerLabel", {name: knowledgeBase.name})}>{KB_ICON_OPTIONS.map(option => <button key={option.id} type="button" className={option.id === selectedIcon ? "selected" : ""} aria-label={t(`kb.icon.${option.id}`)} title={t(`kb.icon.${option.id}`)} aria-pressed={option.id === selectedIcon} disabled={isSaving} onClick={() => selectIcon(option.id)}><KnowledgeBaseIcon knowledgeBase={knowledgeBase} icon={option.id} size={18}/></button>)}</div></details>;
 }
 
-function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKbName, createKb, manageKnowledgeBase, updateRetrievalConfig, updateKnowledgeBaseIcon, renameKnowledgeBase, uploadKnowledgeBaseCover, deleteKnowledgeBaseCover, onContinue}) {
+function KnowledgeBases({canManageRetrieval = false, canManageKbs = false, users = [], newKbOwnerId = "", setNewKbOwnerId, kbs, selectedKbId, setSelectedKbId, newKbName, setNewKbName, createKb, manageKnowledgeBase, updateRetrievalConfig, updateKnowledgeBaseIcon, renameKnowledgeBase, uploadKnowledgeBaseCover, deleteKnowledgeBaseCover, onContinue}) {
   const {t} = useLanguage();
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -1395,7 +1403,6 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
   };
   return <>
     <section className="kb-hero">
-      <p className="eyebrow">{t("kb.hero.eyebrow")}</p>
       <h1>{t("kb.hero.title")}</h1>
       <p>{t("kb.hero.description")}</p>
       <div className="kb-hero-search">
@@ -1403,7 +1410,7 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
         <label className="native-field">{t("common.status")}<select value={statusFilter} onChange={event => setStatusFilter(event.target.value)}><option value="all">{t("common.allStatuses")}</option><option value="active">{t("common.active")}</option><option value="draft">{t("kb.status.draft")}</option><option value="disabled">{t("status.disabled.label")}</option></select></label>
       </div>
     </section>
-    <div className="kb-hub-heading"><div className="kb-hub-heading-text"><h2>{t("kb.hub.heading")}</h2><p>{kbs.length ? t("kb.hub.shownCount", {shown: visibleKnowledgeBases.length, total: kbs.length}) : t("kb.hub.createFirst")}</p></div><div className="kb-hub-view-toggle" role="group" aria-label={t("kb.hub.viewToggleLabel")}>
+    <div className="kb-hub-heading"><div className="kb-hub-heading-text"><h2>{t("kb.hub.heading")}</h2><p>{kbs.length ? t("kb.hub.shownCount", {shown: visibleKnowledgeBases.length, total: kbs.length}) : (canManageKbs ? t("kb.hub.createFirst") : t("kb.hub.noneAssigned"))}</p></div><div className="kb-hub-view-toggle" role="group" aria-label={t("kb.hub.viewToggleLabel")}>
       <button type="button" className={hubView === "cards" ? "selected" : ""} aria-pressed={hubView === "cards"} onClick={() => changeHubView("cards")}><SquaresFour weight="regular" size={16}/><span>{t("kb.hub.view.cards")}</span></button>
       <button type="button" className={hubView === "table" ? "selected" : ""} aria-pressed={hubView === "table"} onClick={() => changeHubView("table")}><Rows weight="regular" size={16}/><span>{t("kb.hub.view.table")}</span></button>
     </div></div>
@@ -1425,9 +1432,9 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
               <td><KbStatusBadge status={kb.status}/></td>
               <td><div className="row-actions">
                 <Button label={t("kb.hub.open") } size="sm" variant="ghost" onClick={() => openKnowledgeBase(kb)}/>
-                <Button label={t("common.rename")} size="sm" variant="ghost" onClick={() => setRenamingKb(kb)}/>
+                {canManageKbs && <><Button label={t("common.rename")} size="sm" variant="ghost" onClick={() => setRenamingKb(kb)}/>
                 {kb.status === "active" ? <Button label={t("common.disable")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "disable")}/> : <Button label={t("common.activate")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "activate")}/>}
-                <Button label={t("common.delete")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "delete")}/>
+                <Button label={t("common.delete")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "delete")}/></>}
               </div></td>
             </tr>)}
           </tbody>
@@ -1459,17 +1466,17 @@ function KnowledgeBases({kbs, selectedKbId, setSelectedKbId, newKbName, setNewKb
         </button>
         <div className="kb-hub-actions">
           <KnowledgeBaseIconPicker knowledgeBase={kb} onChange={updateKnowledgeBaseIcon}/>
-          <Button label={t("common.rename")} size="sm" variant="ghost" onClick={() => setRenamingKb(kb)}/>
+          {canManageKbs && <><Button label={t("common.rename")} size="sm" variant="ghost" onClick={() => setRenamingKb(kb)}/>
           {kb.status === "active" ? <Button label={t("common.disable")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "disable")}/> : <Button label={t("common.activate")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "activate")}/>}
-          <Button label={t("common.delete")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "delete")}/>
+          <Button label={t("common.delete")} size="sm" variant="ghost" onClick={() => manageKnowledgeBase(kb, "delete")}/></>}
         </div>
-        <RetrievalPolicyEditor knowledgeBase={kb} onSave={config => updateRetrievalConfig(kb, config)}/>
+        {canManageRetrieval && <RetrievalPolicyEditor knowledgeBase={kb} onSave={config => updateRetrievalConfig(kb, config)}/>}
       </article>)}
-      <article className={`kb-hub-card kb-hub-create ${isCreating ? "open" : ""}`}>
+      {canManageKbs && <article className={`kb-hub-card kb-hub-create ${isCreating ? "open" : ""}`}>
         {isCreating
-          ? <form className="form-stack" onSubmit={submitCreate}><TextInput label={t("kb.hub.create.nameLabel")} value={newKbName} onChange={setNewKbName} placeholder={t("kb.hub.create.namePlaceholder")} isRequired hasAutoFocus/><div className="kb-hub-create-actions"><Button label={t("common.cancel")} type="button" variant="ghost" size="sm" onClick={() => setIsCreating(false)}/><Button label={t("common.create")} type="submit" variant="primary" size="sm"/></div></form>
+          ? <form className="form-stack" onSubmit={submitCreate}><TextInput label={t("kb.hub.create.nameLabel")} value={newKbName} onChange={setNewKbName} placeholder={t("kb.hub.create.namePlaceholder")} isRequired hasAutoFocus/><Selector label={t("kb.hub.create.ownerLabel")} description={t("kb.hub.create.ownerHelp")} value={newKbOwnerId} onChange={setNewKbOwnerId} options={[{value: "", label: t("kb.hub.create.ownerSelf")}, ...users.filter(row => row.is_active !== false && row.role !== "admin").map(row => ({value: row.id, label: row.display_name ? `${row.display_name} (${row.username})` : row.username}))]}/><div className="kb-hub-create-actions"><Button label={t("common.cancel")} type="button" variant="ghost" size="sm" onClick={() => setIsCreating(false)}/><Button label={t("common.create")} type="submit" variant="primary" size="sm"/></div></form>
           : <button type="button" className="kb-hub-create-trigger" onClick={() => setIsCreating(true)}><span className="kb-hub-create-preview"><ImageSquare size={34}/></span><span className="kb-hub-create-icon">+</span><span>{t("sideNav.newKnowledgeBase")}</span></button>}
-      </article>
+      </article>}
     </section>
     {kbs.length > 0 && !visibleKnowledgeBases.length && <EmptyState isCompact title={t("kb.hub.noMatch.title")} description={t("kb.hub.noMatch.description")}/>}
     {renamingKb && <RenameKnowledgeBaseDialog knowledgeBase={renamingKb} onClose={() => setRenamingKb(null)} onSave={async (name, description) => { const ok = await renameKnowledgeBase(renamingKb, name, description); if (ok) setRenamingKb(null); }}/>}
@@ -1546,6 +1553,18 @@ function DocumentRowOverflowMenu({document: doc, processing, onReprocess, onDele
   </div>;
 }
 
+// Secondary Documents actions live behind one "More" trigger so "Add documents" stays the only primary action.
+function DocumentsMoreMenu({items, t, returnFocusRef}) {
+  const menu = useAnchoredMenu();
+  const setTriggerRef = node => { menu.triggerRef.current = node; if (returnFocusRef) returnFocusRef.current = node; };
+  return <div className="document-overflow documents-more" ref={menu.rootRef}>
+    <button type="button" className="snx-more-trigger" ref={setTriggerRef} aria-haspopup="menu" aria-expanded={menu.open} onClick={menu.toggle}>{t("documents.more")}<CaretDown size={14} weight="bold" aria-hidden="true"/></button>
+    {menu.open && <div className="document-overflow-menu" role="menu" ref={menu.menuRef} style={menu.style}>
+      {items.map(item => <button key={item.id} type="button" role="menuitem" className={item.isSeparated ? "menu-separated" : undefined} onClick={() => { menu.close(); item.onSelect(); }}>{item.label}</button>)}
+    </div>}
+  </div>;
+}
+
 // A document is live, deleted (restorable) or purged (gone for good); each state offers different actions.
 function DocumentRowActions({document, processing, t, onRestore, onDownload, onPreview, onReprocess, onDelete}) {
   if (document.purged_at) return <span className="document-purged-note" title={t("documents.purged.help")}>{t("documents.purged.label")}</span>;
@@ -1585,7 +1604,7 @@ function KnowledgeBaseQualityDrawer({open, quality, loading, onClose, onOpenDocu
   </div>;
 }
 
-function Documents({exportKnowledgeBaseMetadata, exportDocumentMetadata, selectedKb, documents, documentTotal, documentOffset, setDocumentOffset, documentSearch, setDocumentSearch, documentStatusFilter, setDocumentStatusFilter, documentTypeFilter, setDocumentTypeFilter, documentsLoading, hasCompletedDocuments, knowledgeBaseQuality, knowledgeBaseQualityLoading, loadKnowledgeBaseQualityPage, showDeletedDocuments, setShowDeletedDocuments, uploadFile, setUploadFile, uploadTitle, setUploadTitle, uploadDocumentType, setUploadDocumentType, documentTemplates, uploadTemplateId, setUploadTemplateId, uploadMetadata, setUploadMetadata, createDocumentTemplate, updateDocumentTemplate, deactivateDocumentTemplate, activateDocumentTemplate, renameDocumentTemplate, duplicateDocumentTemplate, purgeDocumentTemplate, uploadDocument, isUploading, openDocument, extractLegalMetadata, saveLegalMetadata, deleteLegalMetadata, reprocessDocument, deleteDocument, restoreDocument, downloadOriginalDocument, previewOriginalDocument, pdfPreview, onClosePdfPreview, reindexEmbeddings, refreshDocuments, documentPreview, documentJobs, documentJobPolling, documentJobPollError, legalInstruments, resolveLegalRegistry, updateLegalInstrument, entities, relationships, addEntity, addRelationship, impact, analyzeImpact, syncGraphFromDocuments, refreshGraph, isLegalGraph, legalGraphView, setLegalGraphView, queueLegalGraphRebuild, legalRebuildStatus, reviewLegalRelationship, onClosePreview, onCreateKb, onSearch, onExplore}) {
+function Documents({canReindex = false, exportKnowledgeBaseMetadata, exportDocumentMetadata, selectedKb, documents, documentTotal, documentOffset, setDocumentOffset, documentSearch, setDocumentSearch, documentStatusFilter, setDocumentStatusFilter, documentTypeFilter, setDocumentTypeFilter, documentsLoading, hasCompletedDocuments, knowledgeBaseQuality, knowledgeBaseQualityLoading, loadKnowledgeBaseQualityPage, showDeletedDocuments, setShowDeletedDocuments, uploadFile, setUploadFile, uploadTitle, setUploadTitle, uploadDocumentType, setUploadDocumentType, documentTemplates, uploadTemplateId, setUploadTemplateId, uploadMetadata, setUploadMetadata, createDocumentTemplate, updateDocumentTemplate, deactivateDocumentTemplate, activateDocumentTemplate, renameDocumentTemplate, duplicateDocumentTemplate, purgeDocumentTemplate, uploadDocument, isUploading, openDocument, extractLegalMetadata, saveLegalMetadata, deleteLegalMetadata, reprocessDocument, deleteDocument, restoreDocument, downloadOriginalDocument, previewOriginalDocument, pdfPreview, onClosePdfPreview, reindexEmbeddings, refreshDocuments, documentPreview, documentJobs, documentJobPolling, documentJobPollError, legalInstruments, resolveLegalRegistry, updateLegalInstrument, entities, relationships, addEntity, addRelationship, impact, analyzeImpact, syncGraphFromDocuments, refreshGraph, isLegalGraph, legalGraphView, setLegalGraphView, queueLegalGraphRebuild, legalRebuildStatus, reviewLegalRelationship, onClosePreview, onCreateKb, onSearch, onExplore}) {
   const {t} = useLanguage();
   const [isTypeDrawerOpen, setIsTypeDrawerOpen] = useState(false);
   const [isUploadDrawerOpen, setIsUploadDrawerOpen] = useState(false);
@@ -1649,7 +1668,7 @@ function Documents({exportKnowledgeBaseMetadata, exportDocumentMetadata, selecte
     </div>}
     <div className="upload-actions"><Button label={uploadFile.length > 1 ? t("documents.upload.submitMultiple", {count: uploadFile.length}) : t("documents.upload.submitSingle")} type="submit" variant="primary" isDisabled={!uploadFile.length || isUploading} isLoading={isUploading}/></div>
   </form>;
-  return <><PageHeading eyebrow={t("documents.pageHeading.eyebrow")} title={t("documents.pageHeading.title", {name: selectedKb.name})} description={t("documents.pageHeading.description")} actions={<><Button ref={uploadTriggerRef} label={t("documents.upload.addDocuments")} variant="primary" onClick={() => { setIsUploadDrawerOpen(true); }}/><Button ref={qualityTriggerRef} label={t("kbQuality.button", {score: knowledgeBaseQuality?.score ?? "—"})} variant="secondary" isDisabled={knowledgeBaseQualityLoading && !knowledgeBaseQuality} onClick={() => { setIsQualityDrawerOpen(true); loadKnowledgeBaseQualityPage(0); }}/><Button ref={typeManagerTriggerRef} label={t("documents.manageTypes")} variant="secondary" onClick={() => setIsTypeDrawerOpen(true)}/><Button label={showDeletedDocuments ? t("documents.hideDeleted") : t("documents.showDeleted")} variant="ghost" onClick={() => { setDocumentOffset(0); setShowDeletedDocuments(value => !value); }}/><Button label={t("documents.reindex")} variant="secondary" onClick={reindexEmbeddings}/><Button label={t("documents.exportMetadata")} variant="secondary" onClick={() => exportKnowledgeBaseMetadata(selectedKb)}/><Button label={t("documents.refreshStatus")} variant="ghost" onClick={refreshDocuments}/></>}/>
+  return <><PageHeading eyebrow={t("documents.pageHeading.eyebrow")} title={t("documents.pageHeading.title", {name: selectedKb.name})} description={t("documents.pageHeading.description")} actions={<><Button ref={uploadTriggerRef} label={t("documents.upload.addDocuments")} variant="primary" onClick={() => { setIsUploadDrawerOpen(true); }}/><Button ref={qualityTriggerRef} label={t("kbQuality.button", {score: knowledgeBaseQuality?.score ?? "—"})} variant="secondary" isDisabled={knowledgeBaseQualityLoading && !knowledgeBaseQuality} onClick={() => { setIsQualityDrawerOpen(true); loadKnowledgeBaseQualityPage(0); }}/><DocumentsMoreMenu t={t} items={[{id: "types", label: t("documents.manageTypes"), onSelect: () => setIsTypeDrawerOpen(true)}, {id: "deleted", label: showDeletedDocuments ? t("documents.hideDeleted") : t("documents.showDeleted"), onSelect: () => { setDocumentOffset(0); setShowDeletedDocuments(value => !value); }}, {id: "export", label: t("documents.exportMetadata"), onSelect: () => exportKnowledgeBaseMetadata(selectedKb)}, {id: "refresh", label: t("documents.refreshStatus"), onSelect: refreshDocuments}, ...(canReindex ? [{id: "reindex", label: t("documents.reindex"), onSelect: reindexEmbeddings, isSeparated: true}] : [])]} returnFocusRef={typeManagerTriggerRef}/></>}/>
     {hasCompletedDocuments && <section className="next-step-card"><div><p className="eyebrow">{t("documents.nextStep.eyebrow")}</p><h2>{t("documents.nextStep.title")}</h2><p>{t("documents.nextStep.description")}</p></div><div className="next-step-actions"><Button label={t("documents.nextStep.search")} variant="primary" onClick={onSearch}/><Button label={t("workflow.explore")} variant="secondary" onClick={onExplore}/></div></section>}
     {isUploadDrawerOpen && <div className="document-type-drawer-overlay" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) closeUploadDrawer(); }}><aside ref={uploadDrawerRef} className="document-type-drawer upload-drawer" role="dialog" aria-modal="true" aria-labelledby="upload-drawer-title" onMouseDown={event => event.stopPropagation()}><header className="document-type-drawer-header"><div><p className="eyebrow">{t("documents.pageHeading.eyebrow")}</p><h2 id="upload-drawer-title" tabIndex={-1} ref={uploadDrawerHeadingRef}>{t("documents.upload.addDocuments")}</h2><p>{t("documents.upload.formatNote")}</p></div><button type="button" className="drawer-close" onClick={closeUploadDrawer} aria-label={t("documentPreview.closeAriaLabel")}>×</button></header>{uploadForm}</aside></div>}
     <div className="log-tabs" role="tablist">{[["files", t("documents.tabs.files")], ["metadata-quality", t("documents.tabs.metadataQuality")], ...(legalInstruments?.length > 0 ? [["legal", t("documents.tabs.legal")]] : [])].map(([value, label]) => <button role="tab" key={value} aria-selected={libraryTab === value} className={libraryTab === value ? "selected" : ""} onClick={() => setLibraryTab(value)}>{label}</button>)}</div>
@@ -1732,7 +1751,7 @@ function ExploreView({selectedKb, entities, relationships, addEntity, addRelatio
 }
 
 const GRAPH_TYPE_VISUALS = {
-  application: {Icon: AppWindow, color: "#2786C2", tint: "#eaf4fa"},
+  application: {Icon: AppWindow, color: "#4582b8", tint: "#ecf4fa"},
   service: {Icon: Cloud, color: "#5f5fc4", tint: "#efeffb"},
   server: {Icon: HardDrives, color: "#0d7c83", tint: "#e8f7f7"},
   database: {Icon: Database, color: "#287d65", tint: "#e8f6ef"},
@@ -1742,7 +1761,7 @@ const GRAPH_TYPE_VISUALS = {
   document: {Icon: FileText, color: "#6f6a63", tint: "#f4f2ef"},
   concept: {Icon: Lightbulb, color: "#7454bf", tint: "#f2effc"},
   legalinstrument: {Icon: Gavel, color: "#6750a4", tint: "#f1edfb"},
-  provision: {Icon: BookOpen, color: "#2786C2", tint: "#eaf4fa"},
+  provision: {Icon: BookOpen, color: "#4582b8", tint: "#ecf4fa"},
   legalauthority: {Icon: Buildings, color: "#0d7c83", tint: "#e8f7f7"},
   legalparty: {Icon: User, color: "#a14878", tint: "#fbeef5"},
   obligation: {Icon: Scales, color: "#c27a18", tint: "#fff5e5"},
@@ -2060,7 +2079,7 @@ function GraphCanvas({knowledgeBaseId, entities, relationships, addEntity, addRe
     setEdges(visibleRelationships.filter(relationship => nodesById[relationship.source_entity_id] && nodesById[relationship.target_entity_id]).map(relationship => {
       const isDependency = /DEPEND|RUNS_ON|USES/i.test(relationship.relationship_type);
       const reviewStatus = relationship.review_status || "verified";
-      const statusColor = reviewStatus === "suggested" ? "#d58b14" : reviewStatus === "rejected" ? "#9a6a6a" : relationship.origin === "manual" ? "#65439a" : (isDependency ? "#56328d" : "#008c96");
+      const statusColor = reviewStatus === "suggested" ? "#d58b14" : reviewStatus === "rejected" ? "#9a6a6a" : relationship.origin === "manual" ? "#65439a" : (isDependency ? "#56328d" : "#4582b8");
       const handles = connectionHandles(nodesById[relationship.source_entity_id], nodesById[relationship.target_entity_id]);
       const selectedPath = selectedEntityId && (relationship.source_entity_id === selectedEntityId || relationship.target_entity_id === selectedEntityId);
       const showLabel = relationship.id === selectedRelationshipId || Boolean(selectedPath && selectedEntityId);

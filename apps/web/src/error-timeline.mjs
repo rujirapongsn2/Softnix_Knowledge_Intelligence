@@ -1,12 +1,12 @@
 // Layout for the status page's error chart: one bar per hour or day, stacked by error group, failed below retried.
 
 export const ERROR_GROUP_COLORS = {
-  retrieval_engine: "#2786C2",
-  ai_provider: "#D97706",
-  ocr_extraction: "#7C3AED",
-  metadata: "#0F9D8A",
-  index_cleanup: "#DC2626",
-  other: "#6B7280",
+  retrieval_engine: "#4582b8",
+  ai_provider: "#f3903f",
+  ocr_extraction: "#a9cb2e",
+  metadata: "#fdc70c",
+  index_cleanup: "#e74341",
+  other: "#6b7585",
 };
 
 // A round axis top at or above the tallest bar: 1, 2, 2.5 or 5 times a power of ten. Counts are whole, so 2.5

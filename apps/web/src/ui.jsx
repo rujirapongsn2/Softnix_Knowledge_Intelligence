@@ -50,7 +50,7 @@ export function useDialogFocus({open, dialogRef, onClose, initialFocusRef}) {
 
 export const Button = forwardRef(function Button({label, children, variant = "secondary", size = "md", isLoading = false, isDisabled = false, className, ...props}, ref) {
   const kumoVariant = variant === "destructive" ? "destructive" : variant === "ghost" ? "ghost" : variant;
-  return <KumoButton ref={ref} variant={kumoVariant} loading={isLoading} disabled={isDisabled || isLoading} className={join("snx-button", `snx-button-${size}`, className)} {...props}>{children || label}</KumoButton>;
+  return <KumoButton ref={ref} variant={kumoVariant} loading={isLoading} disabled={isDisabled || isLoading} className={join("snx-button", `snx-button-${size}`, `snx-button-v-${variant}`, className)} {...props}>{children || label}</KumoButton>;
 });
 
 // Kumo prints an English "(optional)" after the label whenever `required` is
@@ -143,7 +143,7 @@ export function SideNav({header, topContent, children, collapsible = false, mobi
   </aside>;
 }
 
-export function SideNavHeading({superheading, heading}) { return <div className="snx-brand-heading"><span>{superheading}</span><strong>{heading}</strong></div>; }
+export function SideNavHeading({superheading, heading}) { return <div className="snx-brand-heading"><strong>{heading}</strong><span>{superheading}</span></div>; }
 export function SideNavSection({title, subtitle, children, className}) { return <section className={join("snx-nav-section", className)}><p>{title}</p>{subtitle && <small>{subtitle}</small>}<div>{children}</div></section>; }
 export function SideNavItem({label, isSelected, onClick, icon}) { return <button type="button" className={join("snx-nav-item", isSelected && "is-active")} onClick={() => { onClick?.(); window.dispatchEvent(new Event("softnix:navigate")); }} title={label}>{icon}<span>{label}</span></button>; }
 

@@ -2,13 +2,13 @@
 
 .users-toolbar { display: flex; justify-content: flex-end; gap: .5rem; margin-bottom: .9rem; }
 
-.table-scroll { border: 1px solid #d9e5e7; border-radius: 1rem; overflow: auto; background: var(--color-background-surface); box-shadow: 0 12px 32px #173f4810; }
+.table-scroll { border: 1px solid #e2e5ea; border-radius: 1rem; overflow: auto; background: var(--color-background-surface); box-shadow: 0 12px 32px #4582b810; }
 
 .data-table { width: 100%; border-collapse: collapse; font-size: .9rem; }
-.data-table th { padding: .8rem 1rem; text-align: left; font-size: .7rem; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; color: #5c767c; background: #f5f8f8; border-bottom: 1px solid #dce8ea; white-space: nowrap; }
-.data-table td { padding: .8rem 1rem; border-bottom: 1px solid #e6eff0; color: var(--color-text-primary); vertical-align: middle; }
+.data-table th { padding: .8rem 1rem; text-align: left; font-size: .7rem; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; color: #5f6b7a; background: #f9fafb; border-bottom: 1px solid #e2e5ea; white-space: nowrap; }
+.data-table td { padding: .8rem 1rem; border-bottom: 1px solid #e2e5ea; color: var(--color-text-primary); vertical-align: middle; }
 .data-table tbody tr:last-child td { border-bottom: 0; }
-.data-table tbody tr:hover { background: #f7fbfb; }
+.data-table tbody tr:hover { background: #f9fafb; }
 .data-table td b { font-weight: 700; }
 
 .row-actions { display: flex; flex: 0 0 auto; gap: .35rem; align-items: center; justify-content: flex-end; }
@@ -19,23 +19,23 @@
 .profile-summary h3 { margin: .1rem 0 0; font-size: 1.12rem; letter-spacing: -.03em; }
 
 .topnav-profile-button { border: 0; padding: .25rem .45rem; border-radius: 7px; background: transparent; color: inherit; font: inherit; font-weight: 650; cursor: pointer; }
-.topnav-profile-button:hover, .topnav-profile-button:focus-visible { background: #eaf5f6; color: #0d6874; outline: 3px solid #147d8935; }
+.topnav-profile-button:hover, .topnav-profile-button:focus-visible { background: #ecf4fa; color: #3a6f9e; outline: 3px solid #4582b835; }
 
 .drawer-body { display: grid; gap: .8rem; align-content: start; }
 
 .document-type-drawer-close { width: 2rem; height: 2rem; border: 0; border-radius: 8px; background: transparent; color: var(--color-text-secondary); font-size: 1.4rem; line-height: 1; cursor: pointer; }
-.document-type-drawer-close:hover, .document-type-drawer-close:focus-visible { background: #eaf5f6; color: #0d6874; outline: 3px solid #147d8935; }
+.document-type-drawer-close:hover, .document-type-drawer-close:focus-visible { background: #ecf4fa; color: #3a6f9e; outline: 3px solid #4582b835; }
 
 /* System Status Dashboard */
 .service-status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-top: 1rem; }
-.service-status-card { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.25rem; border: 1px solid #d7e4e7; border-radius: .8rem; background: #fbfdfd; }
+.service-status-card { display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.25rem; border: 1px solid #e2e5ea; border-radius: .8rem; background: #fbfdfd; }
 .service-status-info { display: flex; align-items: center; gap: .75rem; }
 .service-status-info div { display: grid; gap: .1rem; }
 .service-status-info b { font-size: .92rem; color: var(--color-text-primary); }
-.service-status-info span { font-size: .78rem; color: #5d737a; }
-.status-dot.ready, .status-dot.online { background: #21a66b; box-shadow: 0 0 0 4px #21a66b1f; }
-.status-dot.unavailable, .status-dot.failed { background: #d93d42; box-shadow: 0 0 0 4px #d93d421f; }
-.status-dot.degraded, .status-dot.warning { background: #e69138; box-shadow: 0 0 0 4px #e691381f; }
+.service-status-info span { font-size: .78rem; color: #5f6b7a; }
+.status-dot.ready, .status-dot.online { background: #3a6f9e; box-shadow: 0 0 0 4px #4582b81f; }
+.status-dot.unavailable, .status-dot.failed { background: #e74341; box-shadow: 0 0 0 4px #e743411f; }
+.status-dot.degraded, .status-dot.warning { background: #d0761f; box-shadow: 0 0 0 4px #d0761f1f; }
 
 @media (max-width: 700px) {
   .users-toolbar { justify-content: flex-start; }

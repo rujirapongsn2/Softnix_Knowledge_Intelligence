@@ -550,7 +550,7 @@ def delete_group(group_id: str, user: User = Depends(require_admin), db: Session
 
 
 @app.post("/api/v1/knowledge-bases", response_model=KnowledgeBaseOut)
-def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     requested_code = payload.code
     if requested_code:
         existing = db.query(KnowledgeBase).filter_by(code=requested_code).first()
@@ -575,13 +575,20 @@ def create_kb(payload: KnowledgeBaseCreate, user: User = Depends(current_admin),
             suffix_text = f"-{suffix}"
             code = f"{base[:120 - len(suffix_text)].rstrip('-')}{suffix_text}"
             suffix += 1
-    values = payload.model_dump(exclude={"code"})
+    owner = user
+    if payload.owner_user_id:
+        owner = db.get(User, payload.owner_user_id)
+        if not owner or not owner.is_active:
+            raise HTTPException(422, {"code": "KNOWLEDGE_BASE_OWNER_INVALID",
+                                      "message": "Owner must be an active user.", "retryable": False})
+    values = payload.model_dump(exclude={"code", "owner_user_id"})
     kb = KnowledgeBase(**values, code=code, retrieval_config=DEFAULT_RETRIEVAL_CONFIG.copy())
     db.add(kb); db.flush()
-    # The creator owns the KB.  v1 writes a single owner row; the table is
-    # already many-to-many so sharing later is an INSERT, not a migration.
-    db.add(KbOwner(kb_id=kb.id, user_id=user.id))
-    record_audit(db, "knowledge_base.create", user.id, "knowledge_base", kb.id, {"code": kb.code}); db.commit(); db.refresh(kb); return kb
+    # Only admins create KBs; ownership goes to the chosen owner (default: the
+    # admin).  v1 writes a single owner row; the table is already many-to-many
+    # so sharing later is an INSERT, not a migration.
+    db.add(KbOwner(kb_id=kb.id, user_id=owner.id))
+    record_audit(db, "knowledge_base.create", user.id, "knowledge_base", kb.id, {"code": kb.code, "owner_user_id": owner.id}); db.commit(); db.refresh(kb); return kb
 
 
 @app.get("/api/v1/knowledge-bases", response_model=list[KnowledgeBaseOut])
@@ -591,7 +598,7 @@ def list_kbs(user: User = Depends(current_admin), db: Session = Depends(get_db))
 
 
 @app.patch("/api/v1/knowledge-bases/{kb_id}/retrieval-config", response_model=KnowledgeBaseOut)
-def update_retrieval_config(kb_id: str, payload: RetrievalConfigUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def update_retrieval_config(kb_id: str, payload: RetrievalConfigUpdate, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
@@ -717,7 +724,7 @@ def delete_kb_cover(kb_id: str, user: User = Depends(current_admin), db: Session
 
 
 @app.patch("/api/v1/knowledge-bases/{kb_id}/rename", response_model=KnowledgeBaseOut)
-def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Rename a Knowledge Base without touching its stable code.
 
     The code is the immutable identifier external systems and ingest tokens
@@ -739,7 +746,7 @@ def rename_kb(kb_id: str, payload: KnowledgeBaseRename, user: User = Depends(cur
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/activate")
-def activate_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def activate_kb(kb_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at: raise HTTPException(404, "Knowledge base not found")
     assert_kb_access(db, user, kb_id)
@@ -747,7 +754,7 @@ def activate_kb(kb_id: str, user: User = Depends(current_admin), db: Session = D
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/disable")
-def disable_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def disable_kb(kb_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
@@ -759,7 +766,7 @@ def disable_kb(kb_id: str, user: User = Depends(current_admin), db: Session = De
 
 
 @app.delete("/api/v1/knowledge-bases/{kb_id}")
-def delete_kb(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def delete_kb(kb_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     kb = db.get(KnowledgeBase, kb_id)
     if not kb or kb.deleted_at:
         raise HTTPException(404, "Knowledge base not found")
@@ -1178,7 +1185,7 @@ def knowledge_base_quality_readiness(kb_id: str, limit: int = 50, offset: int = 
 
 
 @app.post("/api/v1/knowledge-bases/{kb_id}/documents/reindex")
-def reindex_embeddings(kb_id: str, force: bool = False, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def reindex_embeddings(kb_id: str, force: bool = False, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
         raise HTTPException(404, "Knowledge base not found")
     assert_kb_access(db, user, kb_id)
@@ -2271,7 +2278,7 @@ TOKEN_DEFAULT_LIMITS = {"ingest": (600, 10), "mcp": (60, 5)}
 
 
 @app.post("/api/v1/tokens", response_model=TokenCreated)
-def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def create_token(payload: TokenCreate, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     # An unknown name would silently grant nothing now that authorize() requires
     # positive membership, so a typo is rejected at issue time instead.
     if set(payload.allowed_tools) - {tool["name"] for tool in MCP_TOOLS}:
@@ -2356,13 +2363,13 @@ def create_token(payload: TokenCreate, user: User = Depends(current_admin), db: 
 
 
 @app.get("/api/v1/tokens", response_model=list[TokenOut])
-def list_tokens(user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def list_tokens(user: User = Depends(require_admin), db: Session = Depends(get_db)):
     rows = db.query(TokenKey).order_by(TokenKey.created_at.desc()).all()
     return [row for row in rows if token_visible_to(db, user, row)]
 
 
 @app.post("/api/v1/tokens/{token_id}/disable")
-def disable_token(token_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def disable_token(token_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     token = db.get(TokenKey, token_id)
     if not token or not token_visible_to(db, user, token):
         raise HTTPException(404, "Token not found")
@@ -2374,7 +2381,7 @@ def disable_token(token_id: str, user: User = Depends(current_admin), db: Sessio
 
 
 @app.post("/api/v1/tokens/{token_id}/enable")
-def enable_token(token_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def enable_token(token_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     token = db.get(TokenKey, token_id)
     if not token or not token_visible_to(db, user, token):
         raise HTTPException(404, "Token not found")
@@ -2386,7 +2393,7 @@ def enable_token(token_id: str, user: User = Depends(current_admin), db: Session
 
 
 @app.patch("/api/v1/tokens/{token_id}/limits", response_model=TokenOut)
-def update_token_limits(token_id: str, payload: TokenLimitsUpdate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def update_token_limits(token_id: str, payload: TokenLimitsUpdate, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     token = db.get(TokenKey, token_id)
     if not token or not token_visible_to(db, user, token):
         raise HTTPException(404, "Token not found")
@@ -2402,7 +2409,7 @@ def update_token_limits(token_id: str, payload: TokenLimitsUpdate, user: User = 
 
 
 @app.post("/api/v1/tokens/{token_id}/revoke")
-def revoke_token(token_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def revoke_token(token_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     token = db.get(TokenKey, token_id)
     if not token or not token_visible_to(db, user, token):
         raise HTTPException(404, "Token not found")
@@ -2413,7 +2420,7 @@ def revoke_token(token_id: str, user: User = Depends(current_admin), db: Session
 
 
 @app.post("/api/v1/tokens/{token_id}/rotate", response_model=TokenCreated)
-def rotate_token(token_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+def rotate_token(token_id: str, user: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Issue a replacement secret without ever recovering the old plaintext key.
 
     Token hashes are intentionally one-way. Rotation preserves the original
@@ -2763,7 +2770,7 @@ def get_retrieval_trace(trace_id: str, user: User = Depends(require_manager), db
 
 
 @app.get("/api/v1/mcp/activity")
-def list_mcp_activity(limit: int = 50, _: User = Depends(current_admin), db: Session = Depends(get_db)):
+def list_mcp_activity(limit: int = 50, _: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Return operator-safe MCP tool traces, newest first.
 
     Token secrets and request headers are never persisted. Query text is capped

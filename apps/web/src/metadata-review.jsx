@@ -5,7 +5,7 @@ import {fieldReview, fieldsByUrgency, waitingFields} from "./metadata-states.mjs
 
 const display = value => Array.isArray(value) ? value.join(", ") : String(value);
 
-export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFields}) {
+export function MetadataReviewPanel({canEdit = false, preview, fields, api, onRefresh, MetadataFields}) {
   const {t} = useLanguage();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -34,7 +34,7 @@ export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFi
   const review = (field, action, extra = {}) => run("metadata-review", {revision: preview.metadata_revision, field_key: field.key, action, ...extra});
   return <section className="metadata-review-panel">
     <div className="preview-heading"><div><h3>{preview.metadata_template_name || t("documentPreview.metadata.defaultTitle")}</h3><p role="status">{t(`autoMetadata.${preview.metadata_status || "not_started"}`)}</p></div>
-      <Button label={t("autoMetadata.fillMissing")} size="sm" variant="secondary" isDisabled={busy || running || !preview.text || !fields.length} onClick={() => run("metadata-extract", {enable_missing_fields: true})}/>
+      {canEdit && <Button label={t("autoMetadata.fillMissing")} size="sm" variant="secondary" isDisabled={busy || running || !preview.text || !fields.length} onClick={() => run("metadata-extract", {enable_missing_fields: true})}/>}
     </div>
     {error && <p className="inline-error" role="alert">{error}</p>}
     <div className="metadata-review-switch"><button type="button" aria-pressed={!all} onClick={() => setAll(false)}>{t("autoMetadata.reviewCount", {count: reviewFields.length})}</button><button type="button" aria-pressed={all} onClick={() => setAll(true)}>{t("autoMetadata.allFields", {count: fields.length})}</button></div>
@@ -50,14 +50,14 @@ export function MetadataReviewPanel({preview, fields, api, onRefresh, MetadataFi
         {values[field.key] !== undefined && <p className="metadata-effective-value">{display(values[field.key])}</p>}
         {state === "unverified" && values[field.key] !== undefined && <p className="metadata-in-use-help">{t("autoMetadata.inUseHelp")}</p>}
         {(observation.candidates || []).map((candidate, index) => <div className="metadata-candidate" key={index}>
-          <div><span>{display(candidate.value)}</span>{waiting && <Button label={t("autoMetadata.confirm")} size="sm" variant="secondary" isDisabled={busy || running} onClick={() => review(field, "confirm", {candidate_index: index})}/>}</div>
+          <div><span>{display(candidate.value)}</span>{waiting && canEdit && <Button label={t("autoMetadata.confirm")} size="sm" variant="secondary" isDisabled={busy || running} onClick={() => review(field, "confirm", {candidate_index: index})}/>}</div>
           {(candidate.item_evidence || [candidate.evidence]).map((evidence, at) => <blockquote key={at}>{evidence.quote}</blockquote>)}
           <details><summary>{t("autoMetadata.sourceContext")}</summary><pre>{preview.text?.slice(Math.max(0, candidate.evidence.char_start - 220), candidate.evidence.char_end + 220)}</pre></details>
         </div>)}
         {editing === field.key ? <form onSubmit={event => { event.preventDefault(); review(field, "set", {value: draft[field.key], revision: draftRevision}); }}>
           <MetadataFields fields={[{...field, required: true}]} values={draft} onChange={setDraft} isDisabled={busy}/>
           <div className="preview-actions"><Button label={t("common.save")} type="submit" size="sm" isDisabled={busy}/><Button label={t("common.cancel")} type="button" size="sm" variant="ghost" onClick={() => setEditing(null)}/></div>
-        </form> : <div className="preview-actions"><Button label={t("common.edit")} size="sm" variant="ghost" isDisabled={busy} onClick={() => { setEditing(field.key); setDraftRevision(preview.metadata_revision); setDraft({[field.key]: values[field.key] ?? observation.candidates?.[0]?.value ?? ""}); }}/>{waiting && <Button label={t("autoMetadata.notFound")} size="sm" variant="ghost" isDisabled={busy || running} onClick={() => review(field, "not_found")}/>}</div>}
+        </form> : <div className="preview-actions">{canEdit && <Button label={t("common.edit")} size="sm" variant="ghost" isDisabled={busy} onClick={() => { setEditing(field.key); setDraftRevision(preview.metadata_revision); setDraft({[field.key]: values[field.key] ?? observation.candidates?.[0]?.value ?? ""}); }}/>}{waiting && canEdit && <Button label={t("autoMetadata.notFound")} size="sm" variant="ghost" isDisabled={busy || running} onClick={() => review(field, "not_found")}/>}</div>}
       </article>;
     })}
   </section>;

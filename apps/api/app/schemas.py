@@ -89,6 +89,10 @@ class KnowledgeBaseOut(ORMModel):
     default_language: str
     status: str
     retrieval_config: dict[str, Any]
+    # Who may edit the KB besides admins.  The UI hides edit actions for everyone else.
+    owner_user_ids: list[str] = []
+    # Whether the caller may edit this KB (owner, manager of the owner's group, or admin).
+    can_edit: bool = False
 
 
 class KnowledgeBaseIconUpdate(BaseModel):

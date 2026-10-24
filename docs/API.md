@@ -20,6 +20,28 @@ Base path คือ `/api/v1` และ endpoint ของผู้ดูแล�
 - `GET /knowledge-bases/{id}/documents` (legacy list), `GET /knowledge-bases/{id}/documents/page` (bounded UI page with `limit`, `offset`, `search`, `status`, `document_type`, plus global processing/completed/legal flags), `POST /knowledge-bases/{id}/documents/reindex`
 - `GET /documents/{id}/text|jobs|file`, `POST /documents/{id}/reprocess`, `DELETE /documents/{id}`, `POST /documents/{id}/restore` — `/file` downloads the stored original (`Content-Disposition: attachment`)
 - `PATCH /documents/{id}/metadata` รองรับ `published_at: YYYY-MM-DD` และแก้ค่าฟิลด์ metadata ตาม snapshot ของเอกสาร
+- `GET /knowledge-bases/{id}/metadata-export` และ `GET /documents/{id}/metadata-export` ดาวน์โหลดโครงสร้างประเภทเอกสารพร้อมค่า metadata เป็นไฟล์ JSON (`Content-Disposition: attachment`, `schema_version: ski.metadata-export.v1`) ระดับคลังความรู้รวมทุกประเภทเอกสารและทุกเอกสารที่ยังไม่ถูกลบ ระดับเอกสารมีเฉพาะเอกสารนั้นกับประเภทที่ใช้ รูปแบบไฟล์:
+
+  ```json
+  {
+    "schema_version": "ski.metadata-export.v1",
+    "scope": "knowledge_base",
+    "exported_at": "2026-10-24T03:00:00+00:00",
+    "knowledge_base": {"id": "…", "code": "hr-docs", "name": "เอกสารบุคคล"},
+    "document_types": [
+      {"id": "…", "code": "circular", "name": "หนังสือเวียน", "description": null, "base_document_type": "general",
+       "version": 2, "is_system": false, "is_active": true, "is_current": true,
+       "fields": [{"key": "issuer", "label": "ผู้ออก", "field_type": "text", "required": true, "searchable": true, "filterable": false}]}
+    ],
+    "documents": [
+      {"id": "…", "external_id": null, "title": "หนังสือเวียน 12.pdf", "original_filename": "หนังสือเวียน 12.pdf", "status": "completed",
+       "document_type": {"id": "…", "version": 2}, "metadata_status": "complete", "metadata_revision": 1,
+       "metadata": {"issuer": "กรมทดสอบ"}, "field_states": {}, "updated_at": "2026-10-23T08:15:00"}
+    ]
+  }
+  ```
+
+  เอกสารเก็บ snapshot ของฟิลด์ตาม version ของประเภทที่ใช้ตอนกรอก ประเภทเดียวกันจึงอาจปรากฏหลาย version และ `documents[].document_type` ชี้ไปที่ `id` กับ `version` ใน `document_types` โดย `is_current: false` คือ version เก่าที่ยังมีเอกสารใช้อยู่ `field_states` บอกสถานะการตรวจของฟิลด์ที่ AI สกัด
 
 ## Ingestion API (token)
 

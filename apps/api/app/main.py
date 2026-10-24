@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import unicodedata
+from urllib.parse import quote
 import uuid
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
@@ -29,6 +30,7 @@ from .data_quality import build_document_quality_report, build_knowledge_base_qu
 from .metadata_search import describe_schema
 from .legal_edits import with_manual_edits
 from .metadata_extraction import content_digest, field_review_states, queue_metadata_extraction, reevaluate_observations, update_status as update_metadata_status, usable_values, with_review_outcome
+from .metadata_export import metadata_export
 from .metadata_quality import metadata_quality_report
 from .observability import metrics, now
 from .embeddings import EmbeddingClient
@@ -791,6 +793,26 @@ def get_document_templates(kb_id: str, include_inactive: bool = False, user: Use
     return list_templates(db, kb_id, include_inactive=include_inactive)
 
 
+def metadata_export_response(export: dict, filename: str) -> JSONResponse:
+    # filename= for clients that ignore RFC 5987's filename*; it cannot carry a Thai name.
+    ascii_name = filename if filename.isascii() and filename.isprintable() and '"' not in filename else "metadata.json"
+    return JSONResponse(export, headers={
+        "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"})
+
+
+@app.get("/api/v1/knowledge-bases/{kb_id}/metadata-export")
+def export_kb_metadata(kb_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Download the Knowledge Base's document types and every live document's metadata values as JSON."""
+    kb = db.get(KnowledgeBase, kb_id)
+    if not kb or kb.deleted_at:
+        raise HTTPException(404, "Knowledge base not found")
+    assert_kb_access(db, user, kb_id)
+    export = metadata_export(db, kb)
+    record_audit(db, "metadata.export", user.id, "knowledge_base", kb.id, {"documents": len(export["documents"])})
+    db.commit()
+    return metadata_export_response(export, f"metadata-{kb.code}.json")
+
+
 @app.post("/api/v1/knowledge-bases/{kb_id}/document-templates", response_model=DocumentMetadataTemplateOut)
 def create_document_template(kb_id: str, payload: DocumentMetadataTemplateCreate, user: User = Depends(current_admin), db: Session = Depends(get_db)):
     if not db.get(KnowledgeBase, kb_id):
@@ -1288,6 +1310,19 @@ def document_jobs(document_id: str, user: User = Depends(current_admin), db: Ses
     rows = db.query(ProcessingJob).filter_by(document_id=document_id).order_by(ProcessingJob.created_at.desc()).all()
     return [{"id": job.id, "type": job.job_type, "status": job.status, "stage": job.current_stage, "progress_percent": job.progress_percent,
              "attempt_count": job.attempt_count, "error_code": job.error_code, "error_message": job.error_message} for job in rows]
+
+
+@app.get("/api/v1/documents/{document_id}/metadata-export")
+def export_document_metadata(document_id: str, user: User = Depends(current_admin), db: Session = Depends(get_db)):
+    """Download one document's metadata values with its document type as JSON."""
+    doc = db.get(Document, document_id)
+    if not doc or not doc.is_live:
+        raise HTTPException(404, "Document not found")
+    assert_kb_access(db, user, doc.knowledge_base_id)
+    export = metadata_export(db, db.get(KnowledgeBase, doc.knowledge_base_id), doc.id)
+    record_audit(db, "metadata.export", user.id, "document", doc.id)
+    db.commit()
+    return metadata_export_response(export, f"metadata-{Path(doc.original_filename or '').stem.lstrip('.') or doc.id}.json")
 
 
 @app.post("/api/v1/documents/{document_id}/legal-extract")

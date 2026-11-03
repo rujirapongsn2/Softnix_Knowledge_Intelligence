@@ -1,5 +1,7 @@
 # ติดตั้งจาก Harbor Registry / Install from Harbor
 
+> ฉบับย่อทีละขั้นตอน: [INSTALL_STEP_BY_STEP.md](INSTALL_STEP_BY_STEP.md)
+
 ติดตั้ง Softnix Knowledge Intelligence จาก image สำเร็จรูปบน `registry.softnix.co.th/ski` ไม่ต้องมี source code และไม่ต้อง build
 Install from prebuilt images in `registry.softnix.co.th/ski`. No source checkout or build is needed.
 

@@ -4,14 +4,39 @@
 
 ## การติดตั้ง
 
-> **ติดตั้งจาก Harbor แบบทีละขั้นตอน (แนะนำสำหรับผู้ติดตั้ง):** ดู [docs/INSTALL_STEP_BY_STEP.md](docs/INSTALL_STEP_BY_STEP.md)
+มี 2 แบบ เลือกให้ตรงกับงาน:
 
-> ติดตั้งให้ลูกค้าจาก image สำเร็จรูปบน Harbor (`registry.softnix.co.th/ski`) โดยไม่ต้อง build: ดู [docs/INSTALL_HARBOR.md](docs/INSTALL_HARBOR.md) ขั้นตอนด้านล่างเป็นการติดตั้งจาก source
+| แบบ | ใช้เมื่อ | คู่มือ |
+|---|---|---|
+| **A. ติดตั้งจาก Harbor** (แนะนำ) | ติดตั้งให้ลูกค้าหรือใช้งานจริง ไม่ต้อง build | [docs/INSTALL_STEP_BY_STEP.md](docs/INSTALL_STEP_BY_STEP.md) (รายละเอียดเต็ม: [docs/INSTALL_HARBOR.md](docs/INSTALL_HARBOR.md)) |
+| **B. build จาก source** | พัฒนาหรือแก้โค้ด | ขั้นตอน 1–6 ด้านล่าง |
 
 ### สิ่งที่ต้องมี
 
-- Docker พร้อม Compose v2 (Docker Desktop บน macOS หรือ Windows)
-- repository [Anydoc-ocr](https://github.com/rujirapongsn2/Anydoc-ocr) วางไว้ข้างโฟลเดอร์นี้ (`../Anydoc-ocr`) เพราะ image ของ api และ worker build ตัวแปลงเอกสารจาก repository นั้น ถ้าวางไว้ที่อื่น ให้ตั้ง `ANYDOC_DIR`
+#### A. ติดตั้งจาก Harbor (แนะนำสำหรับผู้ติดตั้ง)
+
+| รายการ | ข้อกำหนด |
+|---|---|
+| เครื่อง | Linux แบบ amd64 หรือ arm64, RAM 8 GB ขึ้นไป, disk ว่าง 40 GB ขึ้นไป |
+| Docker | Docker Engine 24 ขึ้นไป และ Docker Compose v2 (`docker compose`) |
+| เครื่องมือ | `openssl` (ตัวติดตั้งใช้สุ่มรหัสผ่าน และจะหยุดถ้าไม่มี) และ `git` สำหรับดาวน์โหลดไฟล์ติดตั้ง (หรือใช้ไฟล์ release ที่ Softnix ส่งให้) |
+| สิทธิ์ดึง image | Harbor username (รูปแบบ `robot$ski+customer-pull`) และ token ที่ได้รับจาก Softnix |
+| LLM | server ภายนอกที่รองรับ OpenAI API เช่น vLLM, Ollama หรือ OpenRouter |
+| Embedding | server ภายนอกที่รองรับ OpenAI API (`/v1/embeddings`) รันโมเดล `embeddinggemma-2` ขนาด 768 มิติ |
+| Reranker | ไม่บังคับ |
+| ใช้งานจริง | HTTPS reverse proxy หน้าพอร์ต 8081 เช่น nginx, Caddy หรือ Cloudflare Tunnel |
+
+> **ไม่ต้องติดตั้ง** Anydoc-ocr, Rust, Python หรือ Node บนเครื่องลูกค้า เพราะระบบ OCR (Anydoc + Tesseract ไทย/อังกฤษ + poppler) อยู่ใน image `ski/api` แล้ว
+
+#### B. พัฒนา / build จาก source
+
+- Docker พร้อม Compose v2 (Docker Desktop บน macOS หรือ Windows) ไม่ต้องติดตั้ง Rust, Python หรือ Node บนเครื่อง เพราะ build ใน container ทั้งหมด
+- repository [Anydoc-ocr](https://github.com/rujirapongsn2/Anydoc-ocr) วางไว้ข้างโฟลเดอร์นี้ที่ `../Anydoc-ocr` เพราะ `docker-compose.yml` ใช้เป็น build context ชื่อ `anydoc` (`${ANYDOC_DIR:-../Anydoc-ocr}`) ถ้าวางไว้ที่อื่นให้ตั้ง `ANYDOC_DIR` ให้ตรงกับ release ให้ใช้ commit เดียวกับ CI (`e914f723fa08e83d1aa62abbe9a1c969a060329b` ตาม `.github/workflows/release.yml`):
+  ```bash
+  # รันในโฟลเดอร์แม่ของ repo นี้
+  git clone https://github.com/rujirapongsn2/Anydoc-ocr.git
+  git -C Anydoc-ocr checkout e914f723fa08e83d1aa62abbe9a1c969a060329b
+  ```
 - `llama-server` ของ [llama.cpp](https://github.com/ggml-org/llama.cpp) สำหรับ embedding server บน macOS ติดตั้งด้วย `brew install llama.cpp`
 - API key ของผู้ให้บริการ LLM ที่รองรับ OpenAI API เช่น OpenRouter หรือ OpenAI
 
@@ -20,6 +45,7 @@
 ```bash
 git clone https://github.com/rujirapongsn2/Softnix_Knowledge_Intelligence.git
 git clone https://github.com/rujirapongsn2/Anydoc-ocr.git
+git -C Anydoc-ocr checkout e914f723fa08e83d1aa62abbe9a1c969a060329b  # ใช้ commit เดียวกับ CI
 cd Softnix_Knowledge_Intelligence
 ```
 

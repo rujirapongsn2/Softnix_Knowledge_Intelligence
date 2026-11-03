@@ -42,7 +42,9 @@ const isPdfDocument = document => {
   const name = String(document?.original_filename || "").toLowerCase();
   return mime === "application/pdf" || mime.includes("/pdf") || name.endsWith(".pdf");
 };
-const MAX_FILE_SIZE_MB = Math.max(1, Number(import.meta.env.VITE_MAX_FILE_SIZE_MB || 100));
+// /config.js is written when the web container starts (docker/40-ski-config.sh), so MAX_FILE_SIZE_MB in .env
+// takes effect without a rebuild. The build-time VITE_MAX_FILE_SIZE_MB stays as the fallback.
+const MAX_FILE_SIZE_MB = Math.max(1, Number(globalThis.__SKI_CONFIG__?.maxFileSizeMb || import.meta.env.VITE_MAX_FILE_SIZE_MB || 100));
 const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
 const WORKSPACE_VIEWS = new Set(["knowledge-bases", "documents", "search", "explore", "mcp-tokens", "ingest-tokens", "system-status", "logs", "users", "groups", "profile"]);
 const ROLE_LEVEL = {user: 0, manager: 1, admin: 2};

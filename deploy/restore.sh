@@ -13,7 +13,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-sql() { docker compose exec -T postgres psql -U skip -d skip -At -c "$1"; }
+# The user and database come from the postgres container's own environment (POSTGRES_USER/POSTGRES_DB).
+sql() { docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c "$1"' sh "$1"; }
 counts() {
   local neo4j
   neo4j=$(docker compose exec -T neo4j sh -c 'cypher-shell -u neo4j -p "${NEO4J_AUTH#neo4j/}" --format plain "MATCH (n) RETURN count(n)"' | tail -1)
@@ -60,7 +61,7 @@ PROJECT=$(docker compose config --format json | python3 -c 'import json, sys; pr
 
 log "postgres"
 quiet docker compose up -d postgres
-for _ in $(seq 60); do docker compose exec -T postgres pg_isready -U skip -d skip >/dev/null 2>&1 && break; sleep 2; done
+for _ in $(seq 60); do docker compose exec -T postgres sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1 && break; sleep 2; done
 existing=$(sql "select count(*) from information_schema.tables where table_name = 'documents'")
 if [ "$existing" != 0 ] && [ "$(sql "select count(*) from documents")" != 0 ] && [ "$FORCE" = 0 ]; then
   log "this project already holds documents; pass --force to replace them"; exit 1
@@ -68,7 +69,7 @@ fi
 # Stopped only now, so a refused restore leaves a running installation as it was.
 docker compose stop worker api lightrag neo4j >/dev/null 2>&1 || true
 sql "set client_min_messages = warning; drop schema public cascade; create schema public;" >/dev/null
-docker compose exec -T postgres pg_restore -U skip -d skip --no-owner --exit-on-error < "$BACKUP/postgres.dump"
+docker compose exec -T postgres sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --no-owner --exit-on-error' < "$BACKUP/postgres.dump"
 
 log "build, then neo4j and files"
 quiet docker compose build

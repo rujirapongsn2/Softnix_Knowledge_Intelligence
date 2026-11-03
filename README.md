@@ -4,6 +4,8 @@
 
 ## การติดตั้ง
 
+> ติดตั้งให้ลูกค้าจาก image สำเร็จรูปบน Harbor (`registry.softnix.co.th/ski`) โดยไม่ต้อง build: ดู [docs/INSTALL_HARBOR.md](docs/INSTALL_HARBOR.md) ขั้นตอนด้านล่างเป็นการติดตั้งจาก source
+
 ### สิ่งที่ต้องมี
 
 - Docker พร้อม Compose v2 (Docker Desktop บน macOS หรือ Windows)

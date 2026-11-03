@@ -17,7 +17,8 @@ OUT=${OUT:-$HOME/softnix-backups/$(date +%F-%H%M)-full}
 if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT")" ]; then echo "$OUT is not empty" >&2; exit 1; fi
 mkdir -p "$OUT" && chmod 700 "$OUT"
 log() { printf '[%s] %s\n' "$(date +%T)" "$*" | tee -a "$OUT/backup.log"; }
-sql() { docker compose exec -T postgres psql -U skip -d skip -At -c "$1"; }
+# The user and database come from the postgres container's own environment (POSTGRES_USER/POSTGRES_DB).
+sql() { docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c "$1"' sh "$1"; }
 volume_of() {  # the volume mounted at $2 in service $1's container, whatever the compose project is called
   docker inspect -f "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{.Name}}{{end}}{{end}}" "$(docker compose ps -aq "$1" | head -1)"
 }
@@ -42,7 +43,7 @@ log "stop writers"
 docker compose stop worker api lightrag >/dev/null
 
 log "postgres"
-docker compose exec -T postgres pg_dump -U skip -d skip -Fc > "$OUT/postgres.dump"
+docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$OUT/postgres.dump"
 docker compose exec -T postgres pg_restore --list < "$OUT/postgres.dump" | grep -q "TABLE DATA public documents" \
   || { log "postgres.dump has no documents table"; exit 1; }
 

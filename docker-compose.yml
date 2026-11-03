@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+psycopg://skip:skip@postgres:5432/skip
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-skip}:${POSTGRES_PASSWORD:-skip}@postgres:5432/${POSTGRES_DB:-skip}
       REDIS_URL: redis://redis:6379/0
       FILE_STORAGE_PATH: /data/files
       NEO4J_HTTP_URL: http://neo4j:7474
@@ -45,7 +45,7 @@ services:
       replicas: ${WORKER_REPLICAS:-3}
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+psycopg://skip:skip@postgres:5432/skip
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-skip}:${POSTGRES_PASSWORD:-skip}@postgres:5432/${POSTGRES_DB:-skip}
       REDIS_URL: redis://redis:6379/0
       FILE_STORAGE_PATH: /data/files
       NEO4J_HTTP_URL: http://neo4j:7474
@@ -58,7 +58,7 @@ services:
     command: alembic upgrade head
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+psycopg://skip:skip@postgres:5432/skip
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-skip}:${POSTGRES_PASSWORD:-skip}@postgres:5432/${POSTGRES_DB:-skip}
     depends_on: [postgres]
   web:
     build:
@@ -78,10 +78,15 @@ services:
   postgres:
     image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
     restart: unless-stopped
-    environment: {POSTGRES_DB: skip, POSTGRES_USER: skip, POSTGRES_PASSWORD: skip}
+    # The dev defaults (skip/skip) keep existing volumes working. A new install sets POSTGRES_PASSWORD
+    # in .env; Postgres reads these only when it creates the volume, so changing them later needs ALTER USER.
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-skip}
+      POSTGRES_USER: ${POSTGRES_USER:-skip}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skip}
     volumes: [postgres:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U skip -d skip"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -150,9 +155,9 @@ services:
       LIGHTRAG_GRAPH_STORAGE: ${LIGHTRAG_GRAPH_STORAGE:-Neo4JStorage}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      POSTGRES_USER: skip
-      POSTGRES_PASSWORD: skip
-      POSTGRES_DATABASE: skip
+      POSTGRES_USER: ${POSTGRES_USER:-skip}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skip}
+      POSTGRES_DATABASE: ${POSTGRES_DB:-skip}
       POSTGRES_WORKSPACE: lightrag
       # Postgres allows 100 connections and the api and workers pool their own; LightRAG defaults to 50.
       POSTGRES_MAX_CONNECTIONS: 20

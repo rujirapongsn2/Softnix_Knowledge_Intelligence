@@ -16,6 +16,11 @@ server {
     try_files $uri /index.html;
   }
 
+  location = /config.js {
+    # Written at container start from the environment; never cache it.
+    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+  }
+
   location = /index.html {
     add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0" always;
   }

@@ -1,0 +1,148 @@
+# Build and publish a release to Harbor (registry.softnix.co.th/ski).
+#   Tag push v1.2.3 -> ski/api and ski/web as v1.2.3, 1.2, sha-<short>, for linux/amd64 + linux/arm64,
+#   plus the public images (pgvector, redis, neo4j, lightrag) mirrored with their exact digests.
+# Secrets: HARBOR_USERNAME, HARBOR_PASSWORD (Harbor robot robot$ski+ci-push: push + pull on project "ski").
+#          ANYDOC_TOKEN only if rujirapongsn2/Anydoc-ocr becomes private (read access to that repo).
+# Variable (optional): ANYDOC_REF overrides the pinned Anydoc-ocr commit below.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to publish (e.g. v1.2.3). Empty: sha-<short> only."
+        required: false
+        default: ""
+      mirror:
+        description: "Mirror the public images too"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: registry.softnix.co.th
+  PROJECT: ski
+  # The anydoc fork the api image is built from. Bump it deliberately, like a dependency.
+  ANYDOC_REPO: rujirapongsn2/Anydoc-ocr
+  ANYDOC_REF: ${{ vars.ANYDOC_REF || 'e914f723fa08e83d1aa62abbe9a1c969a060329b' }}
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - image: api
+            context: .
+            file: apps/api/Dockerfile
+          - image: web
+            context: apps/web
+            file: apps/web/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out Anydoc-ocr (api build context)
+        if: matrix.image == 'api'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ANYDOC_REPO }}
+          ref: ${{ env.ANYDOC_REF }}
+          path: _anydoc
+          # Public today; a private repo needs the ANYDOC_TOKEN secret.
+          token: ${{ secrets.ANYDOC_TOKEN || github.token }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ matrix.image }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=softnix-knowledge-intelligence-${{ matrix.image }}
+            ai.softnix.anydoc.ref=${{ env.ANYDOC_REF }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-contexts: ${{ matrix.image == 'api' && 'anydoc=_anydoc' || '' }}
+          build-args: |
+            ANYDOC_SRC=/
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  mirror:
+    # Copies the digest-pinned public images from docker-compose.yml into Harbor unchanged (crane keeps the
+    # digest), tagged mirror-<first 12 hex of the digest>, which docker-compose.release.yml pulls.
+    if: github.event_name == 'push' || inputs.mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: imjasonh/setup-crane@v0.4
+      - name: Log in to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: printf '%s' "$HARBOR_PASSWORD" | crane auth login "$REGISTRY" -u "$HARBOR_USERNAME" --password-stdin
+      - name: Copy images
+        run: |
+          set -euo pipefail
+          copy() {  # copy <name in Harbor> <source@sha256:...>
+            local name=$1 src=$2 digest=${2##*@}
+            local dst="$REGISTRY/$PROJECT/$name:mirror-${digest:7:12}"
+            echo "$src -> $dst"
+            crane copy "$src" "$dst"
+            [ "$(crane digest "$dst")" = "$digest" ] || { echo "digest changed for $dst" >&2; exit 1; }
+          }
+          pinned() { grep -oE "$1@sha256:[0-9a-f]{64}" docker-compose.yml | head -1; }
+          copy pgvector "$(pinned 'pgvector/pgvector')"
+          copy redis    "$(pinned 'redis')"
+          copy neo4j    "$(pinned 'neo4j')"
+          copy lightrag "$(pinned 'ghcr.io/hkuds/lightrag')"
+      - name: Check the release compose points at the mirrored tags
+        run: |
+          set -euo pipefail
+          for d in $(grep -oE '@sha256:[0-9a-f]{64}' docker-compose.yml | cut -c9-20); do
+            grep -q "mirror-$d" docker-compose.release.yml || { echo "docker-compose.release.yml has no mirror-$d" >&2; exit 1; }
+          done
+
+  compose-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config
+        run: |
+          cp .env.release.example .env
+          docker compose -f docker-compose.release.yml config -q

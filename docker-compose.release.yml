@@ -1,0 +1,159 @@
+# Softnix Knowledge Intelligence: release stack for installers. Every service is a prebuilt image from Harbor,
+# so no source checkout or build is needed. Use it with .env made from .env.release.example:
+#     docker compose -f docker-compose.release.yml up -d        (or set COMPOSE_FILE in .env, as install.sh does)
+# The embedding server, reranker and LLM run outside this stack; .env points to them.
+# See docs/INSTALL_HARBOR.md.
+
+x-ski-image: &ski-api-image ${SKI_REGISTRY:-registry.softnix.co.th/ski}/api:${SKI_VERSION:?set SKI_VERSION in .env, e.g. v1.0.0}
+
+x-ski-db-env: &ski-db-env
+  APP_ENV: production
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-skip}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-skip}
+  REDIS_URL: redis://redis:6379/0
+  FILE_STORAGE_PATH: /data/files
+  NEO4J_HTTP_URL: http://neo4j:7474
+  NEO4J_USERNAME: neo4j
+  NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+  LIGHTRAG_BASE_URL: http://lightrag:9621
+
+services:
+  migrate:
+    image: *ski-api-image
+    command: alembic upgrade head
+    env_file: .env
+    environment: *ski-db-env
+    depends_on:
+      postgres: {condition: service_healthy}
+  api:
+    image: *ski-api-image
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      <<: *ski-db-env
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      LOG_QUERY_TEXT: "false"
+    volumes: [files:/data/files]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_started}
+      neo4j: {condition: service_started}
+      lightrag: {condition: service_started}
+    # Bound to localhost only, for deploy/check_services.sh and a local reverse proxy. Users go through web.
+    ports: ["127.0.0.1:${API_PORT:-8001}:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  worker:
+    image: *ski-api-image
+    command: python -m app.worker
+    restart: unless-stopped
+    deploy:
+      replicas: ${WORKER_REPLICAS:-3}
+    env_file: .env
+    environment:
+      <<: *ski-db-env
+      LOG_QUERY_TEXT: "false"
+    volumes: [files:/data/files]
+    depends_on: [api]
+  web:
+    image: ${SKI_REGISTRY:-registry.softnix.co.th/ski}/web:${SKI_VERSION:?set SKI_VERSION in .env}
+    restart: unless-stopped
+    environment:
+      # Read at container start (config.js and nginx client_max_body_size); keep it equal to the api's value.
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
+    depends_on: [api]
+    ports: ["${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8081}:80"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  # The four images below are byte-for-byte copies of the pinned public images (docker-compose.yml), mirrored
+  # into Harbor by .github/workflows/release.yml. The tag mirror-<first 12 hex of the digest> names the digest
+  # and is immutable in Harbor; a tag (not @sha256) also survives docker save/load for offline installs.
+  # Override *_IMAGE to pull from elsewhere.
+  postgres:
+    image: ${POSTGRES_IMAGE:-${SKI_REGISTRY:-registry.softnix.co.th/ski}/pgvector:mirror-1d533553fefe}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-skip}
+      POSTGRES_USER: ${POSTGRES_USER:-skip}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes: [postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis:
+    image: ${REDIS_IMAGE:-${SKI_REGISTRY:-registry.softnix.co.th/ski}/redis:mirror-6ab0b6e73817}
+    restart: unless-stopped
+    volumes: [redis:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  neo4j:
+    image: ${NEO4J_IMAGE:-${SKI_REGISTRY:-registry.softnix.co.th/ski}/neo4j:mirror-4bae36aff762}
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
+    volumes: [neo4j:/data]
+  lightrag:
+    # LightRAG 1.5.4; keep the settings in step with docker-compose.yml. A release reads only the LLM_* names
+    # (not the legacy OPENROUTER_* ones).
+    image: ${LIGHTRAG_RELEASE_IMAGE:-${SKI_REGISTRY:-registry.softnix.co.th/ski}/lightrag:mirror-de09cd75e32b}
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 9621
+      WORKING_DIR: /app/data/rag_storage
+      INPUT_DIR: /app/data/inputs
+      PROMPT_DIR: /app/data/prompts
+      LIGHTRAG_API_KEY: ${LIGHTRAG_API_KEY:?set LIGHTRAG_API_KEY in .env}
+      LLM_BINDING: openai
+      LLM_BINDING_HOST: ${LLM_BASE_URL:?set LLM_BASE_URL in .env}
+      LLM_BINDING_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${LLM_MODEL:-}}
+      KEYWORD_LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${LLM_MODEL:-}}
+      QUERY_LLM_MODEL: ${LIGHTRAG_LLM_MODEL:-${LLM_MODEL:-}}
+      EMBEDDING_BINDING: openai
+      EMBEDDING_BINDING_HOST: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_BINDING_API_KEY: ${EMBEDDING_API_KEY:-none}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embeddinggemma-2}
+      EMBEDDING_DIM: ${EMBEDDING_DIMENSION:-768}
+      ENTITY_EXTRACTION_USE_JSON: "true"
+      MAX_PARALLEL_INSERT: "3"
+      MAX_ASYNC: ${LIGHTRAG_MAX_ASYNC:-4}
+      EMBEDDING_FUNC_MAX_ASYNC: "4"
+      LIGHTRAG_PARSER: "*:native-teP,*:legacy-R"
+      VLM_PROCESS_ENABLE: "false"
+      LIGHTRAG_KV_STORAGE: ${LIGHTRAG_KV_STORAGE:-PGKVStorage}
+      LIGHTRAG_VECTOR_STORAGE: ${LIGHTRAG_VECTOR_STORAGE:-PGVectorStorage}
+      LIGHTRAG_DOC_STATUS_STORAGE: ${LIGHTRAG_DOC_STATUS_STORAGE:-PGDocStatusStorage}
+      LIGHTRAG_GRAPH_STORAGE: ${LIGHTRAG_GRAPH_STORAGE:-Neo4JStorage}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-skip}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DATABASE: ${POSTGRES_DB:-skip}
+      POSTGRES_WORKSPACE: lightrag
+      POSTGRES_MAX_CONNECTIONS: 20
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_DATABASE: neo4j
+      NEO4J_WORKSPACE: lightrag
+    volumes: [lightrag:/app/data]
+    depends_on:
+      postgres: {condition: service_healthy}
+      neo4j: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9621/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+volumes: {postgres: {}, redis: {}, neo4j: {}, files: {}, lightrag: {}}

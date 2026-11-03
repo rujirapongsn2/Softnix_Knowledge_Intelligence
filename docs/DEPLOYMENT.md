@@ -23,6 +23,8 @@ docker compose ps
 
 ## Production
 
+ติดตั้งให้ลูกค้าจาก image สำเร็จรูปบน Harbor (ไม่ต้อง build): ดู [INSTALL_HARBOR.md](INSTALL_HARBOR.md)
+
 ใช้ reverse proxy หรือ Cloudflare Tunnel ที่มี HTTPS:
 
 ```bash
@@ -55,11 +57,11 @@ script ตรวจว่า container ทุกตัวรันอยู่ �
 ความหมายของแต่ละข้อดูที่ [README](../README.md#5-ตรวจสถานะหลังติดตั้ง)
 
 `/ready` ต้องเห็น database, redis, neo4j, lightrag และ embeddings เป็น `ready` ส่วน ocr_chain จะตรวจเฉพาะเมื่อตั้ง `SOFTNIX_OCR_TOKEN` แล้ว ถ้า Softnix OCR ตอบไม่ได้แต่ใน `OCR_CHAIN_ENGINES` ยังมี engine ที่อ่านเอกสารสแกนได้ (Mistral ที่ตั้ง key ไว้ หรือ Tesseract ที่ติดตั้งใน image) `/ready` จะรายงาน ocr_chain เป็น `degraded` และยังตอบ 200 ถ้าไม่เหลือ engine สำรอง จึงจะตอบ 503
-ถ้า `SOFTNIX_OCR_*` ยังเป็นค่าตัวอย่างจาก `.env.example` `/ready` จะตอบ 503 และ api จะไม่ขึ้นเป็น healthy
+ถ้า `SOFTNIX_OCR_*` ยังเป็นค่าตัวอย่างจาก `.env.example` probe จะล้มเหลว: มี engine สำรองใน `OCR_CHAIN_ENGINES` (ค่าเริ่มต้นมี tesseract) `/ready` ได้ `degraded` แต่ไม่มีสำรองจะตอบ 503 และ api ไม่ขึ้นเป็น healthy ถ้ายังไม่มี Softnix OCR ให้เว้น `SOFTNIX_OCR_BASE_URL` และ `SOFTNIX_OCR_TOKEN` ว่าง ระบบจะไม่ตรวจเลย
 
 ## การเปลี่ยนแปลงที่มักต้องทำเพิ่ม
 
-- เพิ่ม `MAX_FILE_SIZE_MB` แล้ว rebuild `web` และ `api` เพื่อให้ file picker, proxy และ API ใช้ค่าเดียวกัน (ค่าเริ่มต้น 100 MB)
+- เพิ่ม `MAX_FILE_SIZE_MB` แล้ว `docker compose up -d web api` ค่าถูกอ่านตอน container เริ่ม (web เขียน `/config.js` และ nginx `client_max_body_size`) ไม่ต้อง rebuild ค่า build-arg เดิมยังเป็น fallback (ค่าเริ่มต้น 100 MB)
 - เปลี่ยน embedding model/dimension (ค่าเริ่มต้น `embeddinggemma-2`, 768 มิติ) ต้องรัน migration ปรับคอลัมน์ vector, reindex embeddings ทุก Knowledge Base และ ingest LightRAG ใหม่ ดูขั้นตอนใน [deploy/embedding-server](../deploy/embedding-server/README.md)
 - เพิ่ม/แก้ `published_at` ได้ตอน upload หรือผ่าน `PATCH /api/v1/documents/{id}/metadata`; ไม่มีการ backfill อัตโนมัติ
 - nginx ฝั่ง web resolve ชื่อ service `api` ซ้ำผ่าน Docker DNS จึงรองรับการ recreate API container โดยไม่ต้อง restart web ตาม

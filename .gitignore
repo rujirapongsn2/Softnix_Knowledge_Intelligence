@@ -10,3 +10,6 @@ dist/
 data/
 *.pdf
 *.DS_Store
+
+# Local reference data, not part of the repo
+/กรมที่ดิน/ผังแสดงการแก้ไข_พระราชบัญญัติแก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน_พ.ศ_2520/

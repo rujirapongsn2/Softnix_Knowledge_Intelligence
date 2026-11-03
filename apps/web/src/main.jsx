@@ -24,6 +24,7 @@ import "./knowledge-base-cards.css";
 import {connectionHandles} from "./graph-geometry.mjs";
 import {buildFilePreviewSections, isFilePreviewEmptyValue, mapFilePreviewClassLabel, pickDocumentMetadataValue, pickFilePreviewValue} from "./file-preview.mjs";
 import {Hint} from "./hint.jsx";
+import {DocumentAuditLog} from "./document-audit-log.jsx";
 import {ErrorTimelineChart} from "./error-timeline.jsx";
 import "./error-timeline.css";
 import "./lakehouse-ci.css";
@@ -796,7 +797,7 @@ function App() {
       {activeView === "mcp-tokens" && isAdmin && <McpTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
       {activeView === "ingest-tokens" && isAdmin && <IngestTokensView selectedKb={selectedKb} knowledgeBases={kbs} tokens={tokens} auditLogs={auditLogs} loadAccess={loadAccess} createMcpToken={createMcpToken} rotateMcpToken={rotateMcpToken} changeTokenState={changeTokenState}/>}
       {activeView === "system-status" && userRoleLevel >= ROLE_LEVEL.manager && <SystemStatusView />}
-      {activeView === "logs" && userRoleLevel >= ROLE_LEVEL.manager && <LoggingView transactions={transactionLogs} traces={traceLogs} loadTransactions={loadTransactionLogs} loadTraces={loadTraceLogs} hasMoreTransactions={Boolean(transactionCursor)} hasMoreTraces={Boolean(traceCursor)}/>}
+      {activeView === "logs" && userRoleLevel >= ROLE_LEVEL.manager && <LoggingView transactions={transactionLogs} traces={traceLogs} loadTransactions={loadTransactionLogs} loadTraces={loadTraceLogs} hasMoreTransactions={Boolean(transactionCursor)} hasMoreTraces={Boolean(traceCursor)} onOpenAuditDocument={item => { setSelectedKbId(item.knowledge_base.id); switchView("documents"); openDocument({id: item.document.id, title: item.document.title, original_filename: item.document.filename}); }}/>}
     </div>
   </AppShell></Theme>;
 }
@@ -1124,19 +1125,19 @@ function SystemStatusView() {
   </>;
 }
 
-function LoggingView({transactions, traces, loadTransactions, loadTraces, hasMoreTransactions, hasMoreTraces}) {
+function LoggingView({transactions, traces, loadTransactions, loadTraces, hasMoreTransactions, hasMoreTraces, onOpenAuditDocument}) {
   const {t} = useLanguage();
   const [search, setSearch] = useState("");
   const [method, setMethod] = useState("all");
   const [status, setStatus] = useState("all");
   const [expandedId, setExpandedId] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [view, setView] = useState("traces");
+  const [view, setView] = useState("audit");
   useEffect(() => {
-    if (!autoRefresh) return undefined;
+    if (!autoRefresh || view === "audit") return undefined;
     const timer = window.setInterval(() => Promise.all([loadTransactions(), loadTraces()]).catch(() => undefined), 10000);
     return () => window.clearInterval(timer);
-  }, [autoRefresh, loadTransactions, loadTraces]);
+  }, [autoRefresh, view, loadTransactions, loadTraces]);
   const visible = transactions.filter(item => {
     const needle = search.trim().toLocaleLowerCase();
     const matchSearch = !needle || `${item.request_id} ${item.path} ${item.authentication}`.toLocaleLowerCase().includes(needle);
@@ -1149,10 +1150,10 @@ function LoggingView({transactions, traces, loadTransactions, loadTraces, hasMor
   const retrievalRequests = transactions.filter(item => item.retrieval?.retrieval_trace?.length).length;
   const averageDuration = transactions.length ? Math.round(transactions.reduce((total, item) => total + Number(item.duration_ms || 0), 0) / transactions.length) : 0;
   const methods = [...new Set(transactions.map(item => item.method).filter(Boolean))].sort();
-  return <><PageHeading eyebrow={t("logging.eyebrow")} title={t("logging.title")} description={t("logging.description")} actions={<><label className="log-auto-refresh"><input type="checkbox" checked={autoRefresh} onChange={event => setAutoRefresh(event.target.checked)}/> {t("logging.autoRefresh")}</label><Button label={t("logging.refreshLogs")} variant="secondary" onClick={() => Promise.all([loadTransactions(), loadTraces()])}/></>}/>
-    <section className="metric-grid"><Metric value={transactions.length} label={t("logging.metrics.recentTransactions")} detail={t("logging.metrics.recentTransactionsDetail")}/><Metric value={errors} label={t("logging.metrics.errors")} detail={t("logging.metrics.errorsDetail")}/><Metric value={retrievalRequests} label={t("logging.metrics.retrievalExecutions")} detail={t("logging.metrics.retrievalExecutionsDetail", {count: mcpRequests})}/><Metric value={`${averageDuration} ms`} label={t("logging.metrics.averageDuration")} detail={t("logging.metrics.averageDurationDetail")}/></section>
-    <div className="log-tabs" role="tablist"><button role="tab" aria-selected={view === "traces"} className={view === "traces" ? "selected" : ""} onClick={() => setView("traces")}>{t("logging.tabs.traceExplorer")}</button><button role="tab" aria-selected={view === "transactions"} className={view === "transactions" ? "selected" : ""} onClick={() => setView("transactions")}>{t("logging.tabs.allTransactions")}</button></div>
-    {view === "traces" ? <><TraceExplorer traces={traces}/>{hasMoreTraces && <div className="log-load-more"><Button label={t("logging.loadOlderTraces")} variant="secondary" onClick={() => loadTraces(true)}/></div>}</> : <Card padding={4}><div className="log-filter-bar"><TextInput label={t("logging.filter.findLabel")} value={search} onChange={setSearch} placeholder={t("logging.filter.findPlaceholder")}/><Selector label={t("logging.filter.methodLabel")} value={method} onChange={setMethod} options={[{value: "all", label: t("logging.filter.allMethods")}, ...methods.map(value => ({value, label: value}))]}/><Selector label={t("common.status")} value={status} onChange={setStatus} options={[{value: "all", label: t("common.allStatuses")}, {value: "2", label: t("logging.filter.status2xx")}, {value: "4", label: t("logging.filter.status4xx")}, {value: "5", label: t("logging.filter.status5xx")}, {value: "error", label: t("logging.filter.allErrors")}]}/></div>
+  return <><PageHeading eyebrow={t("logging.eyebrow")} title={t("logging.title")} description={t("logging.description")} actions={view !== "audit" ? <><label className="log-auto-refresh"><input type="checkbox" checked={autoRefresh} onChange={event => setAutoRefresh(event.target.checked)}/> {t("logging.autoRefresh")}</label><Button label={t("logging.refreshLogs")} variant="secondary" onClick={() => Promise.all([loadTransactions(), loadTraces()])}/></> : null}/>
+    {view !== "audit" && <section className="metric-grid"><Metric value={transactions.length} label={t("logging.metrics.recentTransactions")} detail={t("logging.metrics.recentTransactionsDetail")}/><Metric value={errors} label={t("logging.metrics.errors")} detail={t("logging.metrics.errorsDetail")}/><Metric value={retrievalRequests} label={t("logging.metrics.retrievalExecutions")} detail={t("logging.metrics.retrievalExecutionsDetail", {count: mcpRequests})}/><Metric value={`${averageDuration} ms`} label={t("logging.metrics.averageDuration")} detail={t("logging.metrics.averageDurationDetail")}/></section>}
+    <div className="log-tabs" role="tablist" aria-label={t("logging.title")}><button id="document-audit-tab" role="tab" aria-controls="document-audit-panel" aria-selected={view === "audit"} className={view === "audit" ? "selected" : ""} onClick={() => setView("audit")}>{t("audit.title")}</button><button role="tab" aria-selected={view === "traces"} className={view === "traces" ? "selected" : ""} onClick={() => setView("traces")}>{t("logging.tabs.traceExplorer")}</button><button role="tab" aria-selected={view === "transactions"} className={view === "transactions" ? "selected" : ""} onClick={() => setView("transactions")}>{t("logging.tabs.allTransactions")}</button></div>
+    {view === "audit" ? <DocumentAuditLog api={api} onOpenDocument={onOpenAuditDocument}/> : view === "traces" ? <><TraceExplorer traces={traces}/>{hasMoreTraces && <div className="log-load-more"><Button label={t("logging.loadOlderTraces")} variant="secondary" onClick={() => loadTraces(true)}/></div>}</> : <Card padding={4}><div className="log-filter-bar"><TextInput label={t("logging.filter.findLabel")} value={search} onChange={setSearch} placeholder={t("logging.filter.findPlaceholder")}/><Selector label={t("logging.filter.methodLabel")} value={method} onChange={setMethod} options={[{value: "all", label: t("logging.filter.allMethods")}, ...methods.map(value => ({value, label: value}))]}/><Selector label={t("common.status")} value={status} onChange={setStatus} options={[{value: "all", label: t("common.allStatuses")}, {value: "2", label: t("logging.filter.status2xx")}, {value: "4", label: t("logging.filter.status4xx")}, {value: "5", label: t("logging.filter.status5xx")}, {value: "error", label: t("logging.filter.allErrors")}]}/></div>
       <p className="section-copy log-privacy-note">{t("logging.privacyNote")}</p>
       {visible.length ? <div className="transaction-list">{visible.map(item => {
         const isOpen = expandedId === item.id;

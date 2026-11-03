@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .audit import record_audit, record_mcp_error_trace, record_retrieval_execution
+from .audit_logs import document_audit_page
 from .db import Base, engine, get_db, SessionLocal
 from .graph_store import Neo4jGraphStore
 from .legal_registry import provision_number_matches, resolve_instrument_statuses
@@ -57,7 +58,7 @@ REQUEST_TRANSACTION_ACTION = "request.transaction"
 # Health probes and reads of the logging APIs intentionally do not create a new
 # transaction record. This keeps the operator view useful rather than filling it
 # with its own polling traffic.
-REQUEST_LOG_EXCLUDED_PATHS = {"/health", "/ready", "/metrics", "/api/v1/audit-logs", "/api/v1/logs/transactions", "/api/v1/traces"}
+REQUEST_LOG_EXCLUDED_PATHS = {"/health", "/ready", "/metrics", "/api/v1/audit-logs", "/api/v1/logs/transactions", "/api/v1/logs/audit", "/api/v1/traces"}
 
 
 def record_request_transaction(request: Request, request_id: str, status_code: int, duration_seconds: float) -> None:
@@ -2620,6 +2621,17 @@ def list_audit_logs(limit: int = 100, user: User = Depends(require_manager), db:
              "target_id": row.target_id, "metadata": row.metadata_json, "created_at": row.created_at} for row in rows]
 
 
+@app.get("/api/v1/logs/audit")
+def list_document_audit(knowledge_base_id: str | None = None, document_id: str | None = None,
+                        action: str | None = None, actor_type: str | None = None, actor_id: str | None = None,
+                        channel: str | None = None, from_ts: str | None = None, to_ts: str | None = None,
+                        search: str | None = None, cursor: str | None = None, limit: int = 50,
+                        user: User = Depends(require_manager), db: Session = Depends(get_db)):
+    return document_audit_page(db, user, knowledge_base_id=knowledge_base_id, document_id=document_id,
+                               action=action, actor_type=actor_type, actor_id=actor_id, channel=channel,
+                               from_ts=from_ts, to_ts=to_ts, search=search, cursor=cursor, limit=limit)
+
+
 @app.get("/api/v1/logs/transactions")
 def list_request_transactions(limit: int = 100, cursor: str | None = None, from_ts: str | None = None,
                               to_ts: str | None = None, method: str | None = None, status_code: int | None = None,
@@ -3194,7 +3206,7 @@ def attach_reference_file(document_id: str, file: UploadFile, token: TokenKey, d
         doc.reference_file_path, doc.reference_file_filename = path, filename
         doc.reference_file_size, doc.reference_file_checksum_sha256 = size, checksum
         doc.reference_file_mime_type = mime_type
-        record_audit(db, "document.reference_pdf.attach" if pdf_only else "document.reference_file.attach", None, "document", doc.id, {"transport": "ingest_api"})
+        record_audit(db, "document.reference_pdf.attach" if pdf_only else "document.reference_file.attach", None, "document", doc.id, {"transport": "ingest_api", "token_id": token.id, "token_name": token.name, "knowledge_base_id": doc.knowledge_base_id})
         db.commit()
     except Exception:
         db.rollback()

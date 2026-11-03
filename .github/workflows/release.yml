@@ -1,8 +1,10 @@
 # Build and publish a release to Harbor (registry.softnix.co.th/ski).
-#   Tag push v1.2.3 -> ski/api and ski/web as v1.2.3, 1.2, sha-<short>, for linux/amd64 + linux/arm64,
+#   Tag push v1.2.3 -> ski/api and ski/web as v1.2.3, 1.2, sha-<short>, for linux/amd64 + linux/arm64
+#   (each built on a native runner, ubuntu-24.04 / ubuntu-24.04-arm, then merged into one manifest),
 #   plus the public images (pgvector, redis, neo4j, lightrag) mirrored with their exact digests.
 # Secrets: HARBOR_USERNAME, HARBOR_PASSWORD (Harbor robot robot$ski+ci-push: push + pull on project "ski").
 #          ANYDOC_TOKEN only if rujirapongsn2/Anydoc-ocr becomes private (read access to that repo).
+# Harbor keeps v* and mirror-* tags immutable; X.Y and sha-* move.
 # Variable (optional): ANYDOC_REF overrides the pinned Anydoc-ocr commit below.
 name: release
 
@@ -35,12 +37,17 @@ env:
   ANYDOC_REF: ${{ vars.ANYDOC_REF || 'e914f723fa08e83d1aa62abbe9a1c969a060329b' }}
 
 jobs:
-  images:
-    runs-on: ubuntu-latest
+  build:
+    # One job per image and architecture, each on a native runner (no QEMU). Each pushes its image by
+    # digest only; the merge job below joins the two digests into one multi-arch tag.
+    name: build ${{ matrix.image }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: true
       matrix:
+        image: [api, web]
+        arch: [amd64, arm64]
         include:
           - image: api
             context: .
@@ -48,6 +55,10 @@ jobs:
           - image: web
             context: apps/web
             file: apps/web/Dockerfile
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +72,71 @@ jobs:
           # Public today; a private repo needs the ANYDOC_TOKEN secret.
           token: ${{ secrets.ANYDOC_TOKEN || github.token }}
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ matrix.image }}
+          labels: |
+            org.opencontainers.image.title=softnix-knowledge-intelligence-${{ matrix.image }}
+            ai.softnix.anydoc.ref=${{ env.ANYDOC_REF }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          build-contexts: ${{ matrix.image == 'api' && 'anydoc=_anydoc' || '' }}
+          build-args: |
+            ANYDOC_SRC=/
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  images:
+    # Joins the per-arch digests into one manifest list and tags it vX.Y.Z, X.Y, sha-<short>.
+    name: manifest ${{ matrix.image }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: true
+      matrix:
+        image: [api, web]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to Harbor
@@ -82,25 +157,24 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
             type=sha,prefix=sha-,format=short
-          labels: |
-            org.opencontainers.image.title=softnix-knowledge-intelligence-${{ matrix.image }}
-            ai.softnix.anydoc.ref=${{ env.ANYDOC_REF }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.file }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-contexts: ${{ matrix.image == 'api' && 'anydoc=_anydoc' || '' }}
-          build-args: |
-            ANYDOC_SRC=/
-          provenance: false
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+      - name: Create the multi-arch manifest
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          n=$(find . -type f | wc -l)
+          [ "$n" -eq 2 ] || { echo "expected 2 digests (amd64, arm64), got $n" >&2; exit 1; }
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ matrix.image }}
+        run: docker buildx imagetools inspect "$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
 
   mirror:
     # Copies the digest-pinned public images from docker-compose.yml into Harbor unchanged (crane keeps the
@@ -123,6 +197,8 @@ jobs:
             local name=$1 src=$2 digest=${2##*@}
             local dst="$REGISTRY/$PROJECT/$name:mirror-${digest:7:12}"
             echo "$src -> $dst"
+            # mirror-* tags are immutable in Harbor: skip a copy that is already there with this digest.
+            if [ "$(crane digest "$dst" 2>/dev/null || true)" = "$digest" ]; then echo "already mirrored"; return; fi
             crane copy "$src" "$dst"
             [ "$(crane digest "$dst")" = "$digest" ] || { echo "digest changed for $dst" >&2; exit 1; }
           }

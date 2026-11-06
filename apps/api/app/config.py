@@ -131,6 +131,12 @@ class Settings(BaseSettings):
                 setattr(self, field, old)
         return self
 
+    @field_validator("rerank_candidate_limit", mode="after")
+    @classmethod
+    def _clamp_rerank_candidate_limit(cls, value: int) -> int:
+        # Clamped, not rejected: an .env from before the cap must still start the api.
+        return min(max(value, 1), 100)
+
     @field_validator("llm_temperature", mode="before")
     @classmethod
     def _empty_temperature_is_none(cls, value):

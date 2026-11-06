@@ -88,6 +88,7 @@ class RetrievalPlan(BaseModel):
     metadata_predicates: list[dict] = Field(default_factory=list)
     metadata_filters: dict[str, str] = Field(default_factory=dict)
     metadata_document_ids: list[str] | None = Field(default=None, exclude=True, repr=False)
+    named_document_ids: list[str] | None = Field(default=None, exclude=True, repr=False)
     legal_context: LegalContext | None = None
     authority_weight: float = Field(default=0.30, ge=0, le=1)
     recency_weight: float = Field(default=0.15, ge=0, le=1)

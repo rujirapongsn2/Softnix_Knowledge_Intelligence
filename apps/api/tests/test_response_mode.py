@@ -11,6 +11,7 @@ class _CountingLLM:
     answers = 0
     reranker_enabled = False
     llm_enabled = True
+    answer_attempts = 1
 
     def __init__(self, *_args):
         pass

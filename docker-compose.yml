@@ -108,6 +108,8 @@ services:
   lightrag:
     # 1.5.4. The env names below are the ones this version reads.
     image: ${LIGHTRAG_IMAGE:-ghcr.io/hkuds/lightrag@sha256:de09cd75e32b6b45b104625a9fb229f84f3dec4827ecffc825aa4438b196cbe6}
+    # A missing deploy/lightrag-patches mounts as an empty directory and would start LightRAG unpatched.
+    entrypoint: ["sh", "-c", "test -f /opt/ski-lightrag-patches/sitecustomize.py || { echo \"deploy/lightrag-patches/sitecustomize.py is missing\" >&2; exit 1; }; exec python -m lightrag.api.lightrag_server"]
     restart: unless-stopped
     environment:
       HOST: 0.0.0.0
@@ -144,6 +146,8 @@ services:
       MAX_ASYNC: ${LIGHTRAG_MAX_ASYNC:-4}
       EMBEDDING_FUNC_MAX_ASYNC: "4"
       LIGHTRAG_PARSER: "*:native-teP,*:legacy-R"
+      # Loads deploy/lightrag-patches/sitecustomize.py (fixes for the pinned image).
+      PYTHONPATH: /opt/ski-lightrag-patches
       VLM_PROCESS_ENABLE: "false"
       # The file-backed defaults hold every store in memory and rewrite it whole on each
       # document, which does not scale past a few hundred documents. Setting these four back
@@ -167,7 +171,7 @@ services:
       # Community edition has only the default database, and the label keeps LightRAG's nodes apart from KnowledgeEntity.
       NEO4J_DATABASE: neo4j
       NEO4J_WORKSPACE: lightrag
-    volumes: [lightrag:/app/data]
+    volumes: [lightrag:/app/data, ./deploy/lightrag-patches:/opt/ski-lightrag-patches:ro]
     depends_on:
       postgres: {condition: service_healthy}
       neo4j: {condition: service_started}

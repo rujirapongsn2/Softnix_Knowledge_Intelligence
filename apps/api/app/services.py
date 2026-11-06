@@ -18,7 +18,7 @@ import httpx
 from markitdown import MarkItDown
 from sqlalchemy import Text, and_, cast, func, or_, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import Load, Session, aliased
 
 from .config import get_settings
 from .db import SessionLocal
@@ -41,6 +41,8 @@ from .job_queue import ClaimLost, claim_next_graph_event, claim_next_job, hand_b
 from .provider_holds import provider_of, wait_for_provider
 from .remote_index import IN_FLIGHT_STATUSES, HealOutcome, purge_remote_record, resolve_remote_duplicate
 from .retrieval import LightRAGRetrievalEngine, RetrievalEngineError, RetrievalEvidence, classify_track_failure, describe_engine_failure
+from .passages import named_document_ids, passage_query, rank_passages, select_passage
+from .grounded_answer import INSUFFICIENT_ANSWER
 from .retry_policy import PROCESSING_RETRY_POLICIES, PURGE_RETRYABLE_CODES, PURGE_RETRY, purge_busy_delay, PURGE_MAX_BUSY_DEFERRALS, schedule_retry
 
 SUPPORTED_EXTENSIONS = {".pdf", ".doc", ".docx", ".pptx", ".xlsx", ".xls", ".txt", ".md", ".html", ".htm", ".csv", ".json"}
@@ -869,7 +871,8 @@ def relationship_sources(db: Session, relationships: list[Relationship], plan: R
 
 
 def _relationship_filter_active(plan: RetrievalPlan | None) -> bool:
-    return bool(plan and (plan.published_from or plan.published_to or plan.metadata_document_ids is not None))
+    return bool(plan and (plan.published_from or plan.published_to or plan.metadata_document_ids is not None
+                          or plan.named_document_ids is not None))
 
 
 def _filter_relationships_by_plan(db: Session, relationships: list[Relationship], plan: RetrievalPlan | None) -> list[Relationship]:
@@ -3022,12 +3025,30 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
                                 started_at=time.monotonic(), result_count=0,
                                 detail="No documents satisfy explicit metadata filters; retrieval skipped")
         return RetrievalEvidence([], [], [], [])
+    provinces = re.findall(r"จังหวัด([ก-๙]+)", query)
+    if len(set(provinces)) == 1 and re.search(r"พ\.?\s*ศ\.?\s*[0-9๐-๙]{4}", query):
+        started_at = time.monotonic()
+        identities = db.query(Document.id, Document.title, Document.original_filename,
+                              func.substr(Document.extracted_text, 1, 1800)).filter(
+            Document.live(), Document.status == "completed",
+            or_(Document.title.contains("จังหวัด" + provinces[0]), Document.original_filename.contains("จังหวัด" + provinces[0])),
+        )
+        if kb_ids:
+            identities = identities.filter(Document.knowledge_base_id.in_(kb_ids))
+        identities = _apply_metadata_filter(_apply_legal_filter(_apply_published_filter(identities, plan), plan), plan)
+        matched = named_document_ids(query, [(doc_id, f"{title or ''} {filename}", opening or "")
+                                             for doc_id, title, filename, opening in identities.all()])
+        if matched:
+            plan = plan.model_copy(update={"named_document_ids": matched})
+            _append_retrieval_trace(trace, channel="document_scope", system="PostgreSQL document identity", status="used",
+                                    started_at=started_at, result_count=len(matched), detail="explicit province, title, year and version")
+    candidate_limit = max(limit, get_settings().rerank_candidate_limit)
     channels: list[RetrievalEvidence] = []
     db_channels = {
-        RetrievalChannel.EXACT: lambda session: query_exact_documents(session, plan, kb_ids, limit, trace),
-        RetrievalChannel.VECTOR: lambda session: query_database_vectors(session, query, kb_ids, limit, trace, plan),
-        RetrievalChannel.FULLTEXT: lambda session: query_database_chunks(session, query, kb_ids, limit, trace, plan),
-        RetrievalChannel.GRAPH: lambda session: query_database_graph(session, query, kb_ids, limit, trace, plan),
+        RetrievalChannel.EXACT: lambda session: query_exact_documents(session, plan, kb_ids, candidate_limit, trace),
+        RetrievalChannel.VECTOR: lambda session: query_database_vectors(session, query, kb_ids, candidate_limit, trace, plan),
+        RetrievalChannel.FULLTEXT: lambda session: query_database_chunks(session, query, kb_ids, candidate_limit, trace, plan),
+        RetrievalChannel.GRAPH: lambda session: query_database_graph(session, query, kb_ids, candidate_limit, trace, plan),
     }
     for channel in (RetrievalChannel.EXACT, RetrievalChannel.VECTOR, RetrievalChannel.FULLTEXT, RetrievalChannel.GRAPH):
         if channel not in plan.channels:
@@ -3041,7 +3062,7 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
         _append_retrieval_trace(trace, channel="lightrag", system="LightRAG", status="skipped", started_at=time.monotonic(),
                                 detail="not configured" if not engine.enabled else "requires one Knowledge Base")
     else:
-        db_channels[RetrievalChannel.LIGHTRAG] = lambda session: _query_lightrag(session, engine, query, kb_ids, limit, trace, plan)
+        db_channels[RetrievalChannel.LIGHTRAG] = lambda session: _query_lightrag(session, engine, query, kb_ids, candidate_limit, trace, plan)
     futures = {}
     channel_results = {}
     with ThreadPoolExecutor(max_workers=max(1, len(db_channels))) as executor:
@@ -3111,10 +3132,15 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
     instruments_by_document = _legal_instruments_by_document(db, document_ids)
     legal_meta = {doc_id: {"authority_level": row.authority_level, "status": row.status, "effective_from": row.effective_from}
                  for doc_id, row in instruments_by_document.items()}
-    fused = fuse_evidence(*channels, limit=limit, legal_meta=legal_meta, legal_context=plan.legal_context,
+    fused = fuse_evidence(*channels, limit=candidate_limit, legal_meta=legal_meta, legal_context=plan.legal_context,
                           authority_weight=plan.authority_weight, status_weight=plan.status_weight, recency_weight=plan.recency_weight)
     fused = _expand_requested_legal_sections(db, fused, plan, trace)
+    fused.sources = [{**source, "excerpt": select_passage(passage_query(query, source.get("title") or ""), source.get("excerpt") or "")}
+                     for source in fused.sources]
     evidence = rerank_evidence(query, fused, limit, trace, plan.rerank_enabled)
+    if len(evidence.sources) > limit:
+        evidence = RetrievalEvidence([{**source, "citation_id": f"S{index}"} for index, source in enumerate(evidence.sources[:limit], 1)],
+                                     evidence.entities, evidence.relationships, evidence.paths, evidence.answer)
     if evidence.sources is not fused.sources:
         # The cross-encoder reranker has no legal awareness and can drop the
         # current-version guarantee fuse_evidence already applied; restore it
@@ -3143,9 +3169,11 @@ def query_documents(db: Session, query: str, kb_ids: list[str], limit: int,
                                     started_at=started_at, detail="evidence only requested")
             return evidence
         try:
-            evidence.answer = LLMClient().answer_from_sources(query, evidence.sources)
+            answer_client = LLMClient()
+            evidence.answer = answer_client.answer_from_sources(query, evidence.sources)
             _append_retrieval_trace(trace, channel="answer_generation", system="LLM", status="used",
-                                    started_at=started_at, result_count=len(evidence.sources), detail="cited answer")
+                                    started_at=started_at, result_count=len(evidence.sources),
+                                    detail=f"cited answer; attempts={answer_client.answer_attempts}")
         except RuntimeError as exc:
             evidence.answer = None
             _append_retrieval_trace(trace, channel="answer_generation", system="LLM", status="unavailable",
@@ -3214,7 +3242,7 @@ def _query_lightrag(db: Session, engine: LightRAGRetrievalEngine, query: str, kb
     started_at = time.monotonic()
     try:
         value = engine.query(query, kb_ids, limit)
-        if plan and _relationship_filter_active(plan):
+        if _relationship_filter_active(plan):
             source_ids = {source.get("document_id") for source in value.sources if source.get("document_id")}
             allowed = db.query(Document.id).filter(
                 Document.id.in_(source_ids), Document.status == "completed", Document.live(),
@@ -3265,9 +3293,13 @@ def _metadata_filter_document_ids(db: Session, knowledge_base_ids: list[str], fi
 
 
 def _apply_metadata_filter(rows, plan: RetrievalPlan | None):
-    if plan is None or plan.metadata_document_ids is None:
+    if plan is None:
         return rows
-    return rows.filter(Document.id.in_(plan.metadata_document_ids))
+    if plan.metadata_document_ids is not None:
+        rows = rows.filter(Document.id.in_(plan.metadata_document_ids))
+    if plan.named_document_ids is not None:
+        rows = rows.filter(Document.id.in_(plan.named_document_ids))
+    return rows
 
 
 def _apply_legal_filter(rows, plan: RetrievalPlan | None):
@@ -3398,7 +3430,7 @@ def query_database_vectors(db: Session, query: str, kb_ids: list[str], limit: in
     rows = _apply_provision_filter(rows, plan)
     records = sorted(rows.order_by(distance).limit(limit).all(), key=lambda record: record[2])
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
-                "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": max(0.0, 1.0 - float(item_distance)),
+                "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content, "relevance": max(0.0, 1.0 - float(item_distance)),
                 "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}
                for i, (chunk, document, item_distance) in enumerate(records, 1)]
     _append_retrieval_trace(trace, channel="semantic_vector", system="Embedding server → PostgreSQL + pgvector",
@@ -3424,23 +3456,31 @@ def query_database_chunks(db: Session, query: str, kb_ids: list[str], limit: int
     legacy_metadata_text = cast(Document.document_metadata, Text)
     def searchable_metadata_predicate(pattern: str):
         return or_(metadata_text.ilike(pattern), and_(Document.metadata_search_text.is_(None), legacy_metadata_text.ilike(pattern)))
-    if words:
+    if plan and plan.named_document_ids:
+        records = base_rows.options(Load(Document).load_only(Document.id, Document.title),
+                                    Load(DocumentChunk).defer(DocumentChunk.embedding)).order_by(Document.id, DocumentChunk.chunk_index).all()
+        title = records[0][1].title if records else ""
+        order = rank_passages(passage_query(query, title or ""), [chunk.content for chunk, document in records])
+        records = [records[index] for index in order[:limit]]
+    elif words:
         if db.get_bind().dialect.name == "postgresql":
             vector = func.to_tsvector("simple", DocumentChunk.content)
             tsquery = func.websearch_to_tsquery("simple", query)
             rows = rows.filter(or_(vector.op("@@")(tsquery), searchable_metadata_predicate(f"%{query}%"))).order_by(func.ts_rank_cd(vector, tsquery).desc())
         else:
             rows = rows.filter(or_(*[DocumentChunk.content.ilike(f"%{word}%") for word in words[:8]], searchable_metadata_predicate(f"%{query}%")))
-    records = rows.limit(limit).all()
+    if not (plan and plan.named_document_ids):
+        records = rows.limit(limit).all()
     if not records and words and db.get_bind().dialect.name == "postgresql":
         # PostgreSQL simple FTS does not segment Thai. Retain FTS as the first
         # choice, then use an explicit phrase/token fallback in the same scope.
         records = base_rows.filter(or_(*[DocumentChunk.content.ilike(f"%{word}%") for word in words[:8]], *[searchable_metadata_predicate(f"%{word}%") for word in words[:8]])).limit(limit).all()
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
-                "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": 1.0 / i,
+                "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content, "relevance": 1.0 / i,
                 "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}
                for i, (chunk, document) in enumerate(records, 1)]
-    system = "PostgreSQL full-text search" if db.get_bind().dialect.name == "postgresql" else "SQL text fallback"
+    system = ("PostgreSQL scoped passages" if plan and plan.named_document_ids else
+              "PostgreSQL full-text search" if db.get_bind().dialect.name == "postgresql" else "SQL text fallback")
     _append_retrieval_trace(trace, channel="full_text", system=system, status="used",
                             started_at=started_at, result_count=len(sources), detail="keyword retrieval")
     return RetrievalEvidence(sources, [], [], [])
@@ -3472,7 +3512,7 @@ def query_exact_documents(db: Session, plan: RetrievalPlan, kb_ids: list[str], l
                            metadata_text.ilike(pattern), and_(Document.metadata_search_text.is_(None), legacy_metadata_text.ilike(pattern))))
     records = rows.filter(or_(*predicates)).order_by(DocumentChunk.chunk_index).limit(limit).all()
     sources = [{"citation_id": f"S{i}", "document_id": document.id, "title": document.title,
-                "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content[:500], "relevance": 1.0 / i,
+                "chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "excerpt": chunk.content, "relevance": 1.0 / i,
                 "section_kind": chunk.section_kind, "section_number": chunk.section_number, "section_label": chunk.section_label}
                for i, (chunk, document) in enumerate(records, 1)]
     _append_retrieval_trace(trace, channel="exact_document", system="PostgreSQL document metadata", status="used",
@@ -3689,7 +3729,7 @@ def rerank_evidence(query: str, evidence: RetrievalEvidence, limit: int,
                                 detail="disabled by retrieval policy" if not enabled else ("not configured" if not client.reranker_enabled else "no candidates"))
         return evidence
     started_at = time.monotonic()
-    candidates = evidence.sources[:get_settings().rerank_candidate_limit]
+    candidates = evidence.sources[:max(limit, get_settings().rerank_candidate_limit)]
     try:
         ranked = client.rerank(query, [item["excerpt"] for item in candidates], limit)
     except RuntimeError as exc:
@@ -3878,6 +3918,8 @@ def _validate_answer_citations(evidence: RetrievalEvidence, warnings: list[dict]
     answer = (evidence.answer or "").strip()
     if not answer:
         return
+    if answer == INSUFFICIENT_ANSWER:
+        return
     cited_ids = set(_CITATION_RE.findall(answer))
     available = {str(source.get("citation_id")): source for source in evidence.sources}
     valid_ids = cited_ids & available.keys()
@@ -4012,7 +4054,7 @@ def build_answer_claims(answer: str | None, references: list[dict]) -> list[dict
         for reference in references if reference.get("citation_id")
     }
     body = answer
-    for marker in ("\n\nรายละเอียดแหล่งอ้างอิง:", "\n\nแหล่งอ้างอิง:"):
+    for marker in ("\n\nรายละเอียดแหล่งอ้างอิง:", "\n\nแหล่งอ้างอิง:", f"\n\n{_UNSUPPORTING_EVIDENCE_HEADING}"):
         body = body.split(marker, 1)[0]
     claims = []
     for line in (item.strip() for item in body.splitlines()):
@@ -4028,7 +4070,7 @@ def build_answer_claims(answer: str | None, references: list[dict]) -> list[dict
                 "citation_ids": citation_ids,
                 "reference_ids": reference_ids,
             })
-    if claims or not body.strip():
+    if claims or body.strip() in ("", INSUFFICIENT_ANSWER):
         return claims
     # Legacy/generated answers sometimes attach one citation list after the
     # prose instead of placing IDs on each sentence. Preserve that broad
@@ -4110,6 +4152,9 @@ def refresh_saved_answer_citations(answer: str | None, stored_sources: list[dict
     return answer
 
 
+_UNSUPPORTING_EVIDENCE_HEADING = "หลักฐานที่ค้นพบ (ยังไม่เพียงพอสำหรับคำตอบ):"
+
+
 def compose_cited_answer(evidence: RetrievalEvidence, warnings: list[dict] | None = None) -> str:
     if warnings and any(item.get("code") == "AMBIGUOUS_LEGAL_CONTEXT" for item in warnings):
         return "ยังไม่สามารถตอบได้อย่างปลอดภัย เนื่องจากพบหลายฉบับที่อาจตรงกับมาตราที่ระบุ โปรดระบุชื่อฉบับกฎหมายหรือวันที่มีผลบังคับใช้ให้ชัดเจน"
@@ -4127,6 +4172,9 @@ def compose_cited_answer(evidence: RetrievalEvidence, warnings: list[dict] | Non
               if latest_assumption and answer else "")
     if not answer:
         return f"พบหลักฐานที่เกี่ยวข้อง {citations}\n\nแหล่งอ้างอิง:\n{details}"
+    if answer == INSUFFICIENT_ANSWER:
+        # The abstention cites nothing, so the retrieved sources must not read as its support.
+        return f"{answer}\n\n{_UNSUPPORTING_EVIDENCE_HEADING}\n{details}"
     if not re.search(r"\[S\d+\]", answer):
         answer = f"{answer}\n\nแหล่งอ้างอิง: {citations}"
     return f"{prefix}{answer}\n\nรายละเอียดแหล่งอ้างอิง:\n{details}"

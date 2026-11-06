@@ -172,7 +172,7 @@ def _chat_bodies(monkeypatch, effort):
 
     def handler(request: httpx.Request):
         bodies.append(json.loads(request.content))
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"fields": {}}'}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"fields": {}, "claims": [], "insufficient_evidence": true}'}}]})
 
     client = LLMClient(httpx.Client(transport=httpx.MockTransport(handler)))
     client.extract_document_metadata([{"key": "issuer"}], "text")
@@ -263,7 +263,7 @@ def test_rerank_can_use_its_own_server_without_the_llm_key(monkeypatch):
     get_settings.cache_clear()
 
 
-def test_rerank_sends_only_the_start_of_long_candidates_so_one_cannot_fail_the_request(monkeypatch):
+def test_rerank_bounds_long_candidates_so_one_cannot_fail_the_request(monkeypatch):
     monkeypatch.setenv("RERANKER_ENABLED", "true")
     monkeypatch.setenv("RERANK_MODEL", "bge-reranker")
     monkeypatch.setenv("RERANK_BASE_URL", "http://reranker:8091/v1")
@@ -276,7 +276,8 @@ def test_rerank_sends_only_the_start_of_long_candidates_so_one_cannot_fail_the_r
 
     client = LLMClient(httpx.Client(transport=httpx.MockTransport(handler)))
     assert client.rerank("ถาม" * 2000, ["ก" * 20000, "short"], 2) == [(0, 0.1), (1, 0.9)]
-    assert [len(document) for document in bodies[0]["documents"]] == [2000, 5]
+    assert 0 < len(bodies[0]["documents"][0]) <= 2000
+    assert len(bodies[0]["documents"][1]) == 5
     assert len(bodies[0]["query"]) == 1000
     get_settings.cache_clear()
 
@@ -426,7 +427,7 @@ def _requested_models(monkeypatch, answer_model: str | None, call) -> list[str]:
 
     def handler(request: httpx.Request):
         models.append(json.loads(request.content)["model"])
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"fields": {}}'}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"fields": {}, "claims": [], "insufficient_evidence": true}'}}]})
 
     call(LLMClient(httpx.Client(transport=httpx.MockTransport(handler))))
     get_settings.cache_clear()

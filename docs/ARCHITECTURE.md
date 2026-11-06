@@ -38,6 +38,12 @@ Document Type คือ metadata contract ของผู้ดูแล ส่�
 
 Executor รัน channel ที่เลือกแบบขนาน, เคารพ policy ของ Knowledge Base, กรองสิทธิ์และ date range ทุก channel, รวมอันดับ, เรียก reranker เฉพาะเมื่อเปิดใช้งาน และคืนหลักฐานพร้อม citation หาก channel ใดล้มเหลว channel อื่นยังส่งผลได้
 
+Fusion เก็บ candidates อย่างน้อย `RERANK_CANDIDATE_LIMIT` ชิ้นก่อนเลือก `max_sources` สุดท้าย ทั้งแบบเปิดและปิด reranker ยังใช้ขอบเขตสิทธิ์ metadata วันที่และสถานะกฎหมายเดิม เมื่อคำถามระบุเอกสารระดับจังหวัดพร้อมปีและฉบับชัดเจน ระบบจับคู่ชื่อกับข้อความเปิดเอกสารก่อนค้น passage ภายในฉบับนั้น คำถามเปรียบเทียบหลายฉบับยังใช้การค้นหาปกติ
+
+ช่องทาง PostgreSQL ส่งข้อความ chunk ครบให้ขั้นเลือก passage แทนการตัด 500 ตัวอักษรแรก ข้อความยาวเลือกช่วงตามคำถามพร้อมบริบทและแสดงเครื่องหมายละข้อความ LLM อ่านได้สูงสุด 6,000 ตัวอักษรต่อ source ภายใต้งบข้อความหลักฐานรวม 36,000 ตัวอักษร ส่วน reranker เลือกช่วงที่เกี่ยวข้องไม่เกิน 2,000 ตัวอักษรต่อ candidate โค้ดอยู่ใน `app/passages.py`
+
+LLM ตอบเป็น claims ที่มี `text` และ `source_ids` ระบบตรวจรหัสกับหลักฐานที่ส่งให้โมเดลจริง แล้วประกอบ `[S#]` เองผ่าน `app/grounded_answer.py` งบ context แบ่งให้ทุก source โดยคงข้อความสั้นครบ หากรูปแบบหรือ citation ไม่ผ่านจะขอสร้างคำตอบใหม่จากหลักฐานเดิมได้หนึ่งครั้งภายใน deadline และบันทึกจำนวนครั้งใน trace รหัสที่ไม่รู้จักหรือ claims ที่ไม่ระบุแหล่งยังถูกปฏิเสธ หากไม่มีหลักฐานสามารถคืนคำตอบงดสรุปอย่างชัดเจนได้ รูปแบบ response สาธารณะ `answer`, `sources`, `references` และ `claims` คงเดิม
+
 ## Graph และ legal registry
 
 PostgreSQL เก็บ entity/relationship และ evidence เป็น authority; Neo4j รับ projection ผ่าน outbox event และ retry ได้ หาก Neo4j ล่มหรือข้อมูลไม่ครบ ระบบ fallback เป็น PostgreSQL traversal

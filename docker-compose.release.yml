@@ -106,6 +106,8 @@ services:
     # LightRAG 1.5.4; keep the settings in step with docker-compose.yml. A release reads only the LLM_* names
     # (not the legacy OPENROUTER_* ones).
     image: ${LIGHTRAG_RELEASE_IMAGE:-${SKI_REGISTRY:-registry.softnix.co.th/ski}/lightrag:mirror-de09cd75e32b}
+    # A missing deploy/lightrag-patches mounts as an empty directory and would start LightRAG unpatched.
+    entrypoint: ["sh", "-c", "test -f /opt/ski-lightrag-patches/sitecustomize.py || { echo \"deploy/lightrag-patches/sitecustomize.py is missing\" >&2; exit 1; }; exec python -m lightrag.api.lightrag_server"]
     restart: unless-stopped
     environment:
       HOST: 0.0.0.0
@@ -130,6 +132,8 @@ services:
       MAX_ASYNC: ${LIGHTRAG_MAX_ASYNC:-4}
       EMBEDDING_FUNC_MAX_ASYNC: "4"
       LIGHTRAG_PARSER: "*:native-teP,*:legacy-R"
+      # Loads deploy/lightrag-patches/sitecustomize.py (fixes for the pinned image).
+      PYTHONPATH: /opt/ski-lightrag-patches
       VLM_PROCESS_ENABLE: "false"
       LIGHTRAG_KV_STORAGE: ${LIGHTRAG_KV_STORAGE:-PGKVStorage}
       LIGHTRAG_VECTOR_STORAGE: ${LIGHTRAG_VECTOR_STORAGE:-PGVectorStorage}
@@ -147,7 +151,7 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
       NEO4J_DATABASE: neo4j
       NEO4J_WORKSPACE: lightrag
-    volumes: [lightrag:/app/data]
+    volumes: [lightrag:/app/data, ./deploy/lightrag-patches:/opt/ski-lightrag-patches:ro]
     depends_on:
       postgres: {condition: service_healthy}
       neo4j: {condition: service_started}

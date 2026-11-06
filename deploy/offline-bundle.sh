@@ -37,6 +37,7 @@ case "${1:-}" in
     fi
     cp docker-compose.release.yml .env.release.example "$work/"
     cp deploy/install.sh deploy/offline-bundle.sh deploy/check_services.sh deploy/backup.sh deploy/restore.sh "$work/deploy/"
+    cp -R deploy/lightrag-patches "$work/deploy/"
     cp docs/INSTALL_HARBOR.md "$work/docs/"
     sed -i.bak "s/^SKI_VERSION=.*/SKI_VERSION=$version/" "$work/.env.release.example" && rm -f "$work/.env.release.example.bak"
     (cd "$work/images" && shasum -a 256 images.tar.gz > images.tar.gz.sha256 2>/dev/null || sha256sum images.tar.gz > images.tar.gz.sha256)

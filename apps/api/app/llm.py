@@ -190,10 +190,13 @@ class LLMClient:
                     if attempt:
                         raise
                     # Regenerate from the original evidence, never repair by
-                    # inventing IDs or reusing the invalid claims as facts.
-                    payload["messages"].append({"role": "system", "content":
-                        "The response failed citation/schema validation. Regenerate valid JSON using only these source_ids: "
-                        + ", ".join(sorted(supplied_ids)) + ". Each claim needs source_ids; text must have no citation markers."})
+                    # inventing IDs or reusing the invalid claims as facts. The
+                    # note joins the first system message: providers and chat
+                    # templates reject a system message after the user turn.
+                    payload["messages"][0]["content"] += (
+                        " A previous response failed citation/schema validation. Regenerate valid JSON using only these "
+                        "source_ids: " + ", ".join(sorted(supplied_ids)) + ". Each claim needs source_ids; text must have "
+                        "no citation markers.")
         except httpx.HTTPError as exc:
             raise RuntimeError(provider_error_code(exc)) from exc
         finally:

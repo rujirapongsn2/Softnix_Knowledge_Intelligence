@@ -148,6 +148,8 @@ def test_invalid_citation_regeneration_is_bounded_and_still_validates_ids(monkey
             assert client.answer_from_sources("Question", [{"citation_id": "S1", "title": "Doc", "excerpt": "Fact"}]) == "Fact [S1]"
         assert len(seen) == client.answer_attempts == 2
         assert "S99" not in json.dumps(seen[-1]), "Invalid claims must not become retry evidence"
+        assert [m["role"] for m in seen[-1]["messages"]] == ["system", "user"], "A late system message is rejected by some providers"
+        assert "failed citation/schema validation" in seen[-1]["messages"][0]["content"]
     finally:
         get_settings.cache_clear()
 
